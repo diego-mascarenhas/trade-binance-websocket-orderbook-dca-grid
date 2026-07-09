@@ -854,6 +854,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
           f"(auto re-arm grid + trailing TP, poll {args.tp_poll_sec:g}s). Ctrl+C to stop.{RESET}")
     try:
         while True:
+            sleep_s = args.tp_poll_sec
             try:
                 side_is_long, qty, entry = _detect_open_side(args.symbol, hedge, api, sec, args.recv_window)
                 if side_is_long is not None:
@@ -867,10 +868,15 @@ def supervise_loop(args: argparse.Namespace) -> None:
                         print(f"{DIM}Flat · grid armed ({len(oo)} orders waiting to fill)…{RESET}")
                     else:
                         print(f"{BOLD}Flat and no orders → re-arming grid…{RESET}")
-                        build_and_place_grid(args, api, sec, filt, verbose=True)
+                        placed = build_and_place_grid(args, api, sec, filt, verbose=True)
+                        if not placed:
+                            # Could not arm (imbalance guard, no walls, etc.) — back off
+                            # so we don't hammer the API / spam logs every poll.
+                            sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
+                            print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
             except Exception as exc:
                 print(f"{RED}Supervisor pass error: {exc}{RESET}")
-            time.sleep(args.tp_poll_sec)
+            time.sleep(sleep_s)
     except KeyboardInterrupt:
         print(f"\n{RESET}Stopped supervising (open orders/TP left in place).")
 
@@ -966,6 +972,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tp-wall-min-mult", type=float, default=3.0, help="Min wall size vs median book qty to count as a wall")
     p.add_argument("--tp-wall-pick", choices=["nearest", "strongest"], default="nearest", help="Which opposite wall to target")
     p.add_argument("--tp-poll-sec", type=float, default=5.0, help="Position/TP re-sync interval (manage-tp)")
+    p.add_argument("--rearm-backoff", type=float, default=_env_float("REARM_BACKOFF", 60.0),
+                   help="When flat but a grid can't be armed (imbalance/no walls), wait this "
+                        "long before retrying instead of --tp-poll-sec. Env: REARM_BACKOFF")
     p.add_argument("--keep-sl", action="store_true", help="Do NOT auto-cancel foreign STOP_MARKET SLs (e.g. Finandy's)")
     args = p.parse_args()
     # Executes by default; --dry-run flips it off.
