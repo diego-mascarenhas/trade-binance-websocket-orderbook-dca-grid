@@ -73,6 +73,7 @@ python3 orderbook_dca_grid.py ADAUSDT --supervise
 - **Direction**: `--direction auto` (default) decides long/short from bid/ask
   imbalance; or pass `--direction long|short`.
 - **Entry size**: 5% of wallet balance (`--wallet-pct 5`); or fixed `--base-size 20`.
+  Both can also be set in `.env` (`WALLET_PCT`, `BASE_SIZE`); CLI flags take precedence.
 - **Leverage**: the symbol's max is set automatically (`--no-max-leverage` to skip,
   `--set-leverage N` to force).
 - **DCA walls**: anchored to real order-book walls within `--max-range` % (default 12).

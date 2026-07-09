@@ -26,6 +26,7 @@ import hmac
 import json
 import os
 import statistics
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -249,39 +250,40 @@ def render(symbol: str, args: argparse.Namespace, orders: list[dict], entry: flo
 
 # --- Execution (Binance Futures LIMIT orders) ----------------------------
 
-def load_keys(env_file: str | None) -> tuple[str, str]:
-    """Read API keys from environment, falling back to a .env file.
+def load_env_file(env_file: str | None) -> None:
+    """Load a .env file into os.environ without overwriting existing vars.
 
-    Lookup order: environment vars → --env-file → ./.env (cwd) → .env next to
-    this script.
+    Lookup order: --env-file → ./.env (cwd) → .env next to this script. Every
+    KEY=VALUE line is exported (not only the API keys), so config such as
+    WALLET_PCT or BASE_SIZE can live in the .env too.
     """
-    api = os.getenv("BINANCE_API_KEY", "")
-    sec = os.getenv("BINANCE_SECRET_KEY", "")
-    if api and sec:
-        return api, sec
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         env_file,
         os.path.join(os.getcwd(), ".env"),
         os.path.join(here, ".env"),
     ]
+    seen: set[str] = set()
     for path in candidates:
-        if not path or not os.path.exists(path):
+        if not path or path in seen or not os.path.exists(path):
             continue
+        seen.add(path)
         with open(path, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
+                k = k.strip()
                 v = v.strip().strip('"').strip("'")
-                if k.strip() == "BINANCE_API_KEY" and not api:
-                    api = v
-                elif k.strip() == "BINANCE_SECRET_KEY" and not sec:
-                    sec = v
-        if api and sec:
-            break
-    return api, sec
+                if k and k not in os.environ:
+                    os.environ[k] = v
+
+
+def load_keys(env_file: str | None) -> tuple[str, str]:
+    """Read API keys from environment, falling back to a .env file."""
+    load_env_file(env_file)
+    return os.getenv("BINANCE_API_KEY", ""), os.getenv("BINANCE_SECRET_KEY", "")
 
 
 def _public_get(path: str, params: dict) -> dict:
@@ -818,7 +820,28 @@ def print_tp_plan(symbol: str, is_long: bool, args: argparse.Namespace,
           f"{'✓ guaranteed in profit' if ok else '✗ NOT in profit'}{RESET}")
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def parse_args() -> argparse.Namespace:
+    # Load .env early so config vars (e.g. WALLET_PCT) can drive the defaults.
+    # --env-file is honoured on the second pass inside load_keys().
+    env_file = None
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == "--env-file" and i + 1 < len(argv):
+            env_file = argv[i + 1]
+        elif a.startswith("--env-file="):
+            env_file = a.split("=", 1)[1]
+    load_env_file(env_file)
+
     p = argparse.ArgumentParser(description="DCA grid anchored to real order-book walls")
     p.add_argument("symbol", help="Symbol, e.g. MORPHOUSDT")
     p.add_argument("--price", type=float, default=None, help="Entry price (default: live mid)")
@@ -836,8 +859,10 @@ def parse_args() -> argparse.Namespace:
         default="comp",
         help="comp=distance compensation, wall=∝ wall liquidity, scale=geometric, flat=equal",
     )
-    p.add_argument("--base-size", type=float, default=0.0, help="Base order size in USDT (0 = use --wallet-pct)")
-    p.add_argument("--wallet-pct", type=float, default=5.0, help="Entry size as %% of wallet balance when --base-size=0")
+    p.add_argument("--base-size", type=float, default=_env_float("BASE_SIZE", 0.0),
+                   help="Base order size in USDT (0 = use --wallet-pct). Env: BASE_SIZE")
+    p.add_argument("--wallet-pct", type=float, default=_env_float("WALLET_PCT", 5.0),
+                   help="Entry size as %% of wallet balance when --base-size=0. Env: WALLET_PCT")
     p.add_argument("--comp-factor", type=float, default=1.0, help="USDT per %% band per base size (comp mode)")
     p.add_argument("--so-size", type=float, default=58.99, help="First/each DCA size (scale/flat modes)")
     p.add_argument("--volume-scale", type=float, default=1.3, help="Size multiplier per DCA (scale mode)")
