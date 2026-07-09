@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trade-binance-websocket-orderbook-dca-grid"
+version = "0.1.0"
+description = "Order-book anchored DCA grid + trailing take-profit bot for Binance Futures USDT-M"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+orderbook-dca-grid = "orderbook_dca_grid:main"
+
+[tool.setuptools]
+py-modules = ["orderbook_dca_grid"]
