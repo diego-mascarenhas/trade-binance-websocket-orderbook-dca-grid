@@ -72,7 +72,11 @@ python3 orderbook_dca_grid.py ADAUSDT --supervise
 
 - **Direction**: `--direction auto` (default) decides long/short from bid/ask
   imbalance; or pass `--direction long|short`.
-- **Entry size**: 5% of wallet balance (`--wallet-pct 5`); or fixed `--base-size 20`.
+- **Balance filter**: `--max-imbalance 30` (default) skips opening when bid vs ask
+  volume near the mid differ by more than that % (e.g. `790` vs `116` ≈ 74% → skipped).
+  Set `0` to disable, or `--force` to override. Also configurable via `.env`
+  (`MAX_IMBALANCE`).
+- **Entry size**: 10% of wallet balance (`--wallet-pct 10`); or fixed `--base-size 20`.
   Both can also be set in `.env` (`WALLET_PCT`, `BASE_SIZE`); CLI flags take precedence.
 - **Leverage**: the symbol's max is set automatically (`--no-max-leverage` to skip,
   `--set-leverage N` to force).

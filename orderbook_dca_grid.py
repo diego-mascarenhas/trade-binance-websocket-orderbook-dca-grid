@@ -37,6 +37,7 @@ FAPI_BASE = os.getenv("FAPI_BASE", "https://fapi.binance.com").rstrip("/")
 
 GREEN = "\033[32m"
 RED = "\033[31m"
+YELLOW = "\033[33m"
 CYAN = "\033[36m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
@@ -80,6 +81,47 @@ def decide_direction(
     imb = (bid_vol / total) if total else 0.5
     direction = "long" if bid_vol >= ask_vol else "short"
     return {"direction": direction, "bid_vol": bid_vol, "ask_vol": ask_vol, "imbalance": imb}
+
+
+def book_balance(
+    bids: list[list[float]], asks: list[list[float]], mid: float, range_pct: float
+) -> tuple[float, float, float]:
+    """Return (bid_vol, ask_vol, diff_pct) near the mid.
+
+    diff_pct = |bid_vol - ask_vol| / (bid_vol + ask_vol) * 100, i.e. how far the
+    book is from a 50/50 balance (0% = perfectly balanced, 100% = one-sided).
+    """
+    lo = mid * (1 - range_pct / 100)
+    hi = mid * (1 + range_pct / 100)
+    bid_vol = sum(q for p, q in bids if p >= lo)
+    ask_vol = sum(q for p, q in asks if p <= hi)
+    total = bid_vol + ask_vol
+    diff_pct = (abs(bid_vol - ask_vol) / total * 100) if total else 0.0
+    return bid_vol, ask_vol, diff_pct
+
+
+def imbalance_blocks(
+    args: argparse.Namespace, bids: list[list[float]], asks: list[list[float]],
+    mid: float, verbose: bool = True
+) -> bool:
+    """True if the book is too one-sided to open a grid (per --max-imbalance).
+
+    Disabled when --max-imbalance <= 0. Overridable with --force.
+    """
+    if getattr(args, "max_imbalance", 0.0) <= 0:
+        return False
+    bid_vol, ask_vol, diff = book_balance(bids, asks, mid, args.auto_range)
+    if diff <= args.max_imbalance:
+        return False
+    if verbose:
+        state = f"bid {bid_vol:,.0f} vs ask {ask_vol:,.0f}"
+        if args.force:
+            print(f"{YELLOW}Book imbalanced {diff:.1f}% > max {args.max_imbalance:g}% "
+                  f"({state}) — continuing due to --force.{RESET}")
+        else:
+            print(f"{RED}Book too imbalanced: {diff:.1f}% > max {args.max_imbalance:g}% "
+                  f"({state}). Skipping (use --force to override or --max-imbalance 0 to disable).{RESET}")
+    return not args.force
 
 
 def select_walls(
@@ -730,6 +772,9 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
         return False
     mid = (bids[0][0] + asks[0][0]) / 2
 
+    if imbalance_blocks(args, bids, asks, mid, verbose):
+        return False
+
     if args.direction == "auto":
         d = decide_direction(bids, asks, mid, args.auto_range)
         is_long = d["direction"] == "long"
@@ -848,6 +893,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--direction", choices=["long", "short", "auto"], default="auto",
                    help="auto = decide from bid/ask imbalance in the book")
     p.add_argument("--auto-range", type=float, default=1.0, help="%% band around mid for auto-direction imbalance")
+    p.add_argument("--max-imbalance", type=float, default=_env_float("MAX_IMBALANCE", 30.0),
+                   help="Skip opening if bid/ask volume differ by more than this %% (0=off). "
+                        "Env: MAX_IMBALANCE. Override with --force")
     p.add_argument("--so-count", type=int, default=8, help="Number of DCA orders (walls to place)")
     p.add_argument("--limit", type=int, default=1000, help="Order book depth to fetch (5..1000)")
     p.add_argument("--min-gap", type=float, default=0.8, help="Min %% spacing between chosen walls")
@@ -861,7 +909,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--base-size", type=float, default=_env_float("BASE_SIZE", 0.0),
                    help="Base order size in USDT (0 = use --wallet-pct). Env: BASE_SIZE")
-    p.add_argument("--wallet-pct", type=float, default=_env_float("WALLET_PCT", 5.0),
+    p.add_argument("--wallet-pct", type=float, default=_env_float("WALLET_PCT", 10.0),
                    help="Entry size as %% of wallet balance when --base-size=0. Env: WALLET_PCT")
     p.add_argument("--comp-factor", type=float, default=1.0, help="USDT per %% band per base size (comp mode)")
     p.add_argument("--so-size", type=float, default=58.99, help="First/each DCA size (scale/flat modes)")
@@ -970,6 +1018,9 @@ def main() -> None:
 
     best_bid, best_ask = bids[0][0], asks[0][0]
     mid = (best_bid + best_ask) / 2
+
+    if imbalance_blocks(args, bids, asks, mid):
+        return
 
     if args.direction == "auto":
         d = decide_direction(bids, asks, mid, args.auto_range)
