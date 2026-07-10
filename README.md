@@ -96,8 +96,9 @@ python3 orderbook_dca_grid_spot.py BTCUSDT --dry-run    # preview
 python3 orderbook_dca_grid_spot.py BTCUSDT              # grid + OCO
 python3 orderbook_dca_grid_spot.py BTCUSDT --supervise  # autonomous
 python3 orderbook_dca_grid_spot.py BTCUSDT --tp-only    # OCO only
-python3 orderbook_dca_grid_spot.py SOLUSDT --rearm      # cancel + fresh grid (stop unit first)
-python3 orderbook_dca_grid_spot.py BNBUSDT --rearm --rearm-flat  # sell holding, then grid
+python3 orderbook_dca_grid_spot.py SOLUSDT --rearm      # DCA-only if holding; full grid if flat
+python3 orderbook_dca_grid_spot.py BNBUSDT --rearm --rearm-flat  # sell holding, then full grid
+python3 orderbook_dca_grid_spot.py BTCUSDT --tp-only --once   # sync OCO once and exit
 ```
 
 ### Key behavior
