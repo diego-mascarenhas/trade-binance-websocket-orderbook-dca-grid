@@ -26,6 +26,7 @@ import hmac
 import json
 import os
 import statistics
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -36,6 +37,7 @@ FAPI_BASE = os.getenv("FAPI_BASE", "https://fapi.binance.com").rstrip("/")
 
 GREEN = "\033[32m"
 RED = "\033[31m"
+YELLOW = "\033[33m"
 CYAN = "\033[36m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
@@ -79,6 +81,13 @@ def decide_direction(
     imb = (bid_vol / total) if total else 0.5
     direction = "long" if bid_vol >= ask_vol else "short"
     return {"direction": direction, "bid_vol": bid_vol, "ask_vol": ask_vol, "imbalance": imb}
+
+
+def exposure_diff_pct(long_notional: float, short_notional: float) -> float:
+    """|LONG - SHORT| / (LONG + SHORT) * 100 — how far account exposure is from
+    a 50/50 LONG/SHORT balance (0% = balanced, 100% = fully one-sided)."""
+    total = long_notional + short_notional
+    return (abs(long_notional - short_notional) / total * 100) if total else 0.0
 
 
 def select_walls(
@@ -249,39 +258,40 @@ def render(symbol: str, args: argparse.Namespace, orders: list[dict], entry: flo
 
 # --- Execution (Binance Futures LIMIT orders) ----------------------------
 
-def load_keys(env_file: str | None) -> tuple[str, str]:
-    """Read API keys from environment, falling back to a .env file.
+def load_env_file(env_file: str | None) -> None:
+    """Load a .env file into os.environ without overwriting existing vars.
 
-    Lookup order: environment vars → --env-file → ./.env (cwd) → .env next to
-    this script.
+    Lookup order: --env-file → ./.env (cwd) → .env next to this script. Every
+    KEY=VALUE line is exported (not only the API keys), so config such as
+    WALLET_PCT or BASE_SIZE can live in the .env too.
     """
-    api = os.getenv("BINANCE_API_KEY", "")
-    sec = os.getenv("BINANCE_SECRET_KEY", "")
-    if api and sec:
-        return api, sec
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         env_file,
         os.path.join(os.getcwd(), ".env"),
         os.path.join(here, ".env"),
     ]
+    seen: set[str] = set()
     for path in candidates:
-        if not path or not os.path.exists(path):
+        if not path or path in seen or not os.path.exists(path):
             continue
+        seen.add(path)
         with open(path, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
+                k = k.strip()
                 v = v.strip().strip('"').strip("'")
-                if k.strip() == "BINANCE_API_KEY" and not api:
-                    api = v
-                elif k.strip() == "BINANCE_SECRET_KEY" and not sec:
-                    sec = v
-        if api and sec:
-            break
-    return api, sec
+                if k and k not in os.environ:
+                    os.environ[k] = v
+
+
+def load_keys(env_file: str | None) -> tuple[str, str]:
+    """Read API keys from environment, falling back to a .env file."""
+    load_env_file(env_file)
+    return os.getenv("BINANCE_API_KEY", ""), os.getenv("BINANCE_SECRET_KEY", "")
 
 
 def _public_get(path: str, params: dict) -> dict:
@@ -433,16 +443,22 @@ def place_orders(
 
     print(f"\n{BOLD}Placing {len(prepared)} {side} LIMIT orders on {symbol.upper()} "
           f"({'hedge' if hedge else 'one-way'} mode)...{RESET}")
+    tif, gtd = limit_time_in_force(args)
+    if gtd:
+        print(f"{DIM}Order expiry: GTD in {args.order_ttl:g}s "
+              f"({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(gtd / 1000))}).{RESET}")
     placed = 0
     for o in prepared:
         params = {
             "symbol": symbol.upper(),
             "side": side,
             "type": "LIMIT",
-            "timeInForce": args.tif,
+            "timeInForce": tif,
             "quantity": o["quantity"],
             "price": o["price"],
         }
+        if gtd:
+            params["goodTillDate"] = gtd
         if hedge:
             params["positionSide"] = "LONG" if is_long else "SHORT"
         try:
@@ -456,7 +472,18 @@ def place_orders(
     return placed > 0
 
 
-# --- Trailing TP on the OPPOSITE order book (profit-guaranteed) ----------
+def good_till_date_ms(ttl_sec: float) -> int:
+    """Unix ms expiry for Binance GTD orders (second precision, min now + 600 s)."""
+    ttl = max(float(ttl_sec), 610.0)
+    return int(time.time() + ttl) * 1000
+
+
+def limit_time_in_force(args: argparse.Namespace) -> tuple[str, int | None]:
+    """Return (timeInForce, goodTillDate|None) for LIMIT grid orders."""
+    ttl = getattr(args, "order_ttl", 0.0)
+    if ttl > 0:
+        return "GTD", good_till_date_ms(ttl)
+    return args.tif, None
 
 def choose_tp_activation(
     bids: list[list[float]],
@@ -539,6 +566,71 @@ def get_max_leverage(symbol: str, api: str, sec: str, recv: int) -> int:
     br = _signed_request("GET", "/fapi/v1/leverageBracket", {"symbol": symbol.upper()}, api, sec, recv)
     brs = br[0] if isinstance(br, list) else br
     return max(int(b["initialLeverage"]) for b in brs["brackets"])
+
+
+def account_exposure(api: str, sec: str, recv: int) -> tuple[float, float]:
+    """Return (long_notional, short_notional) in USDT across ALL open positions."""
+    rows = _signed_request("GET", "/fapi/v2/positionRisk", {}, api, sec, recv)
+    long_n = short_n = 0.0
+    for r in rows if isinstance(rows, list) else []:
+        amt = float(r.get("positionAmt", 0) or 0)
+        if amt == 0:
+            continue
+        raw = r.get("notional", "")
+        if raw not in ("", None):
+            n = abs(float(raw))
+        else:
+            n = abs(amt) * float(r.get("markPrice", 0) or 0)
+        if amt > 0:
+            long_n += n
+        else:
+            short_n += n
+    return long_n, short_n
+
+
+def account_imbalance_blocks(
+    args: argparse.Namespace, is_long: bool, add_notional: float,
+    api: str, sec: str, verbose: bool = True
+) -> bool:
+    """True if opening `add_notional` USDT on this side would push the account's
+    LONG vs SHORT exposure difference above --max-imbalance %.
+
+    Only blocks when we'd be adding to the already-heavier side; opening on the
+    lighter side is allowed since it rebalances. Disabled when --max-imbalance<=0.
+    Overridable with --force.
+    """
+    limit = getattr(args, "max_imbalance", 0.0)
+    if limit <= 0:
+        return False
+    try:
+        long_n, short_n = account_exposure(api, sec, args.recv_window)
+    except Exception as exc:
+        if verbose:
+            print(f"{YELLOW}Could not read account exposure ({exc}); "
+                  f"skipping imbalance check.{RESET}")
+        return False
+    if is_long:
+        long_n += add_notional
+    else:
+        short_n += add_notional
+    diff = exposure_diff_pct(long_n, short_n)
+    if diff <= limit:
+        return False
+    heavier_is_long = long_n >= short_n
+    # Adding to the lighter side rebalances -> allow it.
+    if is_long != heavier_is_long:
+        return False
+    opening = "LONG" if is_long else "SHORT"
+    state = f"LONG {long_n:,.0f} vs SHORT {short_n:,.0f} USDT"
+    if verbose:
+        if args.force:
+            print(f"{YELLOW}Account imbalance {diff:.1f}% > max {limit:g}% "
+                  f"({state}) — continuing due to --force.{RESET}")
+        else:
+            print(f"{RED}Account too imbalanced: {diff:.1f}% > max {limit:g}% "
+                  f"({state}). Skipping new {opening} "
+                  f"(use --force or --max-imbalance 0 to disable).{RESET}")
+    return not args.force
 
 
 def get_position(symbol: str, is_long: bool, hedge: bool, api: str, sec: str, recv: int) -> tuple[float, float]:
@@ -747,6 +839,9 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
             print(f"{RED}Wallet balance read failed: {exc}{RESET}")
             return False
 
+    if account_imbalance_blocks(args, is_long, base_size, api, sec, verbose):
+        return False
+
     levels = bids if is_long else asks
     walls = select_walls(levels, entry, is_long, args.so_count, args.min_gap, args.min_dist, args.max_range)
     if not walls:
@@ -776,6 +871,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
           f"(auto re-arm grid + trailing TP, poll {args.tp_poll_sec:g}s). Ctrl+C to stop.{RESET}")
     try:
         while True:
+            sleep_s = args.tp_poll_sec
             try:
                 side_is_long, qty, entry = _detect_open_side(args.symbol, hedge, api, sec, args.recv_window)
                 if side_is_long is not None:
@@ -789,10 +885,15 @@ def supervise_loop(args: argparse.Namespace) -> None:
                         print(f"{DIM}Flat · grid armed ({len(oo)} orders waiting to fill)…{RESET}")
                     else:
                         print(f"{BOLD}Flat and no orders → re-arming grid…{RESET}")
-                        build_and_place_grid(args, api, sec, filt, verbose=True)
+                        placed = build_and_place_grid(args, api, sec, filt, verbose=True)
+                        if not placed:
+                            # Could not arm (imbalance guard, no walls, etc.) — back off
+                            # so we don't hammer the API / spam logs every poll.
+                            sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
+                            print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
             except Exception as exc:
                 print(f"{RED}Supervisor pass error: {exc}{RESET}")
-            time.sleep(args.tp_poll_sec)
+            time.sleep(sleep_s)
     except KeyboardInterrupt:
         print(f"\n{RESET}Stopped supervising (open orders/TP left in place).")
 
@@ -818,13 +919,38 @@ def print_tp_plan(symbol: str, is_long: bool, args: argparse.Namespace,
           f"{'✓ guaranteed in profit' if ok else '✗ NOT in profit'}{RESET}")
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def parse_args() -> argparse.Namespace:
+    # Load .env early so config vars (e.g. WALLET_PCT) can drive the defaults.
+    # --env-file is honoured on the second pass inside load_keys().
+    env_file = None
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == "--env-file" and i + 1 < len(argv):
+            env_file = argv[i + 1]
+        elif a.startswith("--env-file="):
+            env_file = a.split("=", 1)[1]
+    load_env_file(env_file)
+
     p = argparse.ArgumentParser(description="DCA grid anchored to real order-book walls")
     p.add_argument("symbol", help="Symbol, e.g. MORPHOUSDT")
     p.add_argument("--price", type=float, default=None, help="Entry price (default: live mid)")
     p.add_argument("--direction", choices=["long", "short", "auto"], default="auto",
                    help="auto = decide from bid/ask imbalance in the book")
     p.add_argument("--auto-range", type=float, default=1.0, help="%% band around mid for auto-direction imbalance")
+    p.add_argument("--max-imbalance", type=float, default=_env_float("MAX_IMBALANCE", 30.0),
+                   help="Skip opening on a side if the account's LONG vs SHORT exposure "
+                        "would differ by more than this %% (0=off). Env: MAX_IMBALANCE. "
+                        "Override with --force")
     p.add_argument("--so-count", type=int, default=8, help="Number of DCA orders (walls to place)")
     p.add_argument("--limit", type=int, default=1000, help="Order book depth to fetch (5..1000)")
     p.add_argument("--min-gap", type=float, default=0.8, help="Min %% spacing between chosen walls")
@@ -836,8 +962,10 @@ def parse_args() -> argparse.Namespace:
         default="comp",
         help="comp=distance compensation, wall=∝ wall liquidity, scale=geometric, flat=equal",
     )
-    p.add_argument("--base-size", type=float, default=0.0, help="Base order size in USDT (0 = use --wallet-pct)")
-    p.add_argument("--wallet-pct", type=float, default=5.0, help="Entry size as %% of wallet balance when --base-size=0")
+    p.add_argument("--base-size", type=float, default=_env_float("BASE_SIZE", 0.0),
+                   help="Base order size in USDT (0 = use --wallet-pct). Env: BASE_SIZE")
+    p.add_argument("--wallet-pct", type=float, default=_env_float("WALLET_PCT", 10.0),
+                   help="Entry size as %% of wallet balance when --base-size=0. Env: WALLET_PCT")
     p.add_argument("--comp-factor", type=float, default=1.0, help="USDT per %% band per base size (comp mode)")
     p.add_argument("--so-size", type=float, default=58.99, help="First/each DCA size (scale/flat modes)")
     p.add_argument("--volume-scale", type=float, default=1.3, help="Size multiplier per DCA (scale mode)")
@@ -846,7 +974,11 @@ def parse_args() -> argparse.Namespace:
     # Execution (LIMIT orders on Binance Futures). Executes by default; use --dry-run to preview.
     p.add_argument("--dry-run", action="store_true", help="Preview only — do NOT place/replace any real orders")
     p.add_argument("--force", action="store_true", help="Place even if the symbol already has a position/open orders")
-    p.add_argument("--tif", choices=["GTC", "GTX", "IOC", "FOK"], default="GTC", help="Time in force")
+    p.add_argument("--tif", choices=["GTC", "GTX", "IOC", "FOK"], default="GTC",
+                   help="Time in force when --order-ttl=0 (default GTC)")
+    p.add_argument("--order-ttl", type=float, default=_env_float("ORDER_TTL", 3600.0),
+                   help="LIMIT lifetime in seconds via native GTD (0=use --tif). Min 600. "
+                        "Default 1h. Env: ORDER_TTL")
     p.add_argument("--position-mode", choices=["auto", "hedge", "oneway"], default="auto")
     p.add_argument("--set-leverage", type=int, default=0, help="Force a specific leverage (0=use symbol max)")
     p.add_argument("--no-max-leverage", action="store_true", help="Do NOT auto-set the symbol's max leverage")
@@ -861,6 +993,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tp-wall-min-mult", type=float, default=3.0, help="Min wall size vs median book qty to count as a wall")
     p.add_argument("--tp-wall-pick", choices=["nearest", "strongest"], default="nearest", help="Which opposite wall to target")
     p.add_argument("--tp-poll-sec", type=float, default=5.0, help="Position/TP re-sync interval (manage-tp)")
+    p.add_argument("--rearm-backoff", type=float, default=_env_float("REARM_BACKOFF", 60.0),
+                   help="When flat but a grid can't be armed (imbalance/no walls), wait this "
+                        "long before retrying instead of --tp-poll-sec. Env: REARM_BACKOFF")
     p.add_argument("--keep-sl", action="store_true", help="Do NOT auto-cancel foreign STOP_MARKET SLs (e.g. Finandy's)")
     args = p.parse_args()
     # Executes by default; --dry-run flips it off.
@@ -979,6 +1114,12 @@ def main() -> None:
                 args.leverage = get_max_leverage(args.symbol, api, sec, args.recv_window)
             except Exception:
                 pass
+
+    # Account-level LONG/SHORT exposure guard (needs API keys).
+    if args.max_imbalance > 0:
+        api, sec = load_keys(args.env_file)
+        if api and sec and account_imbalance_blocks(args, is_long, args.base_size, api, sec):
+            return
 
     levels = bids if is_long else asks
     walls = select_walls(

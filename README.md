@@ -1,10 +1,15 @@
 # trade-binance-websocket-orderbook-dca-grid
 
-Order-book anchored **DCA grid + trailing take-profit** bot for **Binance Futures
-USDT-M**. It reads the live order book, places a base order plus safety orders
-(DCA) on real walls, sizes the entry as a % of your wallet, uses the symbol's max
-leverage, and manages a profit-guaranteed trailing take-profit on the opposite
-side of the book.
+Order-book anchored **DCA grid** bots for **Binance Futures USDT-M** and **Binance Spot**.
+
+Repository: [github.com/diego-mascarenhas/trade-binance-websocket-orderbook-dca-grid](https://github.com/diego-mascarenhas/trade-binance-websocket-orderbook-dca-grid)
+
+Both scripts read the live order book, place DCA orders on real walls, size entries from wallet %, and manage exits anchored to the book:
+
+| Bot | Market | Entry | Exit |
+|-----|--------|-------|------|
+| `orderbook_dca_grid.py` | Futures | LONG/SHORT grid on walls | Trailing TP (`TRAILING_STOP_MARKET`) |
+| `orderbook_dca_grid_spot.py` | Spot | BUY grid on bid walls | OCO (TP + SL) |
 
 Self-contained: **Python standard library only** — no third-party dependencies.
 
@@ -12,123 +17,222 @@ Self-contained: **Python standard library only** — no third-party dependencies
 
 ```
 trade-binance-websocket-orderbook-dca-grid/
-├── orderbook_dca_grid.py   # the bot (single module, contains main())
-├── pyproject.toml          # optional install → `orderbook-dca-grid` command
-├── .env.example            # API key template
-└── deploy/                 # systemd units for Ubuntu (24/7)
-    ├── dca-tp@.service
-    └── dca-super@.service
+├── orderbook_dca_grid.py        # Futures bot
+├── orderbook_dca_grid_spot.py   # Spot bot
+├── pyproject.toml               # optional install → `orderbook-dca-grid` command
+├── .env.example                 # API keys + config template
+└── deploy/
+    ├── dca-futures@.service     # Futures: grid + trailing TP (--supervise)
+    ├── dca-futures-tp@.service  # Futures: trailing TP only (--tp-only)
+    ├── dca-spot@.service        # Spot: buy grid + OCO (--supervise)
+    └── sync_pairs.py            # enable/disable systemd units from .env pair lists
 ```
 
-## Setup
+## Quick start
 
 ```bash
-cp .env.example .env      # then fill in BINANCE_API_KEY / BINANCE_SECRET_KEY
+git clone https://github.com/diego-mascarenhas/trade-binance-websocket-orderbook-dca-grid.git
+cd trade-binance-websocket-orderbook-dca-grid
+cp .env.example .env            # fill in BINANCE_API_KEY / BINANCE_SECRET_KEY
+chmod 600 .env
 ```
 
-Keys are read from environment variables first, then `.env` (cwd or next to the
-script). No `pip install` is required to run.
+Keys are read from environment variables first, then `.env` (cwd or next to the script). No `pip install` is required to run.
 
-## Run
-
-It **executes by default** (auto-direction, 5% wallet, max leverage, DCA walls
-within ±12%). Add `--dry-run` to only preview.
-
-```bash
-# directly
-python3 orderbook_dca_grid.py ADAUSDT
-
-# or as a module
-python3 -m orderbook_dca_grid ADAUSDT
-```
-
-Optional install (adds an `orderbook-dca-grid` command on your PATH):
-
-```bash
-pip install .
-orderbook-dca-grid ADAUSDT
-```
-
-Preview without sending anything:
+Preview without sending orders:
 
 ```bash
 python3 orderbook_dca_grid.py ADAUSDT --dry-run
+python3 orderbook_dca_grid_spot.py BTCUSDT --dry-run
 ```
 
-## Modes
+---
+
+## Futures (`orderbook_dca_grid.py`)
+
+Runs on **Binance USDT-M Futures** (`fapi.binance.com`).
+
+### Modes
 
 ```bash
-# Place grid once + auto-manage the trailing TP (foreground loop) — default
+# Place grid once + auto-manage trailing TP (foreground loop) — default
 python3 orderbook_dca_grid.py ADAUSDT
 
-# Only manage the trailing TP for an existing position (no new grid)
+# Only manage trailing TP for an existing position (no new grid)
 python3 orderbook_dca_grid.py ADAUSDT --tp-only
 
-# Fully autonomous: re-arm the grid whenever flat + manage TP
+# Fully autonomous: re-arm grid when flat + manage TP
 python3 orderbook_dca_grid.py ADAUSDT --supervise
 ```
 
-## Key behavior / defaults
+### Key behavior
 
-- **Direction**: `--direction auto` (default) decides long/short from bid/ask
-  imbalance; or pass `--direction long|short`.
-- **Entry size**: 5% of wallet balance (`--wallet-pct 5`); or fixed `--base-size 20`.
-- **Leverage**: the symbol's max is set automatically (`--no-max-leverage` to skip,
-  `--set-leverage N` to force).
-- **DCA walls**: anchored to real order-book walls within `--max-range` % (default 12).
-- **Execution**: on by default; pass `--dry-run` to preview without sending orders.
-- **Trailing TP**: `TRAILING_STOP_MARKET` on the opposite wall, activation clamped
-  so the callback stays in profit; only replaced when the position size changes.
-- **Safety**: refuses to place a grid if the symbol already has a position/orders
-  (`--force` to override); auto-cancels foreign SLs (`--keep-sl` to disable).
+- **Direction**: `--direction auto` (default) from bid/ask imbalance; or `long` / `short`.
+- **Account balance guard**: `MAX_IMBALANCE=30` (default) skips new orders on the heavier side when `|LONG − SHORT| / total` exceeds the limit; the lighter side is still allowed. `--force` overrides.
+- **Entry size**: 10% of wallet (`WALLET_PCT=10`) or fixed `BASE_SIZE` in USDT.
+- **Leverage**: symbol max set automatically (`--no-max-leverage` / `--set-leverage N`).
+- **DCA walls**: real order-book levels within `--max-range` % (default 12).
+- **Trailing TP**: opposite-side wall, activation clamped so callback stays in profit.
+- **Order expiry**: LIMIT orders use native **GTD** (`ORDER_TTL=3600` = 1 h; `0` = GTC). `--supervise` re-arms when flat.
+- **Safety**: refuses to stack on existing exposure (`--force` to override); cancels foreign SLs (`--keep-sl` to disable).
 
-Run `python3 orderbook_dca_grid.py --help` for the full flag list.
+Run `python3 orderbook_dca_grid.py --help` for all flags.
 
-## 24/7 on Ubuntu
+---
 
-The project is synced (via SFTP) to
-`/home/forge/scripts/trade-binance-websocket-orderbook-dca-grid`. The `.env` is
-**not** uploaded, so create it once on the server; the systemd unit sets
-`WorkingDirectory` to the project folder and the script reads keys from that `.env`.
+## Spot (`orderbook_dca_grid_spot.py`)
+
+Runs on **Binance Spot** (`api.binance.com`). Same `.env`; API key needs **Spot & Margin Trading** permission. **Long-only.**
+
+### Modes
 
 ```bash
-cd /home/forge/scripts/trade-binance-websocket-orderbook-dca-grid
-cp .env.example .env       # fill in BINANCE_API_KEY / BINANCE_SECRET_KEY
+python3 orderbook_dca_grid_spot.py BTCUSDT --dry-run    # preview
+python3 orderbook_dca_grid_spot.py BTCUSDT              # grid + OCO
+python3 orderbook_dca_grid_spot.py BTCUSDT --supervise  # autonomous
+python3 orderbook_dca_grid_spot.py BTCUSDT --tp-only    # OCO only
+python3 orderbook_dca_grid_spot.py SOLUSDT --rearm      # cancel + fresh grid (stop unit first)
+python3 orderbook_dca_grid_spot.py BNBUSDT --rearm --rearm-flat  # sell holding, then grid
+```
+
+### Key behavior
+
+- **BUY LIMIT** grid on real **bid walls**; DCA count from the book (`SO_WALL_MULT`), capped by `SO_MAX`.
+- **OCO SELL** while holding: TP on ask walls, SL **below the deepest open DCA** (`SPOT_SL` is fallback when grid is fully filled).
+- **Budget fit**: before placing, sums grid notional vs free USDT and `MAX_SYMBOL_PCT` (default **25%** of wallet); drops deepest DCAs until it fits.
+- **Grid refresh**: Spot has no native GTD — `--supervise` cancels and re-arms after `GRID_TTL` (default **1 h**; `0` = off).
+
+Run `python3 orderbook_dca_grid_spot.py --help` for all flags.
+
+---
+
+## Configuration (`.env`)
+
+Copy `.env.example` → `.env`. CLI flags override env vars.
+
+| Variable | Default | Applies to | Description |
+|----------|---------|------------|-------------|
+| `BINANCE_API_KEY` | — | both | API key |
+| `BINANCE_SECRET_KEY` | — | both | Secret |
+| `WALLET_PCT` | `10` | both | Entry size as % of wallet/free USDT |
+| `BASE_SIZE` | `0` | both | Fixed entry USDT (`0` = use `WALLET_PCT`) |
+| `MAX_IMBALANCE` | `30` | futures | Account LONG/SHORT balance guard (`0` = off) |
+| `ORDER_TTL` | `3600` | futures | LIMIT expiry via GTD in seconds (`0` = GTC) |
+| `REARM_BACKOFF` | `60` | both | Wait when flat but grid can't be armed |
+| `MAX_SYMBOL_PCT` | `25` | spot | Cap per symbol (% of total USDT wallet) |
+| `MIN_BASE_USDT` | `10` | spot | Floor for wallet-% entry size |
+| `GRID_TTL` | `3600` | spot | Refresh stale armed grid (seconds) |
+| `SPOT_TP` / `SPOT_SL` | `0.5` / `5` | spot | OCO TP/SL % |
+| `FUTURES_PAIRS` | — | deploy | Comma-separated symbols for `dca-futures@` |
+| `SPOT_PAIRS` | — | deploy | Comma-separated symbols for `dca-spot@` |
+
+Example pair lists (alphabetical):
+
+```env
+FUTURES_PAIRS=1000SHIBUSDT,ATOMUSDT,AVAXUSDT,DOGEUSDT,EIGENUSDT,ETCUSDT,NEARUSDT,OPUSDT,SUIUSDT,XRPUSDT
+SPOT_PAIRS=BNBUSDT,BTCUSDT,ETHUSDT,SOLUSDT
+```
+
+---
+
+## 24/7 on Ubuntu (systemd)
+
+### Managed setup (REVISION ALPHA)
+
+If you prefer not to configure the server yourself, you can hire a VPS through **[REVISION ALPHA S.L.](https://revisionalpha.com/servidores-dedicados)** — we install this bot on your server **free of charge** (clone, `.env`, systemd units, and `sync_pairs.py`).
+
+Contact: [info@revisionalpha.com](mailto:info@revisionalpha.com) · [+34 613 194 131](tel:+34613194131)
+
+Install path (code under `/opt`, process runs as **`forge`** — never as root):
+
+```text
+/opt/trade-binance-websocket-orderbook-dca-grid
+```
+
+The `.env` is **not** in git — create it on the server. Units use `User=forge` and `WorkingDirectory` pointing at the project folder.
+
+### Fresh install (new server)
+
+```bash
+# 1. Clone as forge
+sudo mkdir -p /opt
+sudo git clone https://github.com/diego-mascarenhas/trade-binance-websocket-orderbook-dca-grid.git \
+  /opt/trade-binance-websocket-orderbook-dca-grid
+sudo chown -R forge:forge /opt/trade-binance-websocket-orderbook-dca-grid
+
+# 2. Secrets
+cd /opt/trade-binance-websocket-orderbook-dca-grid
+cp .env.example .env
 chmod 600 .env
+nano .env   # BINANCE_API_KEY, BINANCE_SECRET_KEY, FUTURES_PAIRS, SPOT_PAIRS
 
-sudo cp deploy/dca-super@.service /etc/systemd/system/
+# 3. Dry-run
+python3 orderbook_dca_grid_spot.py BTCUSDT --dry-run
+
+# 4. systemd (needs sudo for systemctl)
+sudo cp deploy/dca-futures@.service deploy/dca-futures-tp@.service deploy/dca-spot@.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now dca-super@ADAUSDT      # autonomous per symbol
-# or, TP-only (manage an existing position, no grid):
-# sudo systemctl enable --now dca-tp@SOLUSDT
+python3 deploy/sync_pairs.py --dry-run
+python3 deploy/sync_pairs.py
 ```
 
-Operate / logs (journald):
+Updates later:
 
 ```bash
-systemctl status dca-super@ADAUSDT
-journalctl -u dca-super@ADAUSDT -f
-sudo systemctl restart dca-super@ADAUSDT
-sudo systemctl disable --now dca-super@ADAUSDT
+cd /opt/trade-binance-websocket-orderbook-dca-grid
+git pull
+python3 deploy/sync_pairs.py --restart
 ```
 
-> If your path/user differ, edit `WorkingDirectory`/`ExecStart`/`User` in the
-> `.service` file. Use `dca-super@` (autonomous) **or** `dca-tp@` (manage only)
-> per symbol — not both.
+| Unit | Command | Use when |
+|------|---------|----------|
+| `dca-futures@SYMBOL` | `--supervise` | Full bot: grid + trailing TP |
+| `dca-futures-tp@SYMBOL` | `--tp-only` | Exit only (manual/other entry) |
+| `dca-spot@SYMBOL` | `--supervise` | Spot grid + OCO |
+
+Do **not** run `dca-futures@` and `dca-futures-tp@` on the same symbol.
+
+### Sync pairs from `.env`
+
+```bash
+python3 deploy/sync_pairs.py status     # desired vs running
+python3 deploy/sync_pairs.py --dry-run  # preview
+python3 deploy/sync_pairs.py            # enable+start listed, disable the rest
+python3 deploy/sync_pairs.py --restart  # same + restart running units
+```
+
+Omit `FUTURES_PAIRS` or `SPOT_PAIRS` to leave that market untouched. An empty value disables all units for that template.
+
+### Logs
+
+```bash
+sudo journalctl -u 'dca-futures@*' -u 'dca-spot@*' -f -o with-unit
+sudo systemctl restart 'dca-futures@*' 'dca-spot@*'
+```
+
+### Migrate from `dca-super@` / `dca-tp@` (old unit names)
+
+```bash
+sudo systemctl disable --now 'dca-super@*' 'dca-tp@*'
+sudo cp deploy/dca-futures@.service deploy/dca-futures-tp@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+python3 deploy/sync_pairs.py
+```
+
+---
 
 ## Disclaimer
 
-This places **real orders** on your Binance Futures account. Test with small size
-first. No warranty.
+This places **real orders** on your Binance Futures **and/or Spot** account. Test with `--dry-run` and small size first. No warranty.
 
 ## Security Vulnerabilities
 
-If you discover a security vulnerability within trade-binance-websocket-orderbook-dca-grid, please send an e-mail to Diego Mascarenhas Goytía via [hola@idoneo.dev](mailto:hola@idoneo.dev). All security vulnerabilities will be promptly addressed.
+If you discover a security vulnerability, please e-mail [hola@idoneo.dev](mailto:hola@idoneo.dev).
 
 ## License
 
-trade-binance-websocket-orderbook-dca-grid is open-sourced software licensed under the [GNU Affero General Public License v3.0](https://www.gnu.org/licenses/agpl-3.0.html)
+Licensed under the [GNU Affero General Public License v3.0](https://www.gnu.org/licenses/agpl-3.0.html).
 
 ### Additional Terms
 
-By deploying this software, you agree to notify the original author at [hola@idoneo.dev](mailto:hola@idoneo.dev). or by visiting [http://linkedin.com/in/diego-mascarenhas/](http://linkedin.com/in/diego-mascarenhas/) Any modifications or enhancements must be shared with the original author.
+By deploying this software, you agree to notify the original author at [hola@idoneo.dev](mailto:hola@idoneo.dev) or via [LinkedIn](http://linkedin.com/in/diego-mascarenhas/). Any modifications or enhancements must be shared with the original author.
