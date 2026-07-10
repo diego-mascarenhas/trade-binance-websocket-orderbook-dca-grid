@@ -17,9 +17,10 @@ trade-binance-websocket-orderbook-dca-grid/
 ├── pyproject.toml               # optional install → `orderbook-dca-grid` command
 ├── .env.example                 # API key template
 └── deploy/                      # systemd units for Ubuntu (24/7)
-    ├── dca-tp@.service
-    ├── dca-super@.service
-    └── dca-spot@.service        # Spot supervisor
+    ├── dca-futures@.service     # Futures: grid + trailing TP (--supervise)
+    ├── dca-futures-tp@.service  # Futures: trailing TP only (--tp-only)
+    ├── dca-spot@.service        # Spot: buy grid + OCO
+    └── sync_pairs.py            # enable/disable units from .env pair lists
 ```
 
 ## Setup
@@ -108,20 +109,29 @@ cd /home/forge/scripts/trade-binance-websocket-orderbook-dca-grid
 cp .env.example .env       # fill in BINANCE_API_KEY / BINANCE_SECRET_KEY
 chmod 600 .env
 
-sudo cp deploy/dca-super@.service /etc/systemd/system/
+sudo cp deploy/dca-futures@.service deploy/dca-futures-tp@.service deploy/dca-spot@.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now dca-super@ADAUSDT      # autonomous per symbol
+sudo systemctl enable --now dca-futures@ADAUSDT   # grid + trailing TP per symbol
 # or, TP-only (manage an existing position, no grid):
-# sudo systemctl enable --now dca-tp@SOLUSDT
+# sudo systemctl enable --now dca-futures-tp@SOLUSDT
 ```
 
 Operate / logs (journald):
 
 ```bash
-systemctl status dca-super@ADAUSDT
-journalctl -u dca-super@ADAUSDT -f
-sudo systemctl restart dca-super@ADAUSDT
-sudo systemctl disable --now dca-super@ADAUSDT
+systemctl status dca-futures@ADAUSDT
+journalctl -u 'dca-futures@*' -f -o with-unit
+sudo systemctl restart dca-futures@ADAUSDT
+sudo systemctl disable --now dca-futures@ADAUSDT
+```
+
+### Migrate from `dca-super@` / `dca-tp@` (old names)
+
+```bash
+sudo systemctl disable --now 'dca-super@*' 'dca-tp@*'
+sudo cp deploy/dca-futures@.service deploy/dca-futures-tp@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+python3 deploy/sync_pairs.py     # or enable units manually
 ```
 
 ### Sync pairs from `.env`
@@ -138,15 +148,15 @@ python3 deploy/sync_pairs.py --restart # same + restart already-running units
 Example `.env`:
 
 ```env
-FUTURES_PAIRS=BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT
-SPOT_PAIRS=BTCUSDT,ETHUSDT,BNBUSDT
+FUTURES_PAIRS=1000SHIBUSDT,ATOMUSDT,AVAXUSDT,DOGEUSDT,NEARUSDT,OPUSDT,SUIUSDT,XRPUSDT
+SPOT_PAIRS=BNBUSDT,BTCUSDT,ETHUSDT,SOLUSDT
 ```
 
 Omit `FUTURES_PAIRS` or `SPOT_PAIRS` entirely to leave that market untouched.
 An empty value (`SPOT_PAIRS=`) disables all units for that template.
 
 > If your path/user differ, edit `WorkingDirectory`/`ExecStart`/`User` in the
-> `.service` file. Use `dca-super@` (autonomous) **or** `dca-tp@` (manage only)
+> `.service` file. Use `dca-futures@` (grid + TP) **or** `dca-futures-tp@` (TP only)
 > per symbol — not both.
 
 ## Spot variant (`orderbook_dca_grid_spot.py`)

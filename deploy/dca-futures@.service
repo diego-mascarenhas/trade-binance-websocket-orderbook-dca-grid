@@ -1,5 +1,5 @@
 [Unit]
-Description=DCA autonomous supervisor (%i) — re-arm grid + trailing TP
+Description=Futures DCA supervisor (%i) — re-arm grid + trailing TP
 After=network-online.target
 Wants=network-online.target
 
@@ -8,8 +8,8 @@ Type=simple
 User=forge
 # The script reads .env from this directory (BINANCE_API_KEY / BINANCE_SECRET_KEY).
 WorkingDirectory=/home/forge/scripts/trade-binance-websocket-orderbook-dca-grid
-# %i is the symbol, e.g. dca-super@ADAUSDT. Executes by default (auto-direction,
-# 5% wallet, max leverage, ±12% DCA range) and manages the trailing TP.
+# %i is the symbol, e.g. dca-futures@ADAUSDT. Executes by default (auto-direction,
+# wallet %, max leverage) and manages the trailing TP.
 ExecStart=/usr/bin/python3 -u /home/forge/scripts/trade-binance-websocket-orderbook-dca-grid/orderbook_dca_grid.py %i --supervise
 Restart=always
 RestartSec=5

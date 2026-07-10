@@ -6,8 +6,7 @@ Reads comma-separated symbols and keeps systemd in sync:
   - pairs running but not listed → stop + disable
 
 Requires unit templates already installed, e.g.:
-  sudo cp deploy/dca-super@.service /etc/systemd/system/
-  sudo cp deploy/dca-spot@.service /etc/systemd/system/
+  sudo cp deploy/dca-futures@.service deploy/dca-spot@.service /etc/systemd/system/
   sudo systemctl daemon-reload
 
 Usage:
@@ -179,8 +178,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--spot-only", action="store_true")
     p.add_argument("--no-sudo", action="store_true", help="Omit sudo (when already root)")
     p.add_argument("--restart", action="store_true", help="Restart units that were already running")
-    p.add_argument("--futures-unit", default=os.getenv("FUTURES_UNIT", "dca-super"),
-                   help="systemd template for futures (default: dca-super)")
+    p.add_argument("--futures-unit", default=os.getenv("FUTURES_UNIT", "dca-futures"),
+                   help="systemd template for futures (default: dca-futures)")
     p.add_argument("--spot-unit", default=os.getenv("SPOT_UNIT", "dca-spot"),
                    help="systemd template for spot (default: dca-spot)")
     p.add_argument("command", nargs="?", choices=["sync", "status"], default="sync")
