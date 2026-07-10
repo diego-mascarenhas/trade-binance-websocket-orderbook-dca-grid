@@ -150,9 +150,11 @@ it works differently from the Futures bot:
   `--base-size N`. Deep defaults (`--limit 5000`, `--max-range 15`) so it finds
   walls on pricey coins (e.g. ETH) without extra flags.
 - No leverage / no shorting / no hedge (they don't exist on Spot).
-- Exposure guard per symbol (holding + new grid): `--max-symbol-pct` caps it as a
-  **% of the wallet** (total USDT, default **50%**), or `--max-symbol-usdt` as an
-  absolute amount (used only when pct=0). `0` on both = off.
+- Exposure guard per symbol: `--max-symbol-pct` caps **held + full grid cost** as a
+  **% of the wallet** (total USDT, default **25%**), or `--max-symbol-usdt` as an
+  absolute amount (used only when pct=0). `0` on both = off. Before placing, the bot
+  sums the rounded grid notional, compares it to **free USDT** and the cap, and
+  **drops the deepest DCA orders** until the grid fits (keeps base + nearest DCAs).
   Env: `MAX_SYMBOL_PCT` / `MAX_SYMBOL_USDT`.
 - Avg cost is derived from your recent buy trades (`myTrades`) to anchor the TP/SL.
 

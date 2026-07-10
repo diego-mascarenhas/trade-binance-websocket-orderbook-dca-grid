@@ -319,6 +319,121 @@ def prepare_orders(orders: list[dict], filt: dict) -> list[dict]:
     return prepared
 
 
+def grid_notional(prepared: list[dict]) -> float:
+    return sum(o["notional"] for o in prepared)
+
+
+def get_symbol_cap_usdt(args: argparse.Namespace, filt: dict, api: str, sec: str) -> tuple[float, str]:
+    """Return (cap_usdt, description). cap_usdt=0 means no cap."""
+    pct = getattr(args, "max_symbol_pct", 0.0)
+    abs_cap = getattr(args, "max_symbol_usdt", 0.0)
+    quote = filt["quote_asset"]
+    if pct > 0:
+        wallet = get_total(api, sec, args.recv_window, quote)
+        cap = wallet * pct / 100.0
+        return cap, f"{pct:g}% of {wallet:,.2f} {quote} = {cap:,.2f} USDT"
+    if abs_cap > 0:
+        return abs_cap, f"{abs_cap:,.2f} {quote}"
+    return 0.0, ""
+
+
+def get_grid_budget(args: argparse.Namespace, filt: dict, mid: float,
+                    api: str, sec: str) -> tuple[float, float, float, str]:
+    """Return (budget_usdt, free_usdt, held_usdt, description).
+
+    Budget = min(free quote, symbol-cap room). Grid total must fit within this.
+    """
+    quote = filt["quote_asset"]
+    free = get_free(api, sec, args.recv_window, quote)
+    held = symbol_position_usdt(args.symbol, filt, mid, api, sec, args.recv_window)
+    cap, cap_desc = get_symbol_cap_usdt(args, filt, api, sec)
+    if cap > 0 and not getattr(args, "force", False):
+        cap_room = max(0.0, cap - held)
+        budget = min(free, cap_room)
+        desc = (f"min(free {free:,.2f}, cap room {cap_room:,.2f} "
+                f"[{cap_desc}], held {held:,.2f})")
+    elif cap > 0 and getattr(args, "force", False):
+        budget = free
+        desc = f"free {free:,.2f} {quote} (--force ignores cap [{cap_desc}])"
+    else:
+        budget = free
+        desc = f"free {free:,.2f} {quote} (held {held:,.2f})"
+    return budget, free, held, desc
+
+
+def fit_prepared_to_budget(prepared: list[dict], budget: float, min_notional: float,
+                           verbose: bool = True) -> list[dict] | None:
+    """Drop deepest DCA orders until the grid fits the USDT budget.
+
+    Always keeps the base order when possible. Returns None if even the base
+    order does not fit.
+    """
+    if not prepared:
+        return None
+    full_total = grid_notional(prepared)
+    fitted = list(prepared)
+    trimmed = 0
+    while len(fitted) > 1 and grid_notional(fitted) > budget + 0.001:
+        fitted.pop()
+        trimmed += 1
+    fit_total = grid_notional(fitted)
+    if fit_total > budget + 0.001 or fitted[0]["notional"] < min_notional:
+        if verbose:
+            print(f"{RED}Grid needs {full_total:,.2f} USDT ({len(prepared)} orders) "
+                  f"but budget is {budget:,.2f} USDT — not enough free balance / cap room.{RESET}")
+        return None
+    if trimmed and verbose:
+        print(f"{DIM}Budget fit: {len(fitted)}/{len(prepared)} orders, "
+              f"{fit_total:,.2f} USDT within {budget:,.2f} budget "
+              f"(dropped {trimmed} deepest DCA).{RESET}")
+    return fitted
+
+
+def cap_base_size_to_budget(base_size: float, budget: float, min_notional: float,
+                            verbose: bool = True) -> float | None:
+    """Shrink entry size when the wallet floor exceeds available budget."""
+    if budget + 0.001 >= base_size:
+        return base_size
+    if budget < min_notional:
+        return None
+    capped = budget * 0.98  # leave headroom for price/qty rounding up to minNotional
+    if verbose:
+        print(f"{DIM}Base size {base_size:,.2f} USDT > budget {budget:,.2f} → "
+              f"using {capped:,.2f} USDT (single-order grid).{RESET}")
+    return capped
+
+
+def resolve_base_size(args: argparse.Namespace, filt: dict, api: str, sec: str,
+                      verbose: bool = True) -> float | None:
+    """Resolve entry size from --base-size or wallet % (+ min floor)."""
+    base_size = args.base_size
+    if base_size > 0:
+        return base_size
+    try:
+        quote_free = get_free(api, sec, args.recv_window, filt["quote_asset"])
+        base_size = quote_free * args.wallet_pct / 100.0
+        if base_size < args.min_base_usdt:
+            if verbose:
+                print(f"{DIM}Wallet {args.wallet_pct:g}% = {base_size:,.2f} USDT < floor "
+                      f"{args.min_base_usdt:g} → using {args.min_base_usdt:g} USDT.{RESET}")
+            base_size = args.min_base_usdt
+        return base_size
+    except Exception as exc:
+        if verbose:
+            print(f"{RED}Quote balance read failed: {exc}{RESET}")
+        return None
+
+
+def build_fit_prepare_grid(entry: float, walls: list, base_size: float,
+                           args: argparse.Namespace, filt: dict, budget: float,
+                           verbose: bool = True) -> list[dict] | None:
+    """Build grid from walls, round to exchange precision, trim to budget."""
+    orders = build_grid(entry, walls, base_size, args.tp, args.size_mode,
+                        args.comp_factor, args.so_size, args.volume_scale)
+    prepared = prepare_orders(orders, filt)
+    return fit_prepared_to_budget(prepared, budget, float(filt["min_notional"]), verbose)
+
+
 def render(symbol: str, args: argparse.Namespace, orders: list[dict], entry: float, found: int) -> str:
     lines: list[str] = []
     lines.append(f"{BOLD}{CYAN}SPOT OB DCA Grid · {symbol} · {GREEN}BUY{CYAN}{RESET}")
@@ -451,7 +566,12 @@ def place_buy_grid(symbol: str, prepared: list[dict], args: argparse.Namespace,
                   f"orderId={resp.get('orderId')}{RESET}")
             placed += 1
         except Exception as exc:
+            err = str(exc)
             print(f"{RED}✗ {o['name']:<10} BUY {o['quantity']} @ {o['price']}  → {exc}{RESET}")
+            if "-2010" in err or "insufficient balance" in err.lower():
+                if placed:
+                    print(f"{YELLOW}Insufficient balance after {placed} order(s) — stopping grid.{RESET}")
+                break
     print(f"{BOLD}Placed {placed}/{len(prepared)} orders.{RESET}")
     return placed > 0
 
@@ -536,7 +656,8 @@ def manage_oco_once(symbol: str, args: argparse.Namespace, filt: dict,
     """Keep one SELL OCO (TP + SL) synced to the held base-asset quantity."""
     step = filt["step_size"]
     qty_dp = _dec_places(step)
-    base_qty = get_free(api, sec, args.recv_window, filt["base_asset"])
+    # Use total (free + locked) so an active OCO doesn't look like a smaller holding.
+    base_qty = get_total(api, sec, args.recv_window, filt["base_asset"])
 
     # Lightweight best bid/ask (weight 1) — avoids pulling the deep book each poll.
     best_bid, best_ask = best_book(symbol)
@@ -616,46 +737,6 @@ def manage_oco_once(symbol: str, args: argparse.Namespace, filt: dict,
         print(f"{RED}✗ Place OCO failed: {exc}{RESET}")
 
 
-# --- Guards --------------------------------------------------------------
-
-def symbol_cap_blocks(symbol: str, args: argparse.Namespace, filt: dict, mid: float,
-                      add_usdt: float, api: str, sec: str, verbose: bool = True) -> bool:
-    """True if current holding + add would exceed the per-symbol cap.
-
-    The cap is `--max-symbol-pct`% of the wallet (total USDT) if set, otherwise the
-    absolute `--max-symbol-usdt`. 0/unset on both = no cap.
-    """
-    pct = getattr(args, "max_symbol_pct", 0.0)
-    abs_cap = getattr(args, "max_symbol_usdt", 0.0)
-    try:
-        cap = 0.0
-        cap_desc = ""
-        if pct > 0:
-            wallet = get_total(api, sec, args.recv_window, filt["quote_asset"])
-            cap = wallet * pct / 100.0
-            cap_desc = f"{pct:g}% of {wallet:,.2f} = {cap:,.2f} USDT"
-        elif abs_cap > 0:
-            cap = abs_cap
-            cap_desc = f"{cap:,.2f} USDT"
-        if cap <= 0:
-            return False
-        held = symbol_position_usdt(symbol, filt, mid, api, sec, args.recv_window)
-    except Exception as exc:
-        if verbose:
-            print(f"{YELLOW}Could not read wallet/holding ({exc}); skipping symbol cap.{RESET}")
-        return False
-    if held + add_usdt <= cap:
-        return False
-    if verbose:
-        if args.force:
-            print(f"{YELLOW}Symbol cap ({cap_desc}) would be exceeded "
-                  f"(held {held:,.2f} + {add_usdt:,.2f}) — continuing due to --force.{RESET}")
-        else:
-            print(f"{RED}Symbol cap reached: held {held:,.2f} + {add_usdt:,.2f} > {cap_desc}. "
-                  f"Skipping (use --force or set --max-symbol-pct/--max-symbol-usdt 0).{RESET}")
-    return not args.force
-
-
 # --- Grid build & place --------------------------------------------------
 
 def build_and_place_grid(args: argparse.Namespace, api: str, sec: str, filt: dict,
@@ -672,21 +753,31 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str, filt: dic
     mid = (bids[0][0] + asks[0][0]) / 2
     entry = args.price if args.price is not None else mid
 
-    base_size = args.base_size
-    if base_size <= 0:
-        try:
-            quote_free = get_free(api, sec, args.recv_window, filt["quote_asset"])
-            base_size = quote_free * args.wallet_pct / 100.0
-        except Exception as exc:
-            print(f"{RED}Quote balance read failed: {exc}{RESET}")
-            return False
-        if base_size < args.min_base_usdt:
-            if verbose:
-                print(f"{DIM}Wallet {args.wallet_pct:g}% = {base_size:,.2f} USDT < floor "
-                      f"{args.min_base_usdt:g} → using {args.min_base_usdt:g} USDT.{RESET}")
-            base_size = args.min_base_usdt
+    base_size = resolve_base_size(args, filt, api, sec, verbose)
+    if base_size is None:
+        return False
 
-    if symbol_cap_blocks(args.symbol, args, filt, mid, base_size, api, sec, verbose):
+    budget, _free, held, budget_desc = get_grid_budget(args, filt, mid, api, sec)
+    min_n = float(filt["min_notional"])
+    cap, cap_desc = get_symbol_cap_usdt(args, filt, api, sec)
+    if cap > 0 and held >= cap and not args.force:
+        if verbose:
+            print(f"{RED}Symbol cap reached: held {held:,.2f} ≥ {cap_desc}. "
+                  f"Skipping (use --force or raise cap).{RESET}")
+        return False
+    if budget < min_n:
+        if verbose:
+            print(f"{RED}No budget for grid: {budget_desc}, room {budget:,.2f} USDT "
+                  f"< minNotional {min_n:g}.{RESET}")
+        return False
+    if verbose and (cap > 0 or args.max_symbol_pct > 0):
+        print(f"{DIM}Grid budget: {budget:,.2f} USDT ({budget_desc}).{RESET}")
+
+    base_size = cap_base_size_to_budget(base_size, budget, min_n, verbose)
+    if base_size is None:
+        if verbose:
+            print(f"{RED}No budget for grid: {budget_desc}, room {budget:,.2f} USDT "
+                  f"< minNotional {min_n:g}.{RESET}")
         return False
 
     walls = select_walls(bids, entry, args.so_count, args.min_gap, args.min_dist,
@@ -695,9 +786,9 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str, filt: dic
         print(f"{RED}No qualifying bid walls found (lower --so-wall-mult/--min-gap or raise --max-range).{RESET}")
         return False
 
-    orders = build_grid(entry, walls, base_size, args.tp, args.size_mode,
-                        args.comp_factor, args.so_size, args.volume_scale)
-    prepared = prepare_orders(orders, filt)
+    prepared = build_fit_prepare_grid(entry, walls, base_size, args, filt, budget, verbose)
+    if not prepared:
+        return False
     return place_buy_grid(args.symbol, prepared, args, api, sec)
 
 
@@ -715,24 +806,30 @@ def supervise_loop(args: argparse.Namespace) -> None:
         return
     print(f"\n{BOLD}{CYAN}Supervising SPOT {args.symbol.upper()} "
           f"(auto re-arm buy grid + OCO exit, poll {args.poll_sec:g}s). Ctrl+C to stop.{RESET}")
+    armed_log_state: str | None = None
     try:
         while True:
             sleep_s = args.poll_sec
             try:
                 best_bid, best_ask = best_book(args.symbol)
                 mid = (best_bid + best_ask) / 2
-                base_qty = get_free(api, sec, args.recv_window, filt["base_asset"])
+                base_qty = get_total(api, sec, args.recv_window, filt["base_asset"])
                 holding_usdt = base_qty * mid
 
                 if holding_usdt >= float(filt["min_notional"]):
+                    armed_log_state = None
                     # We hold the asset → keep the OCO (TP + SL) synced.
                     manage_oco_once(args.symbol, args, filt, api, sec, verbose=True)
                 else:
                     oo = open_orders(args.symbol, api, sec, args.recv_window)
                     buys = [o for o in oo if str(o.get("side", "")).upper() == "BUY"]
                     if buys:
-                        print(f"{DIM}Flat · grid armed ({len(buys)} buy orders waiting to fill)…{RESET}")
+                        state = f"armed:{len(buys)}"
+                        if state != armed_log_state:
+                            print(f"{DIM}Flat · grid armed ({len(buys)} buy orders waiting to fill)…{RESET}")
+                            armed_log_state = state
                     else:
+                        armed_log_state = None
                         print(f"{BOLD}Flat and no orders → re-arming buy grid…{RESET}")
                         placed = build_and_place_grid(args, api, sec, filt, verbose=True)
                         if not placed:
@@ -839,9 +936,9 @@ def parse_args() -> argparse.Namespace:
                    help="Min wall size vs median book qty to count as a wall for TP/SL anchoring")
     p.add_argument("--tp-wall-pick", choices=["nearest", "strongest"], default="nearest",
                    help="Which order-book wall to anchor the TP/SL to")
-    p.add_argument("--max-symbol-pct", type=float, default=_env_float("MAX_SYMBOL_PCT", 50.0),
+    p.add_argument("--max-symbol-pct", type=float, default=_env_float("MAX_SYMBOL_PCT", 25.0),
                    help="Max invested per symbol as %% of wallet (total USDT). Takes precedence over "
-                        "--max-symbol-usdt. Default 50. 0=off. Env: MAX_SYMBOL_PCT")
+                        "--max-symbol-usdt. Default 25. 0=off. Env: MAX_SYMBOL_PCT")
     p.add_argument("--max-symbol-usdt", type=float, default=_env_float("MAX_SYMBOL_USDT", 0.0),
                    help="Max USDT invested per symbol (absolute; used if --max-symbol-pct=0). 0=off. Env: MAX_SYMBOL_USDT")
     p.add_argument("--dry-run", action="store_true", help="Preview only — do NOT place any real orders")
@@ -895,7 +992,8 @@ def main() -> None:
 
     # Keys are needed to trade, to size from wallet %, and for account guards.
     # A pure --dry-run with an explicit --base-size can preview without them.
-    need_keys = args.execute or args.base_size <= 0 or args.max_symbol_usdt > 0
+    need_keys = (args.execute or args.base_size <= 0 or args.max_symbol_usdt > 0
+                 or args.max_symbol_pct > 0)
     api, sec = load_keys(args.env_file)
     if need_keys and (not api or not sec):
         print(f"{RED}Need API keys (env or .env) to size from wallet %% and trade.{RESET}")
@@ -903,19 +1001,16 @@ def main() -> None:
 
     base_size = args.base_size
     if base_size <= 0:
+        base_size = resolve_base_size(args, filt, api, sec)
+        if base_size is None:
+            return
+        args.base_size = base_size
         try:
             quote_free = get_free(api, sec, args.recv_window, filt["quote_asset"])
-            base_size = quote_free * args.wallet_pct / 100.0
-            note = ""
-            if base_size < args.min_base_usdt:
-                note = f" → floored to {args.min_base_usdt:g}"
-                base_size = args.min_base_usdt
-            args.base_size = base_size
             print(f"{BOLD}{CYAN}Entry size: {args.wallet_pct:g}% of free {filt['quote_asset']}{RESET} "
-                  f"{DIM}({quote_free:,.2f} → {base_size:,.2f} USDT{note}){RESET}")
-        except Exception as exc:
-            print(f"{RED}Could not read quote balance: {exc}{RESET}")
-            return
+                  f"{DIM}({quote_free:,.2f} → {base_size:,.2f} USDT){RESET}")
+        except Exception:
+            print(f"{BOLD}{CYAN}Entry size: {base_size:,.2f} USDT{RESET}")
 
     # Safety: don't stack a new grid on top of existing holding/orders.
     if args.execute and not args.force:
@@ -931,9 +1026,6 @@ def main() -> None:
                   f"Not placing a new grid. Use --force, or --tp-only to just manage the OCO.{RESET}")
             return
 
-    if symbol_cap_blocks(args.symbol, args, filt, mid, base_size, api, sec):
-        return
-
     walls = select_walls(bids, entry, args.so_count, args.min_gap, args.min_dist,
                          args.max_range, args.so_wall_mult)
     if not walls:
@@ -945,9 +1037,46 @@ def main() -> None:
     print(render(args.symbol.upper(), args, orders, entry, len(walls)))
 
     prepared = prepare_orders(orders, filt)
+    budget = None
+    if api and sec:
+        try:
+            budget, _free, held, budget_desc = get_grid_budget(args, filt, mid, api, sec)
+            cap, cap_desc = get_symbol_cap_usdt(args, filt, api, sec)
+            min_n = float(filt["min_notional"])
+            if cap > 0 and held >= cap and not args.force:
+                print(f"{RED}Symbol cap reached: held {held:,.2f} ≥ {cap_desc}. "
+                      f"Skipping (use --force or raise cap).{RESET}")
+                return
+            if budget < min_n:
+                print(f"{RED}No budget for grid: {budget_desc}, room {budget:,.2f} USDT "
+                      f"< minNotional {min_n:g}.{RESET}")
+                return
+            print(f"{DIM}Grid budget: {budget:,.2f} USDT ({budget_desc}).{RESET}")
+            capped = cap_base_size_to_budget(base_size, budget, min_n)
+            if capped is None:
+                print(f"{RED}No budget for grid: {budget_desc}, room {budget:,.2f} USDT "
+                      f"< minNotional {min_n:g}.{RESET}")
+                return
+            if capped + 0.001 < base_size:
+                base_size = capped
+                orders = build_grid(entry, walls, base_size, args.tp, args.size_mode,
+                                    args.comp_factor, args.so_size, args.volume_scale)
+                print(render(args.symbol.upper(), args, orders, entry, len(walls)))
+                prepared = prepare_orders(orders, filt)
+            fitted = fit_prepared_to_budget(prepared, budget, min_n)
+            if fitted is None:
+                return
+            prepared = fitted
+        except Exception as exc:
+            print(f"{YELLOW}Budget check skipped ({exc}) — showing full grid.{RESET}")
+    elif not args.execute:
+        print(f"{DIM}Budget fit skipped (no API keys) — showing full theoretical grid.{RESET}")
+
+    total = grid_notional(prepared)
     print(f"\n{BOLD}{CYAN}Orders to send (BUY LIMIT, rounded to exchange precision):{RESET}")
     for o in prepared:
         print(f"  {o['name']:<10} BUY {o['quantity']:>14} @ {o['price']:>13}  (~{o['notional']:.2f} USDT)")
+    print(f"{DIM}Grid total: {total:,.2f} USDT across {len(prepared)} order(s).{RESET}")
 
     if not args.execute:
         print(f"\n{DIM}DRY-RUN — no orders sent. Remove --dry-run to place the grid "
