@@ -575,8 +575,8 @@ def average_cost(symbol: str, qty_target: float, api: str, sec: str, recv: int) 
 
 
 def symbol_position_usdt(symbol: str, filt: dict, mid: float, api: str, sec: str, recv: int) -> float:
-    """Current holding value in USDT (free base asset * mid price)."""
-    base_qty = get_free(api, sec, recv, filt["base_asset"])
+    """Current holding value in USDT (total base asset × mid, incl. OCO-locked)."""
+    base_qty = get_total(api, sec, recv, filt["base_asset"])
     return base_qty * mid
 
 
@@ -775,56 +775,75 @@ def manage_oco_once(symbol: str, args: argparse.Namespace, filt: dict,
 # --- Grid build & place --------------------------------------------------
 
 def build_and_place_grid(args: argparse.Namespace, api: str, sec: str, filt: dict,
-                         verbose: bool = True) -> bool:
+                         verbose: bool = True, *, dca_only: bool = False,
+                         force: bool = False) -> bool:
+    prev_force = args.force
+    if force:
+        args.force = True
     try:
-        depth = fetch_depth(args.symbol, args.limit)
-    except Exception as exc:
-        print(f"{RED}Depth fetch failed: {exc}{RESET}")
-        return False
-    bids = [[float(p), float(q)] for p, q in depth["bids"]]
-    asks = [[float(p), float(q)] for p, q in depth["asks"]]
-    if not bids or not asks:
-        return False
-    mid = (bids[0][0] + asks[0][0]) / 2
-    entry = args.price if args.price is not None else mid
+        try:
+            depth = fetch_depth(args.symbol, args.limit)
+        except Exception as exc:
+            print(f"{RED}Depth fetch failed: {exc}{RESET}")
+            return False
+        bids = [[float(p), float(q)] for p, q in depth["bids"]]
+        asks = [[float(p), float(q)] for p, q in depth["asks"]]
+        if not bids or not asks:
+            return False
+        mid = (bids[0][0] + asks[0][0]) / 2
+        entry = args.price if args.price is not None else mid
 
-    base_size = resolve_base_size(args, filt, api, sec, verbose)
-    if base_size is None:
-        return False
+        base_size = resolve_base_size(args, filt, api, sec, verbose)
+        if base_size is None:
+            return False
 
-    budget, _free, held, budget_desc = get_grid_budget(args, filt, mid, api, sec)
-    min_n = float(filt["min_notional"])
-    cap, cap_desc = get_symbol_cap_usdt(args, filt, api, sec)
-    if cap > 0 and held >= cap and not args.force:
-        if verbose:
-            print(f"{RED}Symbol cap reached: held {held:,.2f} ≥ {cap_desc}. "
-                  f"Skipping (use --force or raise cap).{RESET}")
-        return False
-    if budget < min_n:
-        if verbose:
-            print(f"{RED}No budget for grid: {budget_desc}, room {budget:,.2f} USDT "
-                  f"< minNotional {min_n:g}.{RESET}")
-        return False
-    if verbose and (cap > 0 or args.max_symbol_pct > 0):
-        print(f"{DIM}Grid budget: {budget:,.2f} USDT ({budget_desc}).{RESET}")
+        budget, _free, held, budget_desc = get_grid_budget(args, filt, mid, api, sec)
+        min_n = float(filt["min_notional"])
+        cap, cap_desc = get_symbol_cap_usdt(args, filt, api, sec)
+        if cap > 0 and held >= cap and not args.force:
+            if verbose:
+                print(f"{RED}Symbol cap reached: held {held:,.2f} ≥ {cap_desc}. "
+                      f"Skipping (use --force or raise cap).{RESET}")
+            return False
+        if budget < min_n:
+            if verbose:
+                print(f"{RED}No budget for grid: {budget_desc}, room {budget:,.2f} USDT "
+                      f"< minNotional {min_n:g}.{RESET}")
+            return False
+        if verbose and (cap > 0 or args.max_symbol_pct > 0):
+            print(f"{DIM}Grid budget: {budget:,.2f} USDT ({budget_desc}).{RESET}")
 
-    base_size = cap_base_size_to_budget(base_size, budget, min_n, verbose)
-    if base_size is None:
-        if verbose:
-            print(f"{RED}No budget for grid: {budget_desc}, room {budget:,.2f} USDT "
-                  f"< minNotional {min_n:g}.{RESET}")
-        return False
+        if not dca_only:
+            base_size = cap_base_size_to_budget(base_size, budget, min_n, verbose)
+            if base_size is None:
+                if verbose:
+                    print(f"{RED}No budget for grid: {budget_desc}, room {budget:,.2f} USDT "
+                          f"< minNotional {min_n:g}.{RESET}")
+                return False
 
-    walls = select_walls(bids, entry, args.so_count, args.min_gap, args.min_dist,
-                         args.max_range, args.so_wall_mult)
-    if not walls:
-        print(f"{RED}No qualifying bid walls found (lower --so-wall-mult/--min-gap or raise --max-range).{RESET}")
-        return False
+        walls = select_walls(bids, entry, args.so_count, args.min_gap, args.min_dist,
+                             args.max_range, args.so_wall_mult)
+        if not walls:
+            print(f"{RED}No qualifying bid walls found (lower --so-wall-mult/--min-gap or raise --max-range).{RESET}")
+            return False
 
-    prepared = build_fit_prepare_grid(entry, walls, base_size, args, filt, budget, verbose)
-    if not prepared:
-        return False
-    return place_buy_grid(args.symbol, prepared, args, api, sec)
+        orders = build_grid(entry, walls, base_size, args.tp, args.size_mode,
+                            args.comp_factor, args.so_size, args.volume_scale)
+        if dca_only:
+            orders = orders[1:]
+            if not orders:
+                print(f"{RED}No DCA levels to place.{RESET}")
+                return False
+            if verbose:
+                print(f"{BOLD}{CYAN}Re-arm DCA only ({len(orders)} buy orders below holding){RESET}")
+
+        prepared = prepare_orders(orders, filt)
+        prepared = fit_prepared_to_budget(prepared, budget, min_n, verbose)
+        if not prepared:
+            return False
+        return place_buy_grid(args.symbol, prepared, args, api, sec)
+    finally:
+        args.force = prev_force
 
 
 def rearm_grid(args: argparse.Namespace) -> bool:
@@ -845,14 +864,20 @@ def rearm_grid(args: argparse.Namespace) -> bool:
 
     oo = open_orders(args.symbol, api, sec, args.recv_window)
     base_held = get_total(api, sec, args.recv_window, filt["base_asset"])
+    best_bid, best_ask = best_book(args.symbol)
+    mid = (best_bid + best_ask) / 2
+    min_n = float(filt["min_notional"])
+    has_holding = base_held * mid >= min_n
+
     if args.dry_run:
-        print(f"{BOLD}{CYAN}DRY-RUN re-arm {args.symbol.upper()}{RESET}")
+        mode = "full buy grid"
+        if has_holding and not args.rearm_flat:
+            mode = f"DCA-only ({qty_fmt(base_held)} {filt['base_asset']} held) + OCO sync"
+        elif args.rearm_flat and has_holding:
+            mode = f"market-sell then full grid ({qty_fmt(base_held)} {filt['base_asset']})"
+        print(f"{BOLD}{CYAN}DRY-RUN re-arm {args.symbol.upper()}{RESET}  {DIM}{mode}{RESET}")
         print(f"  Would cancel {len(oo)} open order(s)")
-        if args.rearm_flat and base_held > 0:
-            print(f"  Would market-sell {qty_fmt(base_held)} {filt['base_asset']}")
-        elif base_held > 0:
-            print(f"  Would keep {qty_fmt(base_held)} {filt['base_asset']} and place DCA buys below")
-        print(f"{DIM}Remove --dry-run to execute.{RESET}")
+        print(f"{DIM}Remove --dry-run to execute. Stop dca-spot@{args.symbol.upper()} first.{RESET}")
         return True
 
     if oo:
@@ -864,16 +889,23 @@ def rearm_grid(args: argparse.Namespace) -> bool:
         if sold > 0:
             print(f"{YELLOW}Market-sold {qty_fmt(sold)} {filt['base_asset']} → flat.{RESET}")
         time.sleep(0.5)
+        has_holding = False
 
-    if not build_and_place_grid(args, api, sec, filt, verbose=True):
-        return False
+    if has_holding:
+        placed = build_and_place_grid(
+            args, api, sec, filt, verbose=True, dca_only=True, force=True,
+        )
+    else:
+        placed = build_and_place_grid(args, api, sec, filt, verbose=True)
 
     best_bid, best_ask = best_book(args.symbol)
     mid = (best_bid + best_ask) / 2
     held = get_total(api, sec, args.recv_window, filt["base_asset"]) * mid
-    if held >= float(filt["min_notional"]):
+    if held >= min_n:
         print(f"{DIM}Holding detected → syncing OCO…{RESET}")
         manage_oco_once(args.symbol, args, filt, api, sec, verbose=True)
+    elif not placed:
+        return False
     return True
 
 
@@ -978,6 +1010,8 @@ def run_oco_manager(args: argparse.Namespace) -> None:
                 manage_oco_once(args.symbol, args, filt, api, sec, verbose=True)
             except Exception as exc:
                 print(f"{RED}OCO pass error: {exc}{RESET}")
+            if getattr(args, "once", False):
+                break
             time.sleep(args.poll_sec)
     except KeyboardInterrupt:
         print(f"\n{RESET}Stopped managing OCO (existing OCO left in place).")
@@ -1042,8 +1076,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--env-file", default=None, help="Path to .env with API keys (default: project root)")
     p.add_argument("--no-tp", action="store_true", help="Do NOT auto-manage the OCO after placing the grid")
     p.add_argument("--tp-only", action="store_true", help="Skip the grid; only (re)place/manage the OCO exit")
+    p.add_argument("--once", action="store_true",
+                   help="With --tp-only: place/sync OCO once and exit (default: loop forever)")
     p.add_argument("--rearm", action="store_true",
-                   help="Cancel open orders and place a fresh buy grid (one-shot via API)")
+                   help="Cancel open orders; DCA-only + OCO if holding, full grid if flat")
     p.add_argument("--rearm-flat", action="store_true",
                    help="With --rearm: market-sell the holding first so the symbol starts flat")
     p.add_argument("--supervise", action="store_true", help="Autonomous: re-arm grid when flat + manage OCO (loop)")
