@@ -91,6 +91,16 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 # --- HTTP ----------------------------------------------------------------
 
 def _public_get(path: str, params: dict) -> dict:
@@ -194,12 +204,23 @@ def _round_to(value: float, step: Decimal, rounding: str) -> Decimal:
 def select_walls(
     levels: list[list[float]],
     entry: float,
-    count: int,
+    max_count: int,
     min_gap_pct: float,
     min_dist_pct: float,
     max_range_pct: float,
+    wall_mult: float,
 ) -> list[tuple[float, float, float]]:
-    """Pick the most significant BID walls below entry (greedy by size)."""
+    """Detect the REAL bid walls below entry from the book itself.
+
+    A level counts as a wall if its resting size is at least `wall_mult` × the
+    median book size. We take as many such walls as exist (spaced by min-gap),
+    so the number of DCA comes from the order book — not a fixed target.
+    `max_count` is only an optional cap (0 = no cap).
+    """
+    qtys = [q for _, q in levels]
+    med = statistics.median(qtys) if qtys else 0.0
+    min_wall = med * wall_mult
+
     cands: list[tuple[float, float, float]] = []
     for price, qty in levels:
         if price >= entry:
@@ -209,16 +230,18 @@ def select_walls(
             continue
         if max_range_pct > 0 and dist > max_range_pct:
             continue
+        if qty < min_wall:  # only genuine walls, not average book noise
+            continue
         cands.append((price, qty, dist))
 
-    cands.sort(key=lambda x: x[1], reverse=True)
+    cands.sort(key=lambda x: x[1], reverse=True)  # biggest walls first
     picked: list[tuple[float, float, float]] = []
     for price, qty, dist in cands:
         if all(abs(price - p) / entry * 100 >= min_gap_pct for p, _, _ in picked):
             picked.append((price, qty, dist))
-        if len(picked) >= count:
+        if max_count > 0 and len(picked) >= max_count:
             break
-    picked.sort(key=lambda x: x[2])
+    picked.sort(key=lambda x: x[2])  # nearest to entry = DCA #1
     return picked
 
 
@@ -329,11 +352,11 @@ def render(symbol: str, args: argparse.Namespace, orders: list[dict], entry: flo
         f"{BOLD}Full-fill TP{RESET} {price_fmt(last['avg'] * (1 + args.tp / 100))} (+{args.tp:g}%)  ·  "
         f"{BOLD}SL{RESET} {price_fmt(last['avg'] * (1 - args.sl / 100))} (-{args.sl:g}%)"
     )
-    if found < args.so_count:
-        lines.append(
-            f"{RED}Only {found}/{args.so_count} qualifying walls found. Try a higher --limit "
-            f"or a smaller --min-gap / larger --max-range.{RESET}"
-        )
+    cap = f" (cap {args.so_count})" if args.so_count > 0 else ""
+    lines.append(
+        f"{DIM}{found} DCA detected from real bid walls{cap} "
+        f"(≥ {args.so_wall_mult:g}× median book size).{RESET}"
+    )
     return "\n".join(lines)
 
 
@@ -345,6 +368,15 @@ def get_free(api: str, sec: str, recv: int, asset: str) -> float:
     for b in acc.get("balances", []):
         if b.get("asset") == asset:
             return float(b.get("free", 0) or 0)
+    return 0.0
+
+
+def get_total(api: str, sec: str, recv: int, asset: str) -> float:
+    """Total balance (free + locked) of an asset on the Spot account."""
+    acc = _signed_request("GET", "/api/v3/account", {}, api, sec, recv)
+    for b in acc.get("balances", []):
+        if b.get("asset") == asset:
+            return float(b.get("free", 0) or 0) + float(b.get("locked", 0) or 0)
     return 0.0
 
 
@@ -425,14 +457,17 @@ def place_buy_grid(symbol: str, prepared: list[dict], args: argparse.Namespace,
 
 
 def choose_oco_prices(bids: list[list[float]], asks: list[list[float]], avg: float,
-                      tp_pct: float, sl_pct: float, tick: Decimal,
-                      wall_min_mult: float, pick: str) -> dict:
-    """Anchor the OCO exit to real order-book walls, guaranteed by tp%/sl%.
+                      tp_pct: float, sl_pct: float, sl_buffer_pct: float, tick: Decimal,
+                      wall_min_mult: float, pick: str,
+                      grid_bottom: float | None = None) -> dict:
+    """Anchor the OCO exit to real order-book walls.
 
     - TP (LIMIT_MAKER): a real ASK wall (resistance) at/above the profit floor
       avg*(1+tp%); if none is deep enough, falls back to that floor.
-    - SL (STOP_LOSS_LIMIT): just below a real BID wall (support) that sits within
-      the risk budget [avg*(1-sl%), last); if none, falls back to avg*(1-sl%).
+    - SL (STOP_LOSS_LIMIT): placed BELOW the whole DCA grid — under the deepest
+      still-open DCA order (`grid_bottom`), snapped just under a support wall
+      beneath it, with a `sl_buffer_pct` cushion. Only if the grid is fully
+      filled (no open DCA) does it fall back to avg*(1-sl%).
 
     Both are clamped so the OCO is accepted (TP above best ask, SL below best bid).
     """
@@ -455,18 +490,20 @@ def choose_oco_prices(bids: list[list[float]], asks: list[list[float]], avg: flo
         tp_wall_qty = None
     tp_d = _round_to(tp, tick, ROUND_UP)
 
-    # --- Stop-loss: just below a BID support wall within the risk budget ---
-    sl_cap = avg * (1 - sl_pct / 100)
-    bid_walls = [(p, q) for p, q in bids if sl_cap <= p < best_bid and q >= min_wall]
-    if bid_walls:
-        wall = (max(bid_walls, key=lambda x: x[0]) if pick == "nearest"
-                else max(bid_walls, key=lambda x: x[1]))
-        stop = wall[0] - tickf  # trigger if that support breaks
+    # --- Stop-loss: BELOW the DCA grid (only cut once the whole grid is broken) ---
+    # Reference = deepest open DCA (grid bottom); fallback = avg*(1-sl%) when the
+    # grid is fully filled and there is nothing left below to protect.
+    sl_ref = grid_bottom if grid_bottom and grid_bottom < best_bid else avg * (1 - sl_pct / 100)
+    # Snap the trigger just below the nearest support wall strictly beneath the grid.
+    below_walls = [(p, q) for p, q in bids if p < sl_ref and q >= min_wall]
+    if below_walls:
+        wall = max(below_walls, key=lambda x: x[0])  # closest support below the grid
+        stop = wall[0] - tickf
         sl_wall_qty = wall[1]
     else:
-        stop = sl_cap
+        stop = sl_ref * (1 - sl_buffer_pct / 100)
         sl_wall_qty = None
-    stop = min(stop, best_bid - tickf)  # must be below last
+    stop = min(stop, sl_ref * (1 - sl_buffer_pct / 100), best_bid - tickf)  # below grid & last
     stop_d = _round_to(stop, tick, ROUND_DOWN)
     # SL limit a hair below the trigger so it fills once triggered.
     sl_limit_d = _round_to(float(stop_d) * (1 - 0.001), tick, ROUND_DOWN)
@@ -545,16 +582,33 @@ def manage_oco_once(symbol: str, args: argparse.Namespace, filt: dict,
     bids = [[float(p), float(q)] for p, q in depth["bids"]]
     asks = [[float(p), float(q)] for p, q in depth["asks"]]
 
+    # Grid bottom = deepest still-open DCA buy → the SL goes BELOW it.
+    buys = [float(o.get("price", 0) or 0) for o in open_orders(symbol, api, sec, args.recv_window)
+            if str(o.get("side", "")).upper() == "BUY"]
+    grid_bottom = min(buys) if buys else None
+
     avg = average_cost(symbol, float(qty_str), api, sec, args.recv_window)
     if avg <= 0:
         avg = mid  # fallback: no trade history found
-    prices = choose_oco_prices(bids, asks, avg, args.tp, args.sl, filt["tick_size"],
-                               args.tp_wall_min_mult, args.tp_wall_pick)
+    prices = choose_oco_prices(bids, asks, avg, args.tp, args.sl, args.sl_buffer,
+                               filt["tick_size"], args.tp_wall_min_mult, args.tp_wall_pick,
+                               grid_bottom=grid_bottom)
+
+    # Both OCO legs must clear minNotional (the lower SL leg is the binding one).
+    leg_min = min(float(prices["tp"]), float(prices["sl_limit"])) * float(qty_str)
+    if leg_min < min_notional:
+        if verbose:
+            print(f"{YELLOW}OCO leg would be {leg_min:,.2f} < minNotional {min_notional:g} "
+                  f"(SL sits below the grid). Position too small — raise --base-size.{RESET}")
+        return
+
     try:
         resp = place_oco_sell(symbol, qty_str, prices, filt, api, sec, args.recv_window)
         oid = resp.get("orderListId")
         tp_note = f"on {qty_fmt(prices['tp_wall_qty'])} wall" if prices["tp_wall_qty"] else "profit floor"
-        sl_note = f"under {qty_fmt(prices['sl_wall_qty'])} wall" if prices["sl_wall_qty"] else "risk cap"
+        sl_ref_note = "below grid" if grid_bottom else "risk cap"
+        sl_note = (f"under {qty_fmt(prices['sl_wall_qty'])} wall, {sl_ref_note}"
+                   if prices["sl_wall_qty"] else sl_ref_note)
         print(f"{GREEN}✓ OCO SELL {qty_str} · TP {price_fmt(float(prices['tp']))} ({tp_note}) · "
               f"SL {price_fmt(float(prices['stop']))} ({sl_note}) · avg {price_fmt(avg)} · "
               f"listId={oid}{RESET}")
@@ -566,25 +620,39 @@ def manage_oco_once(symbol: str, args: argparse.Namespace, filt: dict,
 
 def symbol_cap_blocks(symbol: str, args: argparse.Namespace, filt: dict, mid: float,
                       add_usdt: float, api: str, sec: str, verbose: bool = True) -> bool:
-    """True if current holding + add would exceed --max-symbol-usdt for this symbol."""
-    cap = getattr(args, "max_symbol_usdt", 0.0)
-    if cap <= 0:
-        return False
+    """True if current holding + add would exceed the per-symbol cap.
+
+    The cap is `--max-symbol-pct`% of the wallet (total USDT) if set, otherwise the
+    absolute `--max-symbol-usdt`. 0/unset on both = no cap.
+    """
+    pct = getattr(args, "max_symbol_pct", 0.0)
+    abs_cap = getattr(args, "max_symbol_usdt", 0.0)
     try:
+        cap = 0.0
+        cap_desc = ""
+        if pct > 0:
+            wallet = get_total(api, sec, args.recv_window, filt["quote_asset"])
+            cap = wallet * pct / 100.0
+            cap_desc = f"{pct:g}% of {wallet:,.2f} = {cap:,.2f} USDT"
+        elif abs_cap > 0:
+            cap = abs_cap
+            cap_desc = f"{cap:,.2f} USDT"
+        if cap <= 0:
+            return False
         held = symbol_position_usdt(symbol, filt, mid, api, sec, args.recv_window)
     except Exception as exc:
         if verbose:
-            print(f"{YELLOW}Could not read holding ({exc}); skipping symbol cap.{RESET}")
+            print(f"{YELLOW}Could not read wallet/holding ({exc}); skipping symbol cap.{RESET}")
         return False
     if held + add_usdt <= cap:
         return False
     if verbose:
         if args.force:
-            print(f"{YELLOW}Symbol cap {cap:g} USDT would be exceeded "
+            print(f"{YELLOW}Symbol cap ({cap_desc}) would be exceeded "
                   f"(held {held:,.2f} + {add_usdt:,.2f}) — continuing due to --force.{RESET}")
         else:
-            print(f"{RED}Symbol cap reached: held {held:,.2f} + {add_usdt:,.2f} > {cap:g} USDT. "
-                  f"Skipping (use --force or --max-symbol-usdt 0 to disable).{RESET}")
+            print(f"{RED}Symbol cap reached: held {held:,.2f} + {add_usdt:,.2f} > {cap_desc}. "
+                  f"Skipping (use --force or set --max-symbol-pct/--max-symbol-usdt 0).{RESET}")
     return not args.force
 
 
@@ -621,9 +689,10 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str, filt: dic
     if symbol_cap_blocks(args.symbol, args, filt, mid, base_size, api, sec, verbose):
         return False
 
-    walls = select_walls(bids, entry, args.so_count, args.min_gap, args.min_dist, args.max_range)
+    walls = select_walls(bids, entry, args.so_count, args.min_gap, args.min_dist,
+                         args.max_range, args.so_wall_mult)
     if not walls:
-        print(f"{RED}No qualifying bid walls found (adjust --min-gap/--max-range/--limit).{RESET}")
+        print(f"{RED}No qualifying bid walls found (lower --so-wall-mult/--min-gap or raise --max-range).{RESET}")
         return False
 
     orders = build_grid(entry, walls, base_size, args.tp, args.size_mode,
@@ -698,10 +767,14 @@ def run_oco_manager(args: argparse.Namespace) -> None:
             print(f"{DIM}No sellable position ({qty_fmt(base_qty)} {filt['base_asset']}).{RESET}")
             return
         avg = average_cost(args.symbol, base_qty, api, sec, args.recv_window) or mid
-        prices = choose_oco_prices(bids, asks, avg, args.tp, args.sl, filt["tick_size"],
-                                   args.tp_wall_min_mult, args.tp_wall_pick)
+        buys = [float(o.get("price", 0) or 0) for o in open_orders(args.symbol, api, sec, args.recv_window)
+                if str(o.get("side", "")).upper() == "BUY"]
+        grid_bottom = min(buys) if buys else None
+        prices = choose_oco_prices(bids, asks, avg, args.tp, args.sl, args.sl_buffer,
+                                   filt["tick_size"], args.tp_wall_min_mult, args.tp_wall_pick,
+                                   grid_bottom=grid_bottom)
         tp_note = f"on {qty_fmt(prices['tp_wall_qty'])} ask wall" if prices["tp_wall_qty"] else f"profit floor +{args.tp:g}%"
-        sl_note = f"under {qty_fmt(prices['sl_wall_qty'])} bid wall" if prices["sl_wall_qty"] else f"risk cap -{args.sl:g}%"
+        sl_note = ("below grid" if grid_bottom else f"risk cap -{args.sl:g}%")
         print(f"  SELL {qty_fmt(base_qty)} {filt['base_asset']} · avg {price_fmt(avg)}")
         print(f"  TP {price_fmt(float(prices['tp']))} ({tp_note})  ·  "
               f"SL {price_fmt(float(prices['stop']))} ({sl_note})")
@@ -734,9 +807,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SPOT DCA buy-grid anchored to real order-book walls, with OCO (TP+SL) exit")
     p.add_argument("symbol", help="Spot symbol, e.g. ADAUSDT")
     p.add_argument("--price", type=float, default=None, help="Entry price (default: live mid)")
-    p.add_argument("--so-count", type=int, default=8, help="Number of DCA buy orders (walls)")
+    p.add_argument("--so-count", type=int, default=_env_int("SO_MAX", 15),
+                   help="MAX cap on DCA orders (not a target). The count comes from real walls "
+                        "in the book; fewer walls → fewer DCA. 0 = no cap. Env: SO_MAX")
+    p.add_argument("--so-wall-mult", type=float, default=_env_float("SO_WALL_MULT", 2.0),
+                   help="A bid level counts as a wall (DCA) if its size ≥ this × median book size. Env: SO_WALL_MULT")
     p.add_argument("--limit", type=int, default=5000, help="Order book depth to fetch (deep = reaches walls on pricey/liquid coins)")
-    p.add_argument("--min-gap", type=float, default=0.5, help="Min %% spacing between chosen walls")
+    p.add_argument("--min-gap", type=float, default=0.2,
+                   help="Min %% spacing between chosen walls (lower = more DCA on dense books like BTC/ETH)")
     p.add_argument("--min-dist", type=float, default=0.1, help="Min %% distance of first wall from entry")
     p.add_argument("--max-range", type=float, default=15.0, help="Only DCA walls within this %% of entry (0=off)")
     p.add_argument("--size-mode", choices=["comp", "wall", "scale", "flat"], default="comp",
@@ -754,13 +832,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tp", type=float, default=_env_float("SPOT_TP", 0.5),
                    help="Min take-profit %% above avg (profit floor; TP anchors to an ask wall at/above it). Env: SPOT_TP")
     p.add_argument("--sl", type=float, default=_env_float("SPOT_SL", 5.0),
-                   help="Max stop-loss %% below avg (risk cap; SL anchors under a bid wall within it). Env: SPOT_SL")
+                   help="Fallback stop-loss %% below avg when the grid is fully filled (no open DCA). Env: SPOT_SL")
+    p.add_argument("--sl-buffer", type=float, default=_env_float("SPOT_SL_BUFFER", 0.5),
+                   help="Extra %% below the deepest DCA (grid bottom) for the stop trigger. Env: SPOT_SL_BUFFER")
     p.add_argument("--tp-wall-min-mult", type=float, default=3.0,
                    help="Min wall size vs median book qty to count as a wall for TP/SL anchoring")
     p.add_argument("--tp-wall-pick", choices=["nearest", "strongest"], default="nearest",
                    help="Which order-book wall to anchor the TP/SL to")
+    p.add_argument("--max-symbol-pct", type=float, default=_env_float("MAX_SYMBOL_PCT", 50.0),
+                   help="Max invested per symbol as %% of wallet (total USDT). Takes precedence over "
+                        "--max-symbol-usdt. Default 50. 0=off. Env: MAX_SYMBOL_PCT")
     p.add_argument("--max-symbol-usdt", type=float, default=_env_float("MAX_SYMBOL_USDT", 0.0),
-                   help="Max USDT invested per symbol (holding + new grid). 0=off. Env: MAX_SYMBOL_USDT")
+                   help="Max USDT invested per symbol (absolute; used if --max-symbol-pct=0). 0=off. Env: MAX_SYMBOL_USDT")
     p.add_argument("--dry-run", action="store_true", help="Preview only — do NOT place any real orders")
     p.add_argument("--force", action="store_true", help="Place even if the symbol already has holding/open orders")
     p.add_argument("--tif", choices=["GTC", "IOC", "FOK"], default="GTC", help="Time in force for buy limits")
@@ -851,9 +934,10 @@ def main() -> None:
     if symbol_cap_blocks(args.symbol, args, filt, mid, base_size, api, sec):
         return
 
-    walls = select_walls(bids, entry, args.so_count, args.min_gap, args.min_dist, args.max_range)
+    walls = select_walls(bids, entry, args.so_count, args.min_gap, args.min_dist,
+                         args.max_range, args.so_wall_mult)
     if not walls:
-        print(f"{RED}No qualifying bid walls found. Adjust --min-gap/--min-dist/--max-range/--limit.{RESET}")
+        print(f"{RED}No qualifying bid walls found. Lower --so-wall-mult/--min-gap or raise --max-range.{RESET}")
         return
 
     orders = build_grid(entry, walls, base_size, args.tp, args.size_mode,

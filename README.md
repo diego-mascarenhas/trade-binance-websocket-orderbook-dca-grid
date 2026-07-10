@@ -132,19 +132,28 @@ A sibling bot for **Binance Spot** (`api.binance.com`), using the **same `.env`*
 it works differently from the Futures bot:
 
 - Places **BUY LIMIT** orders on real **bid walls** below entry to DCA the dip.
+  The **number of DCA is detected from the order book** (a level counts as a wall
+  when its size ≥ `--so-wall-mult`× the median book size), not a fixed target;
+  `--so-count` is only a safety **cap** (default 15, `0` = no cap).
 - While holding the asset, it maintains a single **OCO SELL** exit, also
-  **anchored to the order book**: the `LIMIT_MAKER` **take-profit** sits on a real
-  ask wall (resistance) at/above `avg*(1+tp%)`, and the `STOP_LOSS_LIMIT`
-  **stop-loss** sits just under a real bid wall (support) within `avg*(1-sl%)`.
-  `--tp` (default +0.5%) is the profit floor and `--sl` (default -5%) the risk cap;
-  one leg cancels the other automatically. Tune wall detection with
-  `--tp-wall-min-mult` / `--tp-wall-pick`.
+  **anchored to the order book**:
+  - **Take-profit** (`LIMIT_MAKER`): sits on a real ask wall (resistance) at/above
+    the profit floor `avg*(1+tp%)` (`--tp`, default +0.5%).
+  - **Stop-loss** (`STOP_LOSS_LIMIT`): placed **below the whole DCA grid** — under
+    the deepest still-open DCA order, snapped beneath a support wall with a
+    `--sl-buffer` cushion (default 0.5%). This lets the grid buy the dips before
+    ever cutting. `--sl` (default -5%) is only the **fallback** distance below avg
+    once the grid is fully filled (no open DCA left).
+  - One leg cancels the other automatically. Tune wall detection with
+    `--tp-wall-min-mult` / `--tp-wall-pick`.
 - Enters with **`--wallet-pct`% of your free USDT** (default 10%); or a fixed
   `--base-size N`. Deep defaults (`--limit 5000`, `--max-range 15`) so it finds
   walls on pricey coins (e.g. ETH) without extra flags.
 - No leverage / no shorting / no hedge (they don't exist on Spot).
-- Exposure guard: `--max-symbol-usdt` caps total USDT invested per symbol
-  (holding + new grid). `0` = off. Also via `.env` (`MAX_SYMBOL_USDT`).
+- Exposure guard per symbol (holding + new grid): `--max-symbol-pct` caps it as a
+  **% of the wallet** (total USDT, default **50%**), or `--max-symbol-usdt` as an
+  absolute amount (used only when pct=0). `0` on both = off.
+  Env: `MAX_SYMBOL_PCT` / `MAX_SYMBOL_USDT`.
 - Avg cost is derived from your recent buy trades (`myTrades`) to anchor the TP/SL.
 
 ```bash
