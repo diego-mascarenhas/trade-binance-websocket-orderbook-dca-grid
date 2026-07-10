@@ -12,12 +12,14 @@ Self-contained: **Python standard library only** — no third-party dependencies
 
 ```
 trade-binance-websocket-orderbook-dca-grid/
-├── orderbook_dca_grid.py   # the bot (single module, contains main())
-├── pyproject.toml          # optional install → `orderbook-dca-grid` command
-├── .env.example            # API key template
-└── deploy/                 # systemd units for Ubuntu (24/7)
+├── orderbook_dca_grid.py        # the Futures bot (single module, contains main())
+├── orderbook_dca_grid_spot.py   # the Spot bot (buy-grid + OCO TP/SL)
+├── pyproject.toml               # optional install → `orderbook-dca-grid` command
+├── .env.example                 # API key template
+└── deploy/                      # systemd units for Ubuntu (24/7)
     ├── dca-tp@.service
-    └── dca-super@.service
+    ├── dca-super@.service
+    └── dca-spot@.service        # Spot supervisor
 ```
 
 ## Setup
@@ -123,10 +125,57 @@ sudo systemctl disable --now dca-super@ADAUSDT
 > `.service` file. Use `dca-super@` (autonomous) **or** `dca-tp@` (manage only)
 > per symbol — not both.
 
+## Spot variant (`orderbook_dca_grid_spot.py`)
+
+A sibling bot for **Binance Spot** (`api.binance.com`), using the **same `.env`**
+(the key just needs *Spot & Margin Trading* permission). Spot is **long-only**, so
+it works differently from the Futures bot:
+
+- Places **BUY LIMIT** orders on real **bid walls** below entry to DCA the dip.
+- While holding the asset, it maintains a single **OCO SELL** exit, also
+  **anchored to the order book**: the `LIMIT_MAKER` **take-profit** sits on a real
+  ask wall (resistance) at/above `avg*(1+tp%)`, and the `STOP_LOSS_LIMIT`
+  **stop-loss** sits just under a real bid wall (support) within `avg*(1-sl%)`.
+  `--tp` (default +0.5%) is the profit floor and `--sl` (default -5%) the risk cap;
+  one leg cancels the other automatically. Tune wall detection with
+  `--tp-wall-min-mult` / `--tp-wall-pick`.
+- Enters with **`--wallet-pct`% of your free USDT** (default 10%); or a fixed
+  `--base-size N`. Deep defaults (`--limit 5000`, `--max-range 15`) so it finds
+  walls on pricey coins (e.g. ETH) without extra flags.
+- No leverage / no shorting / no hedge (they don't exist on Spot).
+- Exposure guard: `--max-symbol-usdt` caps total USDT invested per symbol
+  (holding + new grid). `0` = off. Also via `.env` (`MAX_SYMBOL_USDT`).
+- Avg cost is derived from your recent buy trades (`myTrades`) to anchor the TP/SL.
+
+```bash
+# preview first (recommended) — no orders sent
+python3 orderbook_dca_grid_spot.py ADAUSDT --dry-run
+
+# place the buy grid + auto-manage the OCO exit
+python3 orderbook_dca_grid_spot.py ADAUSDT
+
+# fully autonomous: re-arm the grid when flat + keep the OCO synced
+python3 orderbook_dca_grid_spot.py ADAUSDT --supervise
+
+# only (re)place/manage the OCO for what you already hold
+python3 orderbook_dca_grid_spot.py ADAUSDT --tp-only
+```
+
+Env knobs (in `.env`): `SPOT_TP`, `SPOT_SL`, `MAX_SYMBOL_USDT`, plus the shared
+`WALLET_PCT` / `BASE_SIZE` / `REARM_BACKOFF`. 24/7 on Ubuntu with the
+`dca-spot@` unit:
+
+```bash
+sudo cp deploy/dca-spot@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dca-spot@ADAUSDT
+sudo journalctl -u 'dca-spot@*' -f -o with-unit
+```
+
 ## Disclaimer
 
-This places **real orders** on your Binance Futures account. Test with small size
-first. No warranty.
+This places **real orders** on your Binance Futures **and/or Spot** account. Test
+with small size first (`--dry-run`). No warranty.
 
 ## Security Vulnerabilities
 

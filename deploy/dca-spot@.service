@@ -1,0 +1,19 @@
+[Unit]
+Description=SPOT DCA autonomous supervisor (%i) — re-arm buy grid + OCO (TP+SL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=forge
+# The script reads .env from this directory (BINANCE_API_KEY / BINANCE_SECRET_KEY,
+# same keys as futures — the key needs "Spot & Margin Trading" permission).
+WorkingDirectory=/home/forge/scripts/trade-binance-websocket-orderbook-dca-grid
+# %i is the spot symbol, e.g. dca-spot@ADAUSDT. Buys DCA on real bid walls
+# (10% of free USDT by default) and maintains an OCO SELL (TP +0.5% / SL -5%).
+ExecStart=/usr/bin/python3 -u /home/forge/scripts/trade-binance-websocket-orderbook-dca-grid/orderbook_dca_grid_spot.py %i --supervise
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
