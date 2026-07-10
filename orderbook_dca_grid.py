@@ -443,16 +443,22 @@ def place_orders(
 
     print(f"\n{BOLD}Placing {len(prepared)} {side} LIMIT orders on {symbol.upper()} "
           f"({'hedge' if hedge else 'one-way'} mode)...{RESET}")
+    tif, gtd = limit_time_in_force(args)
+    if gtd:
+        print(f"{DIM}Order expiry: GTD in {args.order_ttl:g}s "
+              f"({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(gtd / 1000))}).{RESET}")
     placed = 0
     for o in prepared:
         params = {
             "symbol": symbol.upper(),
             "side": side,
             "type": "LIMIT",
-            "timeInForce": args.tif,
+            "timeInForce": tif,
             "quantity": o["quantity"],
             "price": o["price"],
         }
+        if gtd:
+            params["goodTillDate"] = gtd
         if hedge:
             params["positionSide"] = "LONG" if is_long else "SHORT"
         try:
@@ -466,7 +472,18 @@ def place_orders(
     return placed > 0
 
 
-# --- Trailing TP on the OPPOSITE order book (profit-guaranteed) ----------
+def good_till_date_ms(ttl_sec: float) -> int:
+    """Unix ms expiry for Binance GTD orders (second precision, min now + 600 s)."""
+    ttl = max(float(ttl_sec), 610.0)
+    return int(time.time() + ttl) * 1000
+
+
+def limit_time_in_force(args: argparse.Namespace) -> tuple[str, int | None]:
+    """Return (timeInForce, goodTillDate|None) for LIMIT grid orders."""
+    ttl = getattr(args, "order_ttl", 0.0)
+    if ttl > 0:
+        return "GTD", good_till_date_ms(ttl)
+    return args.tif, None
 
 def choose_tp_activation(
     bids: list[list[float]],
@@ -957,7 +974,11 @@ def parse_args() -> argparse.Namespace:
     # Execution (LIMIT orders on Binance Futures). Executes by default; use --dry-run to preview.
     p.add_argument("--dry-run", action="store_true", help="Preview only — do NOT place/replace any real orders")
     p.add_argument("--force", action="store_true", help="Place even if the symbol already has a position/open orders")
-    p.add_argument("--tif", choices=["GTC", "GTX", "IOC", "FOK"], default="GTC", help="Time in force")
+    p.add_argument("--tif", choices=["GTC", "GTX", "IOC", "FOK"], default="GTC",
+                   help="Time in force when --order-ttl=0 (default GTC)")
+    p.add_argument("--order-ttl", type=float, default=_env_float("ORDER_TTL", 3600.0),
+                   help="LIMIT lifetime in seconds via native GTD (0=use --tif). Min 600. "
+                        "Default 1h. Env: ORDER_TTL")
     p.add_argument("--position-mode", choices=["auto", "hedge", "oneway"], default="auto")
     p.add_argument("--set-leverage", type=int, default=0, help="Force a specific leverage (0=use symbol max)")
     p.add_argument("--no-max-leverage", action="store_true", help="Do NOT auto-set the symbol's max leverage")

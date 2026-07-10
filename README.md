@@ -90,6 +90,9 @@ python3 orderbook_dca_grid.py ADAUSDT --supervise
   so the callback stays in profit; only replaced when the position size changes.
 - **Safety**: refuses to place a grid if the symbol already has a position/orders
   (`--force` to override); auto-cancels foreign SLs (`--keep-sl` to disable).
+- **Order expiry (Futures)**: LIMIT grid orders use native **GTD** by default
+  (`ORDER_TTL=3600` = 1 h in `.env`; `0` = GTC via `--tif`). Binance cancels
+  unfilled limits automatically; `--supervise` re-arms when flat.
 
 Run `python3 orderbook_dca_grid.py --help` for the full flag list.
 
@@ -156,6 +159,9 @@ it works differently from the Futures bot:
   sums the rounded grid notional, compares it to **free USDT** and the cap, and
   **drops the deepest DCA orders** until the grid fits (keeps base + nearest DCAs).
   Env: `MAX_SYMBOL_PCT` / `MAX_SYMBOL_USDT`.
+- **Grid refresh (Spot)**: no native GTD on spot LIMIT orders — `--supervise`
+  cancels and re-arms stale grids after `GRID_TTL` seconds (default **1 h**;
+  `0` = off). Env: `GRID_TTL`.
 - Avg cost is derived from your recent buy trades (`myTrades`) to anchor the TP/SL.
 
 ```bash

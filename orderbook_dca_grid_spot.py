@@ -524,6 +524,14 @@ def cancel_all_open_orders(symbol: str, api: str, sec: str, recv: int) -> int:
     return len(oo)
 
 
+def grid_age_sec(orders: list[dict]) -> float:
+    """Age in seconds of the oldest open order (by Binance `time` field)."""
+    times = [int(o.get("time", 0) or 0) for o in orders]
+    if not times:
+        return 0.0
+    return max(0.0, time.time() - min(times) / 1000)
+
+
 def market_sell_base(symbol: str, filt: dict, api: str, sec: str, recv: int) -> float:
     """Market-sell all free base asset. Returns qty sold (0 if nothing to sell)."""
     step = filt["step_size"]
@@ -900,7 +908,16 @@ def supervise_loop(args: argparse.Namespace) -> None:
                 else:
                     oo = open_orders(args.symbol, api, sec, args.recv_window)
                     buys = [o for o in oo if str(o.get("side", "")).upper() == "BUY"]
-                    if buys:
+                    if buys and args.grid_ttl > 0 and grid_age_sec(buys) >= args.grid_ttl:
+                        armed_log_state = None
+                        age_h = grid_age_sec(buys) / 3600
+                        print(f"{YELLOW}Grid stale ({age_h:.1f}h ≥ {args.grid_ttl / 3600:.1f}h TTL) "
+                              f"→ refreshing at current book walls…{RESET}")
+                        cancel_all_open_orders(args.symbol, api, sec, args.recv_window)
+                        if not build_and_place_grid(args, api, sec, filt, verbose=True):
+                            sleep_s = max(args.poll_sec, args.rearm_backoff)
+                            print(f"{DIM}Grid refresh failed → retrying in {sleep_s:g}s.{RESET}")
+                    elif buys:
                         state = f"armed:{len(buys)}"
                         if state != armed_log_state:
                             print(f"{DIM}Flat · grid armed ({len(buys)} buy orders waiting to fill)…{RESET}")
@@ -1033,6 +1050,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--poll-sec", type=float, default=5.0, help="Position/OCO re-sync interval")
     p.add_argument("--rearm-backoff", type=float, default=_env_float("REARM_BACKOFF", 60.0),
                    help="When flat but a grid can't be armed, wait this long before retrying. Env: REARM_BACKOFF")
+    p.add_argument("--grid-ttl", type=float, default=_env_float("GRID_TTL", 3600.0),
+                   help="Refresh a flat armed grid after this many seconds (cancel + re-arm). "
+                        "0=off. Default 1h. Env: GRID_TTL")
     args = p.parse_args()
     args.execute = not args.dry_run
     return args
