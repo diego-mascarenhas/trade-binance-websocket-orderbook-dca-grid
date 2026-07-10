@@ -143,24 +143,45 @@ If you prefer not to configure the server yourself, you can hire a VPS through *
 
 Contact: [info@revisionalpha.com](mailto:info@revisionalpha.com) · [+34 613 194 131](tel:+34613194131)
 
-Recommended install path:
+Install path (code under `/opt`, process runs as **`forge`** — never as root):
 
 ```text
-/home/forge/scripts/trade-binance-websocket-orderbook-dca-grid
+/opt/trade-binance-websocket-orderbook-dca-grid
 ```
 
 The `.env` is **not** in git — create it on the server. Units use `User=forge` and `WorkingDirectory` pointing at the project folder.
 
-### Install units
+### Fresh install (new server)
 
 ```bash
-cd /home/forge/scripts/trade-binance-websocket-orderbook-dca-grid
+# 1. Clone as forge
+sudo mkdir -p /opt
+sudo git clone https://github.com/diego-mascarenhas/trade-binance-websocket-orderbook-dca-grid.git \
+  /opt/trade-binance-websocket-orderbook-dca-grid
+sudo chown -R forge:forge /opt/trade-binance-websocket-orderbook-dca-grid
+
+# 2. Secrets
+cd /opt/trade-binance-websocket-orderbook-dca-grid
 cp .env.example .env
 chmod 600 .env
-# edit .env: keys + FUTURES_PAIRS / SPOT_PAIRS
+nano .env   # BINANCE_API_KEY, BINANCE_SECRET_KEY, FUTURES_PAIRS, SPOT_PAIRS
 
+# 3. Dry-run
+python3 orderbook_dca_grid_spot.py BTCUSDT --dry-run
+
+# 4. systemd (needs sudo for systemctl)
 sudo cp deploy/dca-futures@.service deploy/dca-futures-tp@.service deploy/dca-spot@.service /etc/systemd/system/
 sudo systemctl daemon-reload
+python3 deploy/sync_pairs.py --dry-run
+python3 deploy/sync_pairs.py
+```
+
+Updates later:
+
+```bash
+cd /opt/trade-binance-websocket-orderbook-dca-grid
+git pull
+python3 deploy/sync_pairs.py --restart
 ```
 
 | Unit | Command | Use when |
