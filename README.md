@@ -63,6 +63,11 @@ python3 orderbook_dca_grid.py ADAUSDT --tp-only
 
 # Fully autonomous: re-arm grid when flat + manage TP
 python3 orderbook_dca_grid.py ADAUSDT --supervise
+
+# Cancel + fresh grid (DCA-only if holding; stop systemd unit first)
+python3 orderbook_dca_grid.py OPUSDT --rearm --dry-run
+python3 orderbook_dca_grid.py OPUSDT --rearm
+python3 orderbook_dca_grid.py OPUSDT --rearm --rearm-flat  # close position, then full grid
 ```
 
 ### Key behavior
@@ -73,7 +78,7 @@ python3 orderbook_dca_grid.py ADAUSDT --supervise
 - **Leverage**: symbol max set automatically (`--no-max-leverage` / `--set-leverage N`).
 - **DCA walls**: real order-book levels within `--max-range` % (default 12).
 - **Trailing TP**: opposite-side wall, activation clamped so callback stays in profit.
-- **Order expiry**: LIMIT orders use native **GTD** (`ORDER_TTL=3600` = 1 h; `0` = GTC). `--supervise` re-arms when flat.
+- **Order expiry**: only the **base/entry** LIMIT uses **GTD** (`ORDER_TTL=3600` = 1 h; `0` = all GTC). DCA safety orders stay **GTC**. If the entry expires unfilled, `--supervise` cancels the whole grid and re-arms. With an open position, DCA orders are kept.
 - **Safety**: refuses to stack on existing exposure (`--force` to override); cancels foreign SLs (`--keep-sl` to disable).
 
 Run `python3 orderbook_dca_grid.py --help` for all flags.
@@ -117,7 +122,7 @@ Copy `.env.example` → `.env`. CLI flags override env vars.
 | `WALLET_PCT` | `10` | both | Entry size as % of wallet/free USDT |
 | `BASE_SIZE` | `0` | both | Fixed entry USDT (`0` = use `WALLET_PCT`) |
 | `MAX_IMBALANCE` | `30` | futures | Account LONG/SHORT balance guard (`0` = off) |
-| `ORDER_TTL` | `3600` | futures | LIMIT expiry via GTD in seconds (`0` = GTC) |
+| `ORDER_TTL` | `3600` | futures | Entry order GTD in seconds; DCA orders stay GTC (`0` = all GTC) |
 | `REARM_BACKOFF` | `60` | both | Wait when flat but grid can't be armed |
 | `MAX_SYMBOL_PCT` | `25` | spot | Cap per symbol (% of total USDT wallet) |
 | `MIN_BASE_USDT` | `10` | spot | Floor for wallet-% entry size |

@@ -376,17 +376,53 @@ def prepare_orders(orders: list[dict], symbol: str, is_long: bool, filt: dict[st
     return prepared
 
 
+def entry_client_id(symbol: str) -> str:
+    return f"obdcaE{symbol.upper()}"
+
+
+def dca_client_id(symbol: str, idx: int) -> str:
+    return f"obdcaS{symbol.upper()}{idx:02d}"
+
+
+def _order_client_id(order: dict) -> str:
+    return str(order.get("clientOrderId") or order.get("origClientOrderId") or "")
+
+
+def grid_entry_order_open(open_orders: list[dict], symbol: str) -> bool:
+    want = entry_client_id(symbol)
+    return any(_order_client_id(o) == want for o in open_orders)
+
+
+def grid_is_orphaned(open_orders: list[dict], symbol: str) -> bool:
+    """Flat with DCA limits still open after the tagged entry order expired (GTD)."""
+    if not open_orders or grid_entry_order_open(open_orders, symbol):
+        return False
+    prefix = f"obdcaS{symbol.upper()}"
+    return any(_order_client_id(o).startswith(prefix) for o in open_orders)
+
+
+def cancel_all_symbol_orders(symbol: str, api: str, sec: str, recv: int) -> None:
+    _signed_request(
+        "DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol.upper()}, api, sec, recv,
+    )
+
+
 def place_orders(
     symbol: str,
     is_long: bool,
     prepared: list[dict],
     args: argparse.Namespace,
-) -> None:
+    *,
+    force: bool | None = None,
+    dca_only: bool = False,
+) -> bool:
     side = "BUY" if is_long else "SELL"
     api, sec = load_keys(args.env_file)
     if not api or not sec:
         print(f"{RED}No API keys found (env or .env). Cannot execute.{RESET}")
-        return
+        return False
+
+    use_force = args.force if force is None else force
 
     # Position mode
     hedge = False
@@ -402,7 +438,7 @@ def place_orders(
             print(f"{RED}Could not detect position mode ({exc}); assuming one-way.{RESET}")
 
     # Safety: refuse to place a new grid if there is already exposure on this symbol.
-    if not args.force:
+    if not use_force:
         ql, el = get_position(symbol, True, hedge, api, sec, args.recv_window)
         qs, es = get_position(symbol, False, hedge, api, sec, args.recv_window)
         try:
@@ -442,13 +478,26 @@ def place_orders(
             print(f"{RED}Set leverage failed: {exc}{RESET}")
 
     print(f"\n{BOLD}Placing {len(prepared)} {side} LIMIT orders on {symbol.upper()} "
-          f"({'hedge' if hedge else 'one-way'} mode)...{RESET}")
-    tif, gtd = limit_time_in_force(args)
-    if gtd:
-        print(f"{DIM}Order expiry: GTD in {args.order_ttl:g}s "
-              f"({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(gtd / 1000))}).{RESET}")
+          f"({'hedge' if hedge else 'one-way'} mode)"
+          f"{f' · DCA only' if dca_only else ''}...{RESET}")
+    entry_tif, entry_gtd = limit_time_in_force(args, entry_only=True)
+    if entry_gtd and not dca_only:
+        print(f"{DIM}Entry order expiry: GTD in {args.order_ttl:g}s "
+              f"({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(entry_gtd / 1000))}); "
+              f"DCA orders GTC.{RESET}")
+    elif dca_only:
+        print(f"{DIM}DCA safety orders GTC (no new entry).{RESET}")
     placed = 0
-    for o in prepared:
+    for i, o in enumerate(prepared):
+        if dca_only:
+            tif, gtd = args.tif, None
+            cid = dca_client_id(symbol, i + 1)
+        elif i == 0 and entry_gtd:
+            tif, gtd = entry_tif, entry_gtd
+            cid = entry_client_id(symbol)
+        else:
+            tif, gtd = args.tif, None
+            cid = dca_client_id(symbol, i)
         params = {
             "symbol": symbol.upper(),
             "side": side,
@@ -459,6 +508,7 @@ def place_orders(
         }
         if gtd:
             params["goodTillDate"] = gtd
+        params["newClientOrderId"] = cid
         if hedge:
             params["positionSide"] = "LONG" if is_long else "SHORT"
         try:
@@ -478,12 +528,15 @@ def good_till_date_ms(ttl_sec: float) -> int:
     return int(time.time() + ttl) * 1000
 
 
-def limit_time_in_force(args: argparse.Namespace) -> tuple[str, int | None]:
-    """Return (timeInForce, goodTillDate|None) for LIMIT grid orders."""
+def limit_time_in_force(args: argparse.Namespace, *, entry_only: bool = False) -> tuple[str, int | None]:
+    """Return (timeInForce, goodTillDate|None) for LIMIT grid orders.
+
+    When order_ttl > 0, only the base/entry order uses GTD; DCA safety orders stay GTC.
+    """
     ttl = getattr(args, "order_ttl", 0.0)
-    if ttl > 0:
+    if ttl > 0 and entry_only:
         return "GTD", good_till_date_ms(ttl)
-    return args.tif, None
+    return args.tif if ttl > 0 else args.tif, None
 
 def choose_tp_activation(
     bids: list[list[float]],
@@ -806,7 +859,9 @@ def manage_trailing_tp(symbol: str, is_long: bool | None, args: argparse.Namespa
 
 
 def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
-                         filt: dict[str, Decimal], verbose: bool = True) -> bool:
+                         filt: dict[str, Decimal], verbose: bool = True,
+                         *, dca_only: bool = False, force: bool = False,
+                         direction: str | None = None) -> bool:
     """Compute (auto-direction, wallet%% size, max leverage) and place a fresh grid.
     Returns True if orders were placed. Used by --supervise for auto re-arming."""
     try:
@@ -820,14 +875,15 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
         return False
     mid = (bids[0][0] + asks[0][0]) / 2
 
-    if args.direction == "auto":
+    dir_choice = direction or args.direction
+    if dir_choice == "auto":
         d = decide_direction(bids, asks, mid, args.auto_range)
         is_long = d["direction"] == "long"
         if verbose:
             print(f"{BOLD}{CYAN}Auto-direction: {d['direction'].upper()}{RESET} "
                   f"{DIM}(bid {d['bid_vol']:,.0f} vs ask {d['ask_vol']:,.0f}){RESET}")
     else:
-        is_long = args.direction == "long"
+        is_long = dir_choice == "long"
 
     entry = args.price if args.price is not None else mid
     base_size = args.base_size
@@ -839,8 +895,14 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
             print(f"{RED}Wallet balance read failed: {exc}{RESET}")
             return False
 
-    if account_imbalance_blocks(args, is_long, base_size, api, sec, verbose):
-        return False
+    prev_force = args.force
+    if force:
+        args.force = True
+    try:
+        if account_imbalance_blocks(args, is_long, base_size, api, sec, verbose):
+            return False
+    finally:
+        args.force = prev_force
 
     levels = bids if is_long else asks
     walls = select_walls(levels, entry, is_long, args.so_count, args.min_gap, args.min_dist, args.max_range)
@@ -850,8 +912,110 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
 
     orders = build_grid(entry, is_long, walls, base_size, args.tp, args.size_mode,
                         args.comp_factor, args.so_size, args.volume_scale)
+    if dca_only:
+        orders = orders[1:]
+        if not orders:
+            print(f"{RED}No DCA levels to place.{RESET}")
+            return False
+        if verbose:
+            print(f"{BOLD}{CYAN}Re-arm DCA only ({len(orders)} safety orders, "
+                  f"{'LONG' if is_long else 'SHORT'}){RESET}")
+
     prepared = prepare_orders(orders, args.symbol, is_long, filt)
-    return place_orders(args.symbol, is_long, prepared, args)
+    return place_orders(args.symbol, is_long, prepared, args, force=force, dca_only=dca_only)
+
+
+def market_close_position(symbol: str, is_long: bool, qty: float, hedge: bool,
+                          filt: dict[str, Decimal], api: str, sec: str, recv: int) -> float:
+    """Market-close an open futures position. Returns closed qty."""
+    step = filt["step_size"]
+    qty_dp = _dec_places(step)
+    qty_d = _round_to(qty, step, ROUND_DOWN)
+    if qty_d <= 0:
+        return 0.0
+    side = "SELL" if is_long else "BUY"
+    params: dict[str, str] = {
+        "symbol": symbol.upper(),
+        "side": side,
+        "type": "MARKET",
+        "quantity": f"{qty_d:.{qty_dp}f}",
+    }
+    if hedge:
+        params["positionSide"] = "LONG" if is_long else "SHORT"
+    else:
+        params["reduceOnly"] = "true"
+    _signed_request("POST", "/fapi/v1/order", params, api, sec, recv)
+    return float(qty_d)
+
+
+def rearm_grid(args: argparse.Namespace) -> bool:
+    """Cancel open orders on the symbol and place a fresh grid.
+
+    With an open position: DCA safety orders only (no new entry). Keeps/syncs trailing TP.
+    With --rearm-flat: market-close first, then a full grid from flat.
+    Stop the systemd unit for this symbol before running (supervisor would conflict).
+    """
+    api, sec = load_keys(args.env_file)
+    if not api or not sec:
+        print(f"{RED}No API keys — cannot re-arm.{RESET}")
+        return False
+    try:
+        filt = load_symbol_filters(args.symbol)
+    except Exception as exc:
+        print(f"{RED}Could not load symbol filters: {exc}{RESET}")
+        return False
+    hedge = _resolve_hedge(args, api, sec)
+    sym = args.symbol.upper()
+
+    try:
+        oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window) or []
+    except Exception:
+        oo = []
+    side_is_long, qty, pos_entry = _detect_open_side(args.symbol, hedge, api, sec, args.recv_window)
+
+    if args.dry_run:
+        mode = "full grid"
+        if side_is_long is not None and not args.rearm_flat:
+            mode = f"DCA-only ({'LONG' if side_is_long else 'SHORT'} position {qty:g} @ {pos_entry:g})"
+        elif args.rearm_flat and side_is_long is not None:
+            mode = f"market-close then full grid ({'LONG' if side_is_long else 'SHORT'} {qty:g})"
+        print(f"{BOLD}{CYAN}DRY-RUN re-arm {sym}{RESET}  {DIM}{mode}{RESET}")
+        print(f"  Would cancel {len(oo)} open order(s)")
+        print(f"{DIM}Remove --dry-run to execute. Stop dca-futures@{sym} first.{RESET}")
+        return True
+
+    if oo:
+        try:
+            cancel_all_symbol_orders(sym, api, sec, args.recv_window)
+            print(f"{DIM}Cancelled open orders on {sym}.{RESET}")
+        except Exception as exc:
+            print(f"{RED}Cancel orders failed: {exc}{RESET}")
+            return False
+
+    if args.rearm_flat and side_is_long is not None:
+        try:
+            closed = market_close_position(args.symbol, side_is_long, qty, hedge, filt, api, sec, args.recv_window)
+            print(f"{YELLOW}Market-closed {closed:g} → flat.{RESET}")
+        except Exception as exc:
+            print(f"{RED}Market close failed: {exc}{RESET}")
+            return False
+        time.sleep(0.5)
+        side_is_long, qty, pos_entry = None, 0.0, 0.0
+
+    placed = False
+    if side_is_long is not None:
+        direction = "long" if side_is_long else "short"
+        placed = build_and_place_grid(
+            args, api, sec, filt, verbose=True,
+            dca_only=True, force=True, direction=direction,
+        )
+        if placed:
+            print(f"{DIM}Syncing trailing TP…{RESET}")
+            _manage_tp_once(args.symbol, side_is_long, qty, pos_entry, args, hedge, api, sec, filt)
+    else:
+        placed = build_and_place_grid(args, api, sec, filt, verbose=True, force=True)
+
+    return placed
 
 
 def supervise_loop(args: argparse.Namespace) -> None:
@@ -881,7 +1045,20 @@ def supervise_loop(args: argparse.Namespace) -> None:
                         cancel_foreign_sl(args.symbol, True, api, sec, args.recv_window)
                         cancel_foreign_sl(args.symbol, False, api, sec, args.recv_window)
                     oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": args.symbol.upper()}, api, sec, args.recv_window)
-                    if oo:
+                    sym = args.symbol.upper()
+                    if oo and grid_is_orphaned(oo, sym):
+                        print(f"{YELLOW}Entry expired → cancelling orphan grid ({len(oo)} orders)…{RESET}")
+                        try:
+                            cancel_all_symbol_orders(sym, api, sec, args.recv_window)
+                        except Exception as exc:
+                            print(f"{RED}Cancel orphan grid failed: {exc}{RESET}")
+                        else:
+                            print(f"{BOLD}Flat after entry expiry → re-arming grid…{RESET}")
+                            placed = build_and_place_grid(args, api, sec, filt, verbose=True)
+                            if not placed:
+                                sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
+                                print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
+                    elif oo:
                         print(f"{DIM}Flat · grid armed ({len(oo)} orders waiting to fill)…{RESET}")
                     else:
                         print(f"{BOLD}Flat and no orders → re-arming grid…{RESET}")
@@ -977,8 +1154,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tif", choices=["GTC", "GTX", "IOC", "FOK"], default="GTC",
                    help="Time in force when --order-ttl=0 (default GTC)")
     p.add_argument("--order-ttl", type=float, default=_env_float("ORDER_TTL", 3600.0),
-                   help="LIMIT lifetime in seconds via native GTD (0=use --tif). Min 600. "
-                        "Default 1h. Env: ORDER_TTL")
+                   help="Base/entry LIMIT lifetime in seconds via GTD (0=use --tif for all). "
+                        "DCA safety orders always use --tif (default GTC). Env: ORDER_TTL")
     p.add_argument("--position-mode", choices=["auto", "hedge", "oneway"], default="auto")
     p.add_argument("--set-leverage", type=int, default=0, help="Force a specific leverage (0=use symbol max)")
     p.add_argument("--no-max-leverage", action="store_true", help="Do NOT auto-set the symbol's max leverage")
@@ -996,6 +1173,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rearm-backoff", type=float, default=_env_float("REARM_BACKOFF", 60.0),
                    help="When flat but a grid can't be armed (imbalance/no walls), wait this "
                         "long before retrying instead of --tp-poll-sec. Env: REARM_BACKOFF")
+    p.add_argument("--rearm", action="store_true",
+                   help="Cancel open orders and place a fresh grid (DCA-only if holding a position)")
+    p.add_argument("--rearm-flat", action="store_true",
+                   help="With --rearm: market-close the position first, then place a full grid")
     p.add_argument("--keep-sl", action="store_true", help="Do NOT auto-cancel foreign STOP_MARKET SLs (e.g. Finandy's)")
     args = p.parse_args()
     # Executes by default; --dry-run flips it off.
@@ -1054,6 +1235,10 @@ def run_tp_manager(args: argparse.Namespace, is_long: bool | None) -> None:
 
 def main() -> None:
     args = parse_args()
+
+    if args.rearm:
+        rearm_grid(args)
+        return
 
     if args.supervise:
         if not args.execute:
