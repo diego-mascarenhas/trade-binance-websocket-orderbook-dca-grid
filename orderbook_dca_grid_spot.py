@@ -515,6 +515,33 @@ def cancel_oco(symbol: str, order_list_id: int, api: str, sec: str, recv: int) -
                     {"symbol": symbol.upper(), "orderListId": order_list_id}, api, sec, recv)
 
 
+def cancel_all_open_orders(symbol: str, api: str, sec: str, recv: int) -> int:
+    """Cancel every open order on the symbol (OCO lists + standalone limits). Returns count."""
+    oo = open_orders(symbol, api, sec, recv)
+    if not oo:
+        return 0
+    _signed_request("DELETE", "/api/v3/openOrders", {"symbol": symbol.upper()}, api, sec, recv)
+    return len(oo)
+
+
+def market_sell_base(symbol: str, filt: dict, api: str, sec: str, recv: int) -> float:
+    """Market-sell all free base asset. Returns qty sold (0 if nothing to sell)."""
+    step = filt["step_size"]
+    qty_dp = _dec_places(step)
+    base_qty = get_free(api, sec, recv, filt["base_asset"])
+    qty_d = _round_to(base_qty, step, ROUND_DOWN)
+    if qty_d <= 0 or qty_d < filt["min_qty"]:
+        return 0.0
+    qty_str = f"{qty_d:.{qty_dp}f}"
+    _signed_request("POST", "/api/v3/order", {
+        "symbol": symbol.upper(),
+        "side": "SELL",
+        "type": "MARKET",
+        "quantity": qty_str,
+    }, api, sec, recv)
+    return float(qty_d)
+
+
 def average_cost(symbol: str, qty_target: float, api: str, sec: str, recv: int) -> float:
     """Approx average cost of the currently-held qty from the most recent BUY fills."""
     try:
@@ -792,6 +819,56 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str, filt: dic
     return place_buy_grid(args.symbol, prepared, args, api, sec)
 
 
+def rearm_grid(args: argparse.Namespace) -> bool:
+    """Cancel open orders on the symbol and place a fresh buy grid via API.
+
+    Keeps the current holding by default (OCO is re-synced after if still held).
+    Pass --rearm-flat to market-sell first and start completely flat.
+    """
+    api, sec = load_keys(args.env_file)
+    if not api or not sec:
+        print(f"{RED}No API keys — cannot re-arm.{RESET}")
+        return False
+    try:
+        filt = load_symbol_filters(args.symbol)
+    except Exception as exc:
+        print(f"{RED}Could not load symbol filters: {exc}{RESET}")
+        return False
+
+    oo = open_orders(args.symbol, api, sec, args.recv_window)
+    base_held = get_total(api, sec, args.recv_window, filt["base_asset"])
+    if args.dry_run:
+        print(f"{BOLD}{CYAN}DRY-RUN re-arm {args.symbol.upper()}{RESET}")
+        print(f"  Would cancel {len(oo)} open order(s)")
+        if args.rearm_flat and base_held > 0:
+            print(f"  Would market-sell {qty_fmt(base_held)} {filt['base_asset']}")
+        elif base_held > 0:
+            print(f"  Would keep {qty_fmt(base_held)} {filt['base_asset']} and place DCA buys below")
+        print(f"{DIM}Remove --dry-run to execute.{RESET}")
+        return True
+
+    if oo:
+        n = cancel_all_open_orders(args.symbol, api, sec, args.recv_window)
+        print(f"{DIM}Cancelled {n} open order(s) on {args.symbol.upper()}.{RESET}")
+
+    if args.rearm_flat:
+        sold = market_sell_base(args.symbol, filt, api, sec, args.recv_window)
+        if sold > 0:
+            print(f"{YELLOW}Market-sold {qty_fmt(sold)} {filt['base_asset']} → flat.{RESET}")
+        time.sleep(0.5)
+
+    if not build_and_place_grid(args, api, sec, filt, verbose=True):
+        return False
+
+    best_bid, best_ask = best_book(args.symbol)
+    mid = (best_bid + best_ask) / 2
+    held = get_total(api, sec, args.recv_window, filt["base_asset"]) * mid
+    if held >= float(filt["min_notional"]):
+        print(f"{DIM}Holding detected → syncing OCO…{RESET}")
+        manage_oco_once(args.symbol, args, filt, api, sec, verbose=True)
+    return True
+
+
 # --- Loops ---------------------------------------------------------------
 
 def supervise_loop(args: argparse.Namespace) -> None:
@@ -948,6 +1025,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--env-file", default=None, help="Path to .env with API keys (default: project root)")
     p.add_argument("--no-tp", action="store_true", help="Do NOT auto-manage the OCO after placing the grid")
     p.add_argument("--tp-only", action="store_true", help="Skip the grid; only (re)place/manage the OCO exit")
+    p.add_argument("--rearm", action="store_true",
+                   help="Cancel open orders and place a fresh buy grid (one-shot via API)")
+    p.add_argument("--rearm-flat", action="store_true",
+                   help="With --rearm: market-sell the holding first so the symbol starts flat")
     p.add_argument("--supervise", action="store_true", help="Autonomous: re-arm grid when flat + manage OCO (loop)")
     p.add_argument("--poll-sec", type=float, default=5.0, help="Position/OCO re-sync interval")
     p.add_argument("--rearm-backoff", type=float, default=_env_float("REARM_BACKOFF", 60.0),
@@ -965,6 +1046,10 @@ def main() -> None:
             print(f"{DIM}--supervise places/re-arms real orders; remove --dry-run to run it.{RESET}")
             return
         supervise_loop(args)
+        return
+
+    if args.rearm:
+        rearm_grid(args)
         return
 
     if args.tp_only:

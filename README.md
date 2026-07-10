@@ -170,6 +170,10 @@ python3 orderbook_dca_grid_spot.py ADAUSDT --supervise
 
 # only (re)place/manage the OCO for what you already hold
 python3 orderbook_dca_grid_spot.py ADAUSDT --tp-only
+
+# cancel open orders and place a fresh buy grid (stop the systemd unit first)
+python3 orderbook_dca_grid_spot.py SOLUSDT --rearm
+python3 orderbook_dca_grid_spot.py BNBUSDT --rearm --rearm-flat   # sell first, start flat
 ```
 
 Env knobs (in `.env`): `SPOT_TP`, `SPOT_SL`, `MAX_SYMBOL_USDT`, plus the shared
