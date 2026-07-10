@@ -124,6 +124,27 @@ sudo systemctl restart dca-super@ADAUSDT
 sudo systemctl disable --now dca-super@ADAUSDT
 ```
 
+### Sync pairs from `.env`
+
+Edit `FUTURES_PAIRS` and/or `SPOT_PAIRS` in `.env`, then run:
+
+```bash
+python3 deploy/sync_pairs.py status    # desired vs running
+python3 deploy/sync_pairs.py --dry-run # preview
+python3 deploy/sync_pairs.py           # enable+start listed, disable the rest
+python3 deploy/sync_pairs.py --restart # same + restart already-running units
+```
+
+Example `.env`:
+
+```env
+FUTURES_PAIRS=BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT
+SPOT_PAIRS=BTCUSDT,ETHUSDT,BNBUSDT
+```
+
+Omit `FUTURES_PAIRS` or `SPOT_PAIRS` entirely to leave that market untouched.
+An empty value (`SPOT_PAIRS=`) disables all units for that template.
+
 > If your path/user differ, edit `WorkingDirectory`/`ExecStart`/`User` in the
 > `.service` file. Use `dca-super@` (autonomous) **or** `dca-tp@` (manage only)
 > per symbol — not both.
