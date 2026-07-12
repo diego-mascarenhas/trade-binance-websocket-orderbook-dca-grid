@@ -78,7 +78,8 @@ python3 orderbook_dca_grid.py OPUSDT --rearm --rearm-flat  # close position, the
 - **Leverage**: symbol max set automatically (`--no-max-leverage` / `--set-leverage N`).
 - **DCA walls**: real order-book levels within `--max-range` % (default 12).
 - **Trailing TP**: opposite-side wall, activation clamped so callback stays in profit.
-- **Order expiry**: only the **base/entry** LIMIT uses **GTD** (`ORDER_TTL=3600` = 1 h; `0` = all GTC). DCA safety orders stay **GTC**. If the entry expires unfilled, `--supervise` cancels the whole grid and re-arms. With an open position, DCA orders are kept.
+- **Order expiry**: only the **base/entry** LIMIT uses **GTD** (`ORDER_TTL=3600` = 1 h; `0` = all GTC). DCA safety orders stay **GTC**. If the entry expires unfilled, `--supervise` cancels the whole grid and re-arms.
+- **Grid refresh**: while flat, `--supervise` cancels and re-arms after `GRID_TTL` (default **1 h**; `0` = off), same as Spot. With an open position, DCA orders are kept (use `--rearm` to replenish).
 - **Safety**: refuses to stack on existing exposure (`--force` to override); cancels foreign SLs (`--keep-sl` to disable).
 
 Run `python3 orderbook_dca_grid.py --help` for all flags.
@@ -106,7 +107,7 @@ python3 orderbook_dca_grid_spot.py BTCUSDT --tp-only --once   # sync OCO once an
 - **BUY LIMIT** grid on real **bid walls**; DCA count from the book (`SO_WALL_MULT`), capped by `SO_MAX`.
 - **OCO SELL** while holding: TP on ask walls, SL **below the deepest open DCA** (`SPOT_SL` is fallback when grid is fully filled).
 - **Budget fit**: before placing, sums grid notional vs free USDT and `MAX_SYMBOL_PCT` (default **25%** of wallet); drops deepest DCAs until it fits.
-- **Grid refresh**: Spot has no native GTD — `--supervise` cancels and re-arms after `GRID_TTL` (default **1 h**; `0` = off).
+- **Grid refresh**: `--supervise` cancels and re-arms after `GRID_TTL` (default **1 h**; `0` = off).
 
 Run `python3 orderbook_dca_grid_spot.py --help` for all flags.
 
@@ -124,10 +125,10 @@ Copy `.env.example` → `.env`. CLI flags override env vars.
 | `BASE_SIZE` | `0` | both | Fixed entry USDT (`0` = use `WALLET_PCT`) |
 | `MAX_IMBALANCE` | `30` | futures | Account LONG/SHORT balance guard (`0` = off) |
 | `ORDER_TTL` | `3600` | futures | Entry order GTD in seconds; DCA orders stay GTC (`0` = all GTC) |
+| `GRID_TTL` | `3600` | futures + spot | Refresh stale flat grid (seconds; `0` = off) |
 | `REARM_BACKOFF` | `60` | both | Wait when flat but grid can't be armed |
 | `MAX_SYMBOL_PCT` | `25` | spot | Cap per symbol (% of total USDT wallet) |
 | `MIN_BASE_USDT` | `10` | spot | Floor for wallet-% entry size |
-| `GRID_TTL` | `3600` | spot | Refresh stale armed grid (seconds) |
 | `SPOT_TP` / `SPOT_SL` | `0.5` / `5` | spot | OCO TP/SL % |
 | `FUTURES_PAIRS` | — | deploy | Comma-separated symbols for `dca-futures@` |
 | `SPOT_PAIRS` | — | deploy | Comma-separated symbols for `dca-spot@` |

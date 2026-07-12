@@ -407,6 +407,14 @@ def cancel_all_symbol_orders(symbol: str, api: str, sec: str, recv: int) -> None
     )
 
 
+def grid_age_sec(orders: list[dict]) -> float:
+    """Age in seconds of the oldest open order (by Binance `time` field)."""
+    times = [int(o.get("time", 0) or 0) for o in orders]
+    if not times:
+        return 0.0
+    return max(0.0, time.time() - min(times) / 1000)
+
+
 def place_orders(
     symbol: str,
     is_long: bool,
@@ -1031,14 +1039,18 @@ def supervise_loop(args: argparse.Namespace) -> None:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
     hedge = _resolve_hedge(args, api, sec)
+    ttl_note = f", grid refresh {args.grid_ttl:g}s" if args.grid_ttl > 0 else ""
     print(f"\n{BOLD}{CYAN}Supervising {args.symbol.upper()} "
-          f"(auto re-arm grid + trailing TP, poll {args.tp_poll_sec:g}s). Ctrl+C to stop.{RESET}")
+          f"(auto re-arm grid + trailing TP, poll {args.tp_poll_sec:g}s{ttl_note}). "
+          f"Ctrl+C to stop.{RESET}")
+    armed_log_state: str | None = None
     try:
         while True:
             sleep_s = args.tp_poll_sec
             try:
                 side_is_long, qty, entry = _detect_open_side(args.symbol, hedge, api, sec, args.recv_window)
                 if side_is_long is not None:
+                    armed_log_state = None
                     _manage_tp_once(args.symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
                 else:
                     if not args.keep_sl:
@@ -1047,6 +1059,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
                     oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": args.symbol.upper()}, api, sec, args.recv_window)
                     sym = args.symbol.upper()
                     if oo and grid_is_orphaned(oo, sym):
+                        armed_log_state = None
                         print(f"{YELLOW}Entry expired → cancelling orphan grid ({len(oo)} orders)…{RESET}")
                         try:
                             cancel_all_symbol_orders(sym, api, sec, args.recv_window)
@@ -1058,9 +1071,27 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             if not placed:
                                 sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
                                 print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
+                    elif oo and args.grid_ttl > 0 and grid_age_sec(oo) >= args.grid_ttl:
+                        armed_log_state = None
+                        age_h = grid_age_sec(oo) / 3600
+                        print(f"{YELLOW}Grid stale ({age_h:.1f}h ≥ {args.grid_ttl / 3600:.1f}h TTL) "
+                              f"→ refreshing at current book walls…{RESET}")
+                        try:
+                            cancel_all_symbol_orders(sym, api, sec, args.recv_window)
+                        except Exception as exc:
+                            print(f"{RED}Cancel stale grid failed: {exc}{RESET}")
+                        else:
+                            placed = build_and_place_grid(args, api, sec, filt, verbose=True)
+                            if not placed:
+                                sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
+                                print(f"{DIM}Grid refresh failed → retrying in {sleep_s:g}s.{RESET}")
                     elif oo:
-                        print(f"{DIM}Flat · grid armed ({len(oo)} orders waiting to fill)…{RESET}")
+                        state = f"armed:{len(oo)}"
+                        if state != armed_log_state:
+                            print(f"{DIM}Flat · grid armed ({len(oo)} orders waiting to fill)…{RESET}")
+                            armed_log_state = state
                     else:
+                        armed_log_state = None
                         print(f"{BOLD}Flat and no orders → re-arming grid…{RESET}")
                         placed = build_and_place_grid(args, api, sec, filt, verbose=True)
                         if not placed:
@@ -1156,6 +1187,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--order-ttl", type=float, default=_env_float("ORDER_TTL", 3600.0),
                    help="Base/entry LIMIT lifetime in seconds via GTD (0=use --tif for all). "
                         "DCA safety orders always use --tif (default GTC). Env: ORDER_TTL")
+    p.add_argument("--grid-ttl", type=float, default=_env_float("GRID_TTL", 3600.0),
+                   help="Refresh a flat armed grid after this many seconds (cancel + re-arm). "
+                        "0=off. Default 1h. Env: GRID_TTL")
     p.add_argument("--position-mode", choices=["auto", "hedge", "oneway"], default="auto")
     p.add_argument("--set-leverage", type=int, default=0, help="Force a specific leverage (0=use symbol max)")
     p.add_argument("--no-max-leverage", action="store_true", help="Do NOT auto-set the symbol's max leverage")
