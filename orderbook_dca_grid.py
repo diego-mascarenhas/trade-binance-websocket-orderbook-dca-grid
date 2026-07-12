@@ -1119,7 +1119,7 @@ def parse_args() -> argparse.Namespace:
     load_env_file(env_file)
 
     p = argparse.ArgumentParser(description="DCA grid anchored to real order-book walls")
-    p.add_argument("symbol", help="Symbol, e.g. MORPHOUSDT")
+    p.add_argument("symbol", nargs="?", default=None, help="Symbol, e.g. MORPHOUSDT")
     p.add_argument("--price", type=float, default=None, help="Entry price (default: live mid)")
     p.add_argument("--direction", choices=["long", "short", "auto"], default="auto",
                    help="auto = decide from bid/ask imbalance in the book")
@@ -1177,11 +1177,147 @@ def parse_args() -> argparse.Namespace:
                    help="Cancel open orders and place a fresh grid (DCA-only if holding a position)")
     p.add_argument("--rearm-flat", action="store_true",
                    help="With --rearm: market-close the position first, then place a full grid")
+    p.add_argument("--audit", action="store_true",
+                   help="Show open grid orders, trailing TP, and position (read-only)")
+    p.add_argument("--audit-all", action="store_true",
+                   help="With --audit: every symbol in FUTURES_PAIRS from .env")
+    p.add_argument("--audit-symbols", default=None,
+                   help="With --audit: comma-separated symbols (e.g. LINKUSDT,DOGEUSDT)")
     p.add_argument("--keep-sl", action="store_true", help="Do NOT auto-cancel foreign STOP_MARKET SLs (e.g. Finandy's)")
     args = p.parse_args()
     # Executes by default; --dry-run flips it off.
     args.execute = not args.dry_run
     return args
+
+
+def _parse_symbol_list(raw: str) -> list[str]:
+    """Parse 'BTCUSDT, ETHUSDT' → ['BTCUSDT', 'ETHUSDT']."""
+    pairs: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        sym = part.strip().upper()
+        if sym:
+            pairs.append(sym)
+    return pairs
+
+
+def _list_trailing_tps(symbol: str, api: str, sec: str, recv: int) -> list[dict]:
+    """All open TRAILING_STOP_MARKET algo orders on the symbol."""
+    try:
+        resp = _signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol.upper()}, api, sec, recv)
+    except Exception:
+        return []
+    orders = resp if isinstance(resp, list) else resp.get("orders", resp.get("data", []))
+    out: list[dict] = []
+    for o in orders or []:
+        otype = str(o.get("orderType") or o.get("type") or "").upper()
+        if otype == "TRAILING_STOP_MARKET":
+            out.append(o)
+    return out
+
+
+def audit_symbol(
+    symbol: str,
+    args: argparse.Namespace,
+    api: str,
+    sec: str,
+    hedge: bool,
+    *,
+    so_count: int,
+) -> None:
+    """Print open grid orders, trailing TP, and position for one symbol."""
+    sym = symbol.upper()
+    recv = args.recv_window
+
+    oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, recv) or []
+    dca = [o for o in oo if _order_client_id(o).startswith(f"obdcaS{sym}")]
+    entry = [o for o in oo if _order_client_id(o).startswith(f"obdcaE{sym}")]
+    other = [o for o in oo if not _order_client_id(o).startswith("obdca")]
+
+    side_is_long, qty, pos_entry = _detect_open_side(sym, hedge, api, sec, recv)
+    trailings = _list_trailing_tps(sym, api, sec, recv)
+
+    print(f"\n{BOLD}{CYAN}=== {sym} ==={RESET}")
+    print(f"  Open limits: {len(dca)} DCA  |  {len(entry)} entry  |  {len(other)} other")
+    print(f"  Trailing TP (algo): {len(trailings)}")
+
+    if side_is_long is not None:
+        side = "LONG" if side_is_long else "SHORT"
+        mark = 0.0
+        try:
+            idx = _signed_request("GET", "/fapi/v1/premiumIndex", {"symbol": sym}, api, sec, recv)
+            mark = float(idx.get("markPrice", 0) or 0)
+        except Exception:
+            pass
+        notional = abs(qty) * mark if mark else 0.0
+        print(f"  Position: {side} {qty:g} @ {pos_entry:g}  notional≈{notional:.1f} USDT")
+    else:
+        print(f"  Position: flat")
+
+    if side_is_long is not None and len(dca) == 0:
+        status = f"{YELLOW}⚠ position open, no DCA grid — run --rearm{RESET}"
+    elif side_is_long is None and oo and grid_is_orphaned(oo, sym):
+        status = f"{YELLOW}⚠ orphan grid (entry expired){RESET}"
+    elif side_is_long is not None and len(dca) < so_count:
+        status = f"{DIM}DCA {len(dca)}/{so_count} open (rest may have filled){RESET}"
+    elif side_is_long is not None and len(dca) >= so_count:
+        status = f"{GREEN}✓ grid armed ({len(dca)}/{so_count} DCA){RESET}"
+    elif side_is_long is None and not oo:
+        status = f"{DIM}flat, no orders{RESET}"
+    else:
+        status = f"{DIM}flat, grid waiting ({len(oo)} orders){RESET}"
+    print(f"  Status: {status}")
+
+    if len(trailings) > 1:
+        print(f"  {YELLOW}⚠ {len(trailings)} trailing stops — consider consolidating{RESET}")
+
+    sort_long = side_is_long if side_is_long is not None else True
+    for o in sorted(dca, key=lambda x: float(x["price"]), reverse=sort_long):
+        cid = _order_client_id(o)
+        tag = f"  {cid}" if cid else ""
+        print(f"    DCA  {o['side']} {o['origQty']} @ {o['price']}{tag}")
+
+    for o in entry:
+        cid = _order_client_id(o)
+        tag = f"  {cid}" if cid else ""
+        print(f"    ENTRY {o['side']} {o['origQty']} @ {o['price']}{tag}")
+
+    for t in trailings:
+        cb = t.get("callbackRate", "?")
+        print(f"    TRAIL {t.get('side')} qty={t.get('quantity')} "
+              f"callback={cb}% algoId={t.get('algoId')}")
+
+
+def run_audit(args: argparse.Namespace) -> None:
+    """Audit grid orders and positions (one symbol, --audit-symbols, or --audit-all)."""
+    api, sec = load_keys(args.env_file)
+    if not api or not sec:
+        print(f"{RED}No API keys — cannot audit.{RESET}")
+        return
+    hedge = _resolve_hedge(args, api, sec)
+
+    if args.audit_all:
+        symbols = _parse_symbol_list(os.getenv("FUTURES_PAIRS", ""))
+        if not symbols:
+            print(f"{RED}FUTURES_PAIRS empty or unset in .env — use SYMBOL --audit or --audit-symbols.{RESET}")
+            return
+    elif args.audit_symbols:
+        symbols = _parse_symbol_list(args.audit_symbols)
+        if not symbols:
+            print(f"{RED}--audit-symbols is empty.{RESET}")
+            return
+    elif args.symbol:
+        symbols = [args.symbol.upper()]
+    else:
+        print(f"{RED}Symbol required: SYMBOL --audit, --audit-all, or --audit-symbols LIST.{RESET}")
+        return
+
+    print(f"{BOLD}Grid audit{RESET}  {DIM}({len(symbols)} symbol(s), "
+          f"expect up to {args.so_count} DCA when fully armed){RESET}")
+    for sym in symbols:
+        try:
+            audit_symbol(sym, args, api, sec, hedge, so_count=args.so_count)
+        except Exception as exc:
+            print(f"\n{RED}=== {sym.upper()} === audit failed: {exc}{RESET}")
 
 
 def _resolve_hedge(args: argparse.Namespace, api: str, sec: str) -> bool:
@@ -1235,6 +1371,14 @@ def run_tp_manager(args: argparse.Namespace, is_long: bool | None) -> None:
 
 def main() -> None:
     args = parse_args()
+
+    if args.audit or args.audit_all:
+        run_audit(args)
+        return
+
+    if not args.symbol:
+        print(f"{RED}Symbol required (e.g. ADAUSDT).{RESET}")
+        return
 
     if args.rearm:
         rearm_grid(args)
