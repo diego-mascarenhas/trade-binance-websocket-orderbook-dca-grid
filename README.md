@@ -9,6 +9,7 @@ Both scripts read the live order book, place DCA orders on real walls, size entr
 | Bot | Market | Entry | Exit |
 |-----|--------|-------|------|
 | `orderbook_dca_grid.py` | Futures | LONG/SHORT grid on walls | Trailing TP (`TRAILING_STOP_MARKET`) |
+| `orderbook_staged_exit.py` | Futures | *(addon, experimental)* | 70% TP @ wall + BE + trailing |
 | `orderbook_dca_grid_spot.py` | Spot | BUY grid on bid walls | OCO (TP + SL) |
 
 Self-contained: **Python standard library only** — no third-party dependencies.
@@ -18,12 +19,14 @@ Self-contained: **Python standard library only** — no third-party dependencies
 ```
 trade-binance-websocket-orderbook-dca-grid/
 ├── orderbook_dca_grid.py        # Futures bot
+├── orderbook_staged_exit.py     # Futures staged exit addon (experimental)
 ├── orderbook_dca_grid_spot.py   # Spot bot
 ├── pyproject.toml               # optional install → `orderbook-dca-grid` command
 ├── .env.example                 # API keys + config template
 └── deploy/
     ├── dca-futures@.service     # Futures: grid + trailing TP (--supervise)
     ├── dca-futures-tp@.service  # Futures: trailing TP only (--tp-only)
+    ├── dca-staged-exit@.service # Futures: staged exit addon (experimental)
     ├── dca-spot@.service        # Spot: buy grid + OCO (--supervise)
     └── sync_pairs.py            # enable/disable systemd units from .env pair lists
 ```
@@ -83,6 +86,51 @@ python3 orderbook_dca_grid.py OPUSDT --rearm --rearm-flat  # close position, the
 - **Safety**: refuses to stack on existing exposure (`--force` to override); cancels foreign SLs (`--keep-sl` to disable).
 
 Run `python3 orderbook_dca_grid.py --help` for all flags.
+
+---
+
+## Staged exit addon (`orderbook_staged_exit.py`) — experimental
+
+Separate script to **test** a new exit strategy without changing the main DCA bot. Runs in parallel on chosen pairs.
+
+When a position is open (entry/DCA fill from `orderbook_dca_grid.py`):
+
+1. Waits until profit reaches **TP1_PROFIT_PCT** (default **0.3%**) — **DCA grid stays active**
+2. At target: **cancels all DCA**, closes **TP_PARTIAL_PCT** (70%) at the profit price
+3. Places **SL on the runner at the original entry** (breakeven on remainder)
+4. **Trailing** on the opposite order-book wall for the runner
+
+By default **does not** place an initial adverse SL or cancel DCA before profit target.
+
+**Default mode is automatic** — just run the script (or systemd unit); no `--tp-only --once` after fills.
+
+```bash
+# DCA bot on the test pair — grid only, no trailing TP
+python3 orderbook_dca_grid.py LINKUSDT --supervise --no-tp
+
+# Staged exit addon — auto TP/SL (foreground loop)
+python3 orderbook_staged_exit.py LINKUSDT
+
+python3 orderbook_staged_exit.py LINKUSDT --audit    # read-only status
+python3 orderbook_staged_exit.py LINKUSDT --once     # single sync pass
+python3 orderbook_staged_exit.py LINKUSDT --dry-run --once  # preview
+```
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `TP1_PROFIT_PCT` | `0.3` | Profit % to trigger first partial (70%) |
+| `TP_PARTIAL_PCT` | `70` | First take-profit size (%) |
+| `STAGED_POLL_SEC` | `5` | Supervisor poll interval |
+
+Enable manually (not wired into `sync_pairs.py` yet):
+
+```bash
+sudo cp deploy/dca-staged-exit@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dca-staged-exit@LINKUSDT
+```
+
+Do **not** run `dca-futures@` (with default TP) and `dca-staged-exit@` on the same symbol — use `--no-tp` on the DCA unit or a custom override.
 
 ---
 
@@ -195,9 +243,10 @@ python3 deploy/sync_pairs.py --restart
 |------|---------|----------|
 | `dca-futures@SYMBOL` | `--supervise` | Full bot: grid + trailing TP |
 | `dca-futures-tp@SYMBOL` | `--tp-only` | Exit only (manual/other entry) |
+| `dca-staged-exit@SYMBOL` | *(default loop)* | Experimental staged exit addon |
 | `dca-spot@SYMBOL` | `--supervise` | Spot grid + OCO |
 
-Do **not** run `dca-futures@` and `dca-futures-tp@` on the same symbol.
+Do **not** run `dca-futures@` and `dca-futures-tp@` on the same symbol. For staged exit tests, run `dca-staged-exit@` with DCA on `--no-tp`.
 
 ### Sync pairs from `.env`
 

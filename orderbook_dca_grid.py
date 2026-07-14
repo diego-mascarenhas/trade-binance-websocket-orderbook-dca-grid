@@ -736,6 +736,9 @@ def cancel_foreign_sl(symbol: str, is_long: bool, api: str, sec: str, recv: int)
         otype = str(o.get("orderType") or o.get("type") or "").upper()
         if otype in ("STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET", "TAKE_PROFIT") and \
            str(o.get("side", "")).upper() == close_side:
+            cid = str(o.get("clientAlgoId") or o.get("newClientOrderId") or "")
+            if cid.startswith("obstage"):
+                continue  # staged-exit addon — do not remove
             try:
                 _signed_request("DELETE", "/fapi/v1/algoOrder",
                                 {"symbol": symbol.upper(), "algoId": o.get("algoId")}, api, sec, recv)
@@ -1041,7 +1044,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
     hedge = _resolve_hedge(args, api, sec)
     ttl_note = f", grid refresh {args.grid_ttl:g}s" if args.grid_ttl > 0 else ""
     print(f"\n{BOLD}{CYAN}Supervising {args.symbol.upper()} "
-          f"(auto re-arm grid + trailing TP, poll {args.tp_poll_sec:g}s{ttl_note}). "
+          f"(auto re-arm grid{'' if args.no_tp else ' + trailing TP'}, poll {args.tp_poll_sec:g}s{ttl_note}). "
           f"Ctrl+C to stop.{RESET}")
     armed_log_state: str | None = None
     try:
@@ -1051,7 +1054,8 @@ def supervise_loop(args: argparse.Namespace) -> None:
                 side_is_long, qty, entry = _detect_open_side(args.symbol, hedge, api, sec, args.recv_window)
                 if side_is_long is not None:
                     armed_log_state = None
-                    _manage_tp_once(args.symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
+                    if not args.no_tp:
+                        _manage_tp_once(args.symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
                 else:
                     if not args.keep_sl:
                         cancel_foreign_sl(args.symbol, True, api, sec, args.recv_window)
