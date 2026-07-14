@@ -8,9 +8,10 @@ Both scripts read the live order book, place DCA orders on real walls, size entr
 
 | Bot | Market | Entry | Exit |
 |-----|--------|-------|------|
-| `orderbook_dca_grid.py` | Futures | LONG/SHORT grid on walls | Trailing TP (`TRAILING_STOP_MARKET`) |
-| `orderbook_staged_exit.py` | Futures | *(addon, experimental)* | 70% TP @ wall + BE + trailing |
+| `orderbook_dca_grid.py` | Futures | LONG/SHORT grid on walls | **Staged** (default): TP1 + SL@entry + trail |
 | `orderbook_dca_grid_spot.py` | Spot | BUY grid on bid walls | OCO (TP + SL) |
+
+`orderbook_staged_exit.py` is legacy/experimental — use **`orderbook_dca_grid.py --supervise`** with staged exit (built-in) instead of two processes.
 
 Self-contained: **Python standard library only** — no third-party dependencies.
 
@@ -18,17 +19,24 @@ Self-contained: **Python standard library only** — no third-party dependencies
 
 ```
 trade-binance-websocket-orderbook-dca-grid/
-├── orderbook_dca_grid.py        # Futures bot
-├── orderbook_staged_exit.py     # Futures staged exit addon (experimental)
+├── orderbook_dca_grid.py        # Futures bot (grid + exit plugins)
+├── orderbook_staged_exit.py     # Staged exit logic (used by exits/staged.py; standalone optional)
 ├── orderbook_dca_grid_spot.py   # Spot bot
-├── pyproject.toml               # optional install → `orderbook-dca-grid` command
-├── .env.example                 # API keys + config template
+├── botctl.py                    # CLI: start/stop/status per symbol
+├── telegram_botctl.py           # Telegram remote control daemon
+├── telegram_notify.py           # Telegram alerts (send-only)
+├── exits/                       # Exit plugins (staged, trailing)
+├── .state/                      # Staged exit state per symbol (gitignored)
+├── .run/                        # PID files + logs (Mac pidfile backend; gitignored)
+├── pyproject.toml
+├── .env.example
 └── deploy/
-    ├── dca-futures@.service     # Futures: grid + trailing TP (--supervise)
-    ├── dca-futures-tp@.service  # Futures: trailing TP only (--tp-only)
-    ├── dca-staged-exit@.service # Futures: staged exit addon (experimental)
-    ├── dca-spot@.service        # Spot: buy grid + OCO (--supervise)
-    └── sync_pairs.py            # enable/disable systemd units from .env pair lists
+    ├── dca-futures@.service       # Futures supervisor (--supervise)
+    ├── dca-telegram-ctl.service   # Telegram start/stop/status daemon
+    ├── dca-futures-tp@.service    # Futures: trailing TP only (--tp-only)
+    ├── dca-staged-exit@.service   # Legacy — do not use with dca-futures@
+    ├── dca-spot@.service
+    └── sync_pairs.py              # Start/stop fleet from FUTURES_PAIRS / SPOT_PAIRS
 ```
 
 ## Quick start
@@ -64,7 +72,7 @@ python3 orderbook_dca_grid.py ADAUSDT
 # Only manage trailing TP for an existing position (no new grid)
 python3 orderbook_dca_grid.py ADAUSDT --tp-only
 
-# Fully autonomous: re-arm grid when flat + manage TP
+# Fully autonomous (recommended — defaults: staged exit, auto direction)
 python3 orderbook_dca_grid.py ADAUSDT --supervise
 
 # Cancel + fresh grid (DCA-only if holding; stop systemd unit first)
@@ -89,16 +97,14 @@ Run `python3 orderbook_dca_grid.py --help` for all flags.
 
 ---
 
-## Staged exit (`--exit staged`) — experimental
+## Staged exit (default)
 
-Staged exit lives in `exits/staged.py` (logic in `orderbook_staged_exit.py`). Prefer **one process**:
+Staged exit is the **default** exit mode (code default + `EXIT_MODE=staged` in `.env`). Logic lives in `exits/staged.py` (implementation in `orderbook_staged_exit.py`). Use **one process per symbol**:
 
 ```bash
-# Grid + staged exit together (replaces two terminals)
-python3 orderbook_dca_grid.py 1000RATSUSDT --supervise --exit staged --direction short
-
+python3 orderbook_dca_grid.py 1000RATSUSDT --supervise
 python3 orderbook_dca_grid.py LINKUSDT --audit
-python3 orderbook_staged_exit.py LINKUSDT --audit   # still works standalone
+python3 orderbook_staged_exit.py LINKUSDT --audit --cleanup   # optional standalone audit
 ```
 
 When a position is open:
@@ -107,51 +113,71 @@ When a position is open:
 2. On TP1 fill: **cancels DCA**, **SL on runner at original entry**
 3. **Trailing** on the opposite order-book wall for the runner
 
-Legacy two-process mode (still valid):
+**Do not** run `orderbook_staged_exit.py` in parallel on the same symbol as `--supervise`.
+
+Legacy two-process mode (avoid):
 
 ```bash
-python3 orderbook_dca_grid.py LINKUSDT --supervise --no-tp
+python3 orderbook_dca_grid.py LINKUSDT --supervise --exit none   # or --no-tp
 python3 orderbook_staged_exit.py LINKUSDT
 ```
 
 | Flag / env | Default | Description |
 |------------|---------|-------------|
-| `--exit staged` | — | Use staged exit plugin |
-| `--exit trailing` | default | Trailing TP @ OB wall |
+| `EXIT_MODE` | `staged` | `staged` \| `trailing` \| `none` |
+| `--exit staged` | *(env default)* | Staged exit plugin |
+| `--exit trailing` | — | Trailing TP @ OB wall |
 | `--exit none` / `--no-tp` | — | Grid only |
+| `DIRECTION` | `auto` | `auto` \| `long` \| `short` |
+| `RECV_WINDOW` | `15000` | Binance recvWindow ms |
 | `TP1_PROFIT_PCT` | `0.3` | First partial trigger (%) |
 | `TP_PARTIAL_PCT` | `70` | First partial size (%) |
 | `STAGED_POLL_SEC` | `5` | Staged state poll (via grid `--tp-poll-sec` loop) |
 
 Add new exit strategies under `exits/` and register them in `exits/__init__.py`.
 
-### Telegram (optional)
+### Telegram alerts + remote control
 
-Uses the same env vars as the dashboard bot: `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` in `.env`.
-If unset, alerts are skipped. Notifies: supervise start, grid/DCA re-arm, position open, staged TP1/SL/trail, supervisor errors.
+Uses `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` in `.env`. If unset, alerts and remote control are skipped.
 
-#### Remote start / stop / status (Telegram)
+**Alerts** (`telegram_notify.py`): supervise start, grid/DCA re-arm, DCA fill, position open/close (with PnL), staged TP1/SL/trail, supervisor errors.
 
-A separate daemon controls supervisors **without closing positions or cancelling orders** on stop:
+**Remote control** (`telegram_botctl.py` + `botctl.py`): start/stop/status supervisors **without closing positions or cancelling orders** on stop.
 
-```bash
-# Mac (pid files in .run/) or VPS (systemd dca-futures@SYMBOL — auto-detected)
-python3 telegram_botctl.py
-```
+#### Telegram commands
 
-Commands in Telegram (only from `TELEGRAM_CHAT_ID`):
+Only messages from `TELEGRAM_CHAT_ID` are accepted.
 
 | Command | Action |
 |---------|--------|
-| `/start SXTUSDT` | Start supervisor for symbol |
-| `/stop SXTUSDT` | Stop supervisor (Binance unchanged) |
-| `/status SXTUSDT` | Process + position + staged phase + PnL |
+| `/start SYMBOL` | Start supervisor for symbol |
+| `/stop SYMBOL` | Stop supervisor (orders & position stay on Binance) |
+| `/status SYMBOL` | Process state + position + staged phase + PnL |
 | `/list` | All running supervisors |
 | `/help` | Command list |
 
-CLI equivalent: `python3 botctl.py start|stop|status SXTUSDT`
+`/start` only works for symbols listed in `FUTURES_PAIRS` (whitelist). `/stop` and `/status` work for any symbol.
 
-On Ubuntu, run 24/7:
+CLI equivalent:
+
+```bash
+python3 botctl.py start SXTUSDT
+python3 botctl.py stop SXTUSDT
+python3 botctl.py status SXTUSDT
+python3 botctl.py list
+```
+
+#### Local (Mac) — manual daemon
+
+```bash
+python3 telegram_botctl.py
+```
+
+Uses **pidfile** backend: PIDs in `.run/pids/`, logs in `.run/logs/`. Supervisors started with `/start` run in the background.
+
+#### Production (VPS) — systemd
+
+Install once:
 
 ```bash
 sudo cp deploy/dca-telegram-ctl.service /etc/systemd/system/
@@ -159,17 +185,26 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now dca-telegram-ctl
 ```
 
-Optional: `BOTCTL_MODE=pidfile|systemd|auto`, `FUTURES_UNIT=dca-futures`.
-
-Enable manually (not wired into `sync_pairs.py` yet):
+Uses **systemd** backend: `/start` and `/stop` call `systemctl` on `dca-futures@SYMBOL`.
 
 ```bash
-sudo cp deploy/dca-staged-exit@.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now dca-staged-exit@LINKUSDT
+sudo systemctl status dca-telegram-ctl
+sudo journalctl -u dca-telegram-ctl -f
 ```
 
-Do **not** run `dca-futures@` (with default TP) and `dca-staged-exit@` on the same symbol — use `--no-tp` on the DCA unit or a custom override.
+Optional env: `BOTCTL_MODE=auto|systemd|pidfile`, `FUTURES_UNIT=dca-futures`.
+
+#### Important: Telegram ctl ≠ fleet auto-start
+
+Starting `dca-telegram-ctl` **does not** start trading bots. It only listens for commands.
+
+| Tool | Starts all `FUTURES_PAIRS`? |
+|------|---------------------------|
+| `python3 deploy/sync_pairs.py` | **Yes** — enable + start every listed symbol |
+| `telegram_botctl` `/start SYMBOL` | **One** symbol at a time |
+| `/list` | Shows what's **already running** (empty until sync or `/start`) |
+
+After first deploy, run `sync_pairs.py` once to bring up the default fleet (see [Production deploy](#production-deploy-runbook)).
 
 ---
 
@@ -204,21 +239,68 @@ Run `python3 orderbook_dca_grid_spot.py --help` for all flags.
 
 Copy `.env.example` → `.env`. CLI flags override env vars.
 
+### Required (production)
+
+```env
+BINANCE_API_KEY=...
+BINANCE_SECRET_KEY=...
+FUTURES_PAIRS=1000SHIBUSDT,ATOMUSDT,SXTUSDT,...   # fleet + /start whitelist
+```
+
+Futures API key needs **Futures trading** permission. `chmod 600 .env`.
+
+### Telegram (alerts + remote control)
+
+```env
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+```
+
+### Futures defaults (optional — already coded as defaults)
+
+```env
+EXIT_MODE=staged          # staged | trailing | none
+DIRECTION=auto            # auto | long | short
+RECV_WINDOW=15000         # raise if you see -1021 timestamp errors
+WALLET_PCT=10
+MAX_IMBALANCE=30          # 0 = off
+ORDER_TTL=3600
+GRID_TTL=3600
+REARM_BACKOFF=60
+# TP1_PROFIT_PCT=0.3
+# TP_PARTIAL_PCT=70
+# TELEGRAM_MIN_OPEN_VOL=5
+# BOTCTL_MODE=auto
+# FUTURES_UNIT=dca-futures
+```
+
+### Full reference
+
 | Variable | Default | Applies to | Description |
 |----------|---------|------------|-------------|
 | `BINANCE_API_KEY` | — | both | API key |
 | `BINANCE_SECRET_KEY` | — | both | Secret |
+| `EXIT_MODE` | `staged` | futures | Exit plugin: `staged`, `trailing`, `none` |
+| `DIRECTION` | `auto` | futures | Grid direction: `auto`, `long`, `short` |
+| `RECV_WINDOW` | `15000` | futures | Binance recvWindow (ms) |
 | `WALLET_PCT` | `10` | both | Entry size as % of wallet/free USDT |
 | `BASE_SIZE` | `0` | both | Fixed entry USDT (`0` = use `WALLET_PCT`) |
 | `MAX_IMBALANCE` | `30` | futures | Account LONG/SHORT balance guard (`0` = off) |
 | `ORDER_TTL` | `3600` | futures | Entry order GTD in seconds; DCA orders stay GTC (`0` = all GTC) |
 | `GRID_TTL` | `3600` | futures + spot | Refresh stale flat grid (seconds; `0` = off) |
 | `REARM_BACKOFF` | `60` | both | Wait when flat but grid can't be armed |
+| `TP1_PROFIT_PCT` | `0.3` | futures staged | First partial trigger (%) |
+| `TP_PARTIAL_PCT` | `70` | futures staged | First partial size (%) |
+| `TELEGRAM_BOT_TOKEN` | — | telegram | Bot token for alerts + remote control |
+| `TELEGRAM_CHAT_ID` | — | telegram | Allowed chat for alerts + commands |
+| `TELEGRAM_MIN_OPEN_VOL` | `5` | telegram | Min notional USDT to send `#OPEN` alert |
+| `BOTCTL_MODE` | `auto` | telegram ctl | `auto`, `systemd`, or `pidfile` |
+| `FUTURES_UNIT` | `dca-futures` | deploy / botctl | systemd template name |
+| `FUTURES_PAIRS` | — | deploy | Comma-separated symbols for `dca-futures@` |
+| `SPOT_PAIRS` | — | deploy | Comma-separated symbols for `dca-spot@` |
 | `MAX_SYMBOL_PCT` | `25` | spot | Cap per symbol (% of total USDT wallet) |
 | `MIN_BASE_USDT` | `10` | spot | Floor for wallet-% entry size |
 | `SPOT_TP` / `SPOT_SL` | `0.5` / `5` | spot | OCO TP/SL % |
-| `FUTURES_PAIRS` | — | deploy | Comma-separated symbols for `dca-futures@` |
-| `SPOT_PAIRS` | — | deploy | Comma-separated symbols for `dca-spot@` |
 
 Example pair lists (alphabetical):
 
@@ -254,46 +336,74 @@ sudo git clone https://github.com/diego-mascarenhas/trade-binance-websocket-orde
   /opt/trade-binance-websocket-orderbook-dca-grid
 sudo chown -R forge:forge /opt/trade-binance-websocket-orderbook-dca-grid
 
-# 2. Secrets
+# 2. Branch + secrets
 cd /opt/trade-binance-websocket-orderbook-dca-grid
+git checkout dev
 cp .env.example .env
 chmod 600 .env
-nano .env   # BINANCE_API_KEY, BINANCE_SECRET_KEY, FUTURES_PAIRS, SPOT_PAIRS
+nano .env   # see Configuration section above
 
 # 3. Dry-run
-python3 orderbook_dca_grid_spot.py BTCUSDT --dry-run
+python3 orderbook_dca_grid.py BTCUSDT --dry-run
 
-# 4. systemd (needs sudo for systemctl)
-sudo cp deploy/dca-futures@.service deploy/dca-futures-tp@.service deploy/dca-spot@.service /etc/systemd/system/
+# 4. Install systemd units (once)
+sudo cp deploy/dca-futures@.service deploy/dca-spot@.service \
+        deploy/dca-telegram-ctl.service /etc/systemd/system/
 sudo systemctl daemon-reload
+
+# 5. Start Telegram remote control (optional)
+sudo systemctl enable --now dca-telegram-ctl
+
+# 6. Start trading fleet from FUTURES_PAIRS
 python3 deploy/sync_pairs.py --dry-run
 python3 deploy/sync_pairs.py
+python3 deploy/sync_pairs.py status
 ```
 
-Updates later:
+### Production deploy runbook
+
+What to run after each type of change:
+
+| Situation | Commands |
+|-----------|----------|
+| **First install** | Steps above (units + `sync_pairs.py` + optional `dca-telegram-ctl`) |
+| **Code update** (`git pull`) | `git pull` then `python3 deploy/sync_pairs.py --restart` |
+| **Telegram ctl code only** | `sudo systemctl restart dca-telegram-ctl` |
+| **`.env` changed (same pairs)** | `sync_pairs.py --restart` (reload config in running bots) |
+| **Add/remove symbol in `FUTURES_PAIRS`** | Edit `.env`, then `python3 deploy/sync_pairs.py` (starts new, stops removed) |
+| **One symbol manually** | Telegram `/start SYMBOL` or `/stop SYMBOL` |
+
+`git pull` alone does **not** restart bots — they keep old code in memory until `--restart`.
+
+Typical deploy:
 
 ```bash
 cd /opt/trade-binance-websocket-orderbook-dca-grid
-git pull
+git checkout dev && git pull
 python3 deploy/sync_pairs.py --restart
+sudo systemctl restart dca-telegram-ctl
 ```
+
+### systemd units
 
 | Unit | Command | Use when |
 |------|---------|----------|
-| `dca-futures@SYMBOL` | `--supervise` | Full bot: grid + trailing TP |
+| `dca-futures@SYMBOL` | `--supervise` | **Main bot**: grid + staged exit (defaults from `.env`/code) |
+| `dca-telegram-ctl` | `telegram_botctl.py` | Telegram `/start` `/stop` `/status` (24/7) |
 | `dca-futures-tp@SYMBOL` | `--tp-only` | Exit only (manual/other entry) |
-| `dca-staged-exit@SYMBOL` | *(default loop)* | Experimental staged exit addon |
 | `dca-spot@SYMBOL` | `--supervise` | Spot grid + OCO |
 
-Do **not** run `dca-futures@` and `dca-futures-tp@` on the same symbol. For staged exit tests, run `dca-staged-exit@` with DCA on `--no-tp`.
+Do **not** run `dca-futures@` and `dca-staged-exit@` on the same symbol. Staged exit is built into `dca-futures@` via `EXIT_MODE=staged`.
+
+Do **not** run `dca-futures@` and `dca-futures-tp@` on the same symbol.
 
 ### Sync pairs from `.env`
 
 ```bash
-python3 deploy/sync_pairs.py status     # desired vs running
-python3 deploy/sync_pairs.py --dry-run  # preview
-python3 deploy/sync_pairs.py            # enable+start listed, disable the rest
-python3 deploy/sync_pairs.py --restart  # same + restart running units
+python3 deploy/sync_pairs.py status      # desired vs running
+python3 deploy/sync_pairs.py --dry-run   # preview
+python3 deploy/sync_pairs.py             # enable + start listed, disable the rest
+python3 deploy/sync_pairs.py --restart   # same + restart already-running units
 ```
 
 Omit `FUTURES_PAIRS` or `SPOT_PAIRS` to leave that market untouched. An empty value disables all units for that template.
@@ -301,8 +411,37 @@ Omit `FUTURES_PAIRS` or `SPOT_PAIRS` to leave that market untouched. An empty va
 ### Logs
 
 ```bash
+# Trading bots
 sudo journalctl -u 'dca-futures@*' -u 'dca-spot@*' -f -o with-unit
-sudo systemctl restart 'dca-futures@*' 'dca-spot@*'
+
+# Telegram remote control
+sudo journalctl -u dca-telegram-ctl -f
+
+# One symbol
+sudo journalctl -u dca-futures@SXTUSDT -n 50
+```
+
+Mac (pidfile backend): `.run/logs/SYMBOL.log`
+
+### `/list` says "No supervisors running" but Telegram shows trades
+
+`/list` only sees **systemd units** named `dca-futures@SYMBOL` (or legacy `dca-super@`). It is **not** the same as "positions open on Binance".
+
+Common causes:
+
+| Cause | What happened | Fix |
+|-------|----------------|-----|
+| **sudo without TTY** | `dca-telegram-ctl` runs as `forge`; `sudo systemctl` fails silently in the daemon | Updated `botctl.py` tries systemctl **without sudo** for reads. Redeploy + `sudo systemctl restart dca-telegram-ctl`. For `/start`/`/stop`, add passwordless sudo for forge: `forge ALL=(ALL) NOPASSWD: /bin/systemctl *` |
+| **Fleet never synced** | Alerts from a one-off run; units not enabled | `python3 deploy/sync_pairs.py` on the VPS |
+| **Old unit names** | Bots under `dca-super@` not `dca-futures@` | Migrate per section below, or set `FUTURES_UNIT=dca-super` in `.env` |
+| **Supervisor crashed** | Last alert minutes ago; position still open | `sudo journalctl -u 'dca-futures@*' -n 30`; restart with `/start SYMBOL` or `sync_pairs.py --restart` |
+
+Check on the VPS:
+
+```bash
+python3 deploy/sync_pairs.py status
+sudo systemctl list-units 'dca-futures@*' --state=active
+pgrep -af 'orderbook_dca_grid.py.*--supervise'
 ```
 
 ### Migrate from `dca-super@` / `dca-tp@` (old unit names)

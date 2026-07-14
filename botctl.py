@@ -60,6 +60,120 @@ def _systemctl(use_sudo: bool, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, text=True, capture_output=True)
 
 
+def _systemctl_read(*args: str) -> subprocess.CompletedProcess[str]:
+    """Read-only systemctl: try without sudo first (telegram daemon has no TTY)."""
+    last: subprocess.CompletedProcess[str] | None = None
+    for use_sudo in (False, _use_sudo_systemctl()):
+        if use_sudo and os.geteuid() == 0:
+            continue
+        proc = _systemctl(use_sudo, *args)
+        last = proc
+        if proc.returncode == 0:
+            return proc
+        err = (proc.stderr or "").lower()
+        if "password" in err or "not allowed" in err or "permission denied" in err:
+            continue
+        if proc.stdout.strip():
+            return proc
+    assert last is not None
+    return last
+
+
+def _systemctl_write(*args: str) -> subprocess.CompletedProcess[str]:
+    return _systemctl(_use_sudo_systemctl(), *args)
+
+
+def _unit_templates() -> list[str]:
+    """Primary FUTURES_UNIT plus legacy dca-super if still installed."""
+    primary = futures_unit_template()
+    templates = [primary]
+    legacy = "dca-super"
+    if legacy != primary and Path(f"/etc/systemd/system/{legacy}@.service").exists():
+        templates.append(legacy)
+    return templates
+
+
+def _list_systemd_running(templates: list[str] | None = None) -> list[str]:
+    templates = templates or _unit_templates()
+    running: list[str] = []
+    for tpl in templates:
+        proc = _systemctl_read(
+            "list-units", "--type=service", "--state=active", f"{tpl}@*", "--no-legend", "--plain",
+        )
+        prefix = f"{tpl}@"
+        for line in proc.stdout.splitlines():
+            unit = line.split()[0] if line.split() else ""
+            if unit.startswith(prefix) and unit.endswith(".service"):
+                running.append(unit[len(prefix):-len(".service")].upper())
+    return sorted(set(running))
+
+
+def _pgrep_pids(symbol: str) -> list[int]:
+    """PIDs of supervisor scripts for this symbol (grid and legacy staged)."""
+    sym = symbol.upper()
+    pids: list[int] = []
+    for pattern in (f"orderbook_dca_grid.py {sym}", f"orderbook_staged_exit.py {sym}"):
+        try:
+            proc = subprocess.run(["pgrep", "-f", pattern], text=True, capture_output=True)
+        except FileNotFoundError:
+            continue
+        for line in proc.stdout.splitlines():
+            try:
+                pids.append(int(line.strip()))
+            except ValueError:
+                continue
+    return sorted(set(pids))
+
+
+def _kill_pids(pids: list[int]) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            continue
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        alive = [p for p in pids if _pid_alive(p)]
+        if not alive:
+            break
+        time.sleep(0.25)
+    for pid in [p for p in pids if _pid_alive(p)]:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _pgrep_supervisors() -> list[str]:
+    """Fallback when systemctl list is empty but python supervisors are running."""
+    try:
+        proc = subprocess.run(["pgrep", "-af", "orderbook_dca_grid.py"], text=True, capture_output=True)
+    except FileNotFoundError:
+        return []
+    found: list[str] = []
+    for line in proc.stdout.splitlines():
+        if "--supervise" not in line:
+            continue
+        parts = line.split()
+        for i, part in enumerate(parts):
+            if part.endswith("orderbook_dca_grid.py") and i + 1 < len(parts):
+                sym = parts[i + 1].upper()
+                if sym.isalnum() and sym.endswith("USDT"):
+                    found.append(sym)
+                break
+    return sorted(set(found))
+
+
 def _use_sudo_systemctl() -> bool:
     return _env("BOTCTL_NO_SUDO", "").lower() not in ("1", "true", "yes") and os.geteuid() != 0
 
@@ -78,9 +192,14 @@ def is_running(symbol: str, backend: str | None = None) -> bool:
     sym = symbol.upper()
     backend = backend or detect_backend()
     if backend == "systemd":
-        unit = f"{futures_unit_template()}@{sym}.service"
-        proc = _systemctl(_use_sudo_systemctl(), "is-active", unit)
-        return proc.stdout.strip() == "active"
+        for tpl in _unit_templates():
+            unit = f"{tpl}@{sym}.service"
+            proc = _systemctl_read("is-active", unit)
+            if proc.stdout.strip() == "active":
+                return True
+        return bool(_pgrep_pids(sym))
+    if _pgrep_pids(sym):
+        return True
     pid_file = _pid_path(sym)
     if not pid_file.exists():
         return False
@@ -99,18 +218,8 @@ def is_running(symbol: str, backend: str | None = None) -> bool:
 def list_running(backend: str | None = None) -> list[str]:
     backend = backend or detect_backend()
     if backend == "systemd":
-        tpl = futures_unit_template()
-        proc = _systemctl(
-            _use_sudo_systemctl(),
-            "list-units", "--type=service", "--state=active", f"{tpl}@*", "--no-legend", "--plain",
-        )
-        running: list[str] = []
-        prefix = f"{tpl}@"
-        for line in proc.stdout.splitlines():
-            unit = line.split()[0] if line.split() else ""
-            if unit.startswith(prefix) and unit.endswith(".service"):
-                running.append(unit[len(prefix):-len(".service")].upper())
-        return sorted(set(running))
+        running = set(_list_systemd_running()) | set(_pgrep_supervisors())
+        return sorted(running)
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     out: list[str] = []
     for path in RUN_DIR.glob("*.pid"):
@@ -133,7 +242,7 @@ def start(symbol: str, backend: str | None = None) -> str:
     if backend == "systemd":
         unit = f"{futures_unit_template()}@{sym}.service"
         for action in ("enable", "start"):
-            proc = _systemctl(_use_sudo_systemctl(), action, unit)
+            proc = _systemctl_write(action, unit)
             if proc.returncode != 0:
                 err = (proc.stderr or proc.stdout or "systemctl failed").strip()
                 return f"❌ Could not start {sym}: {err}"
@@ -164,45 +273,46 @@ def start(symbol: str, backend: str | None = None) -> str:
 def stop(symbol: str, backend: str | None = None) -> str:
     sym = symbol.upper()
     backend = backend or detect_backend()
-
-    if not is_running(sym, backend):
-        return f"ℹ️ {sym} was not running."
+    stopped: list[str] = []
 
     if backend == "systemd":
-        unit = f"{futures_unit_template()}@{sym}.service"
-        proc = _systemctl(_use_sudo_systemctl(), "stop", unit)
-        if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or "systemctl failed").strip()
-            return f"❌ Could not stop {sym}: {err}"
-        return f"⏸ {sym} supervisor stopped. Position and orders unchanged on Binance."
+        for tpl in _unit_templates():
+            unit = f"{tpl}@{sym}.service"
+            if _systemctl_read("is-active", unit).stdout.strip() != "active":
+                continue
+            proc = _systemctl_write("stop", unit)
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "systemctl failed").strip()
+                return f"❌ Could not stop {sym}: {err}"
+            stopped.append(f"systemd {unit}")
+
+    pids = _pgrep_pids(sym)
+    if pids:
+        _kill_pids(pids)
+        stopped.append(f"process(es) {', '.join(str(p) for p in pids)}")
 
     pid_file = _pid_path(sym)
-    try:
-        pid = int(pid_file.read_text().strip())
-    except (TypeError, ValueError, OSError):
+    if pid_file.exists():
         pid_file.unlink(missing_ok=True)
-        return f"ℹ️ {sym} has no valid PID."
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pid_file.unlink(missing_ok=True)
-        return f"ℹ️ {sym} was no longer active."
-    except OSError as exc:
-        return f"❌ Could not stop {sym}: {exc}"
+    if stopped:
+        how = "; ".join(stopped)
+        return f"⏸ {sym} supervisor stopped ({how}). Position and orders unchanged on Binance."
 
-    for _ in range(20):
-        if not is_running(sym, "pidfile"):
-            break
-        time.sleep(0.25)
-    else:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
+    if backend == "pidfile":
+        return f"ℹ️ {sym} was not running."
 
-    pid_file.unlink(missing_ok=True)
-    return f"⏸ {sym} supervisor stopped. Position and orders unchanged on Binance."
+    # Supervisor not on this host — often Mac local bot + Telegram ctl on VPS.
+    body = trading_status(sym)
+    has_position = "Position:" in body and "flat" not in body
+    if has_position or "DCA limits:" in body and "DCA limits: 0" not in body:
+        return (
+            f"ℹ️ {sym} supervisor not found on this server.\n"
+            f"If the bot runs on your Mac (or another machine), stop it there:\n"
+            f"  python3 botctl.py stop {sym}\n\n"
+            f"{body}"
+        )
+    return f"ℹ️ {sym} was not running."
 
 
 def trading_status(symbol: str) -> str:
@@ -296,6 +406,17 @@ def status(symbol: str, backend: str | None = None) -> str:
 def list_status(backend: str | None = None) -> str:
     backend = backend or detect_backend()
     running = list_running(backend)
+    if not running and backend == "systemd":
+        pgrep = _pgrep_supervisors()
+        if pgrep:
+            blocks = [f"▶️ {sym} · running (process, not visible via systemctl)\n{trading_status(sym)}"
+                      for sym in pgrep]
+            head = (
+                "⚠️ systemd list empty but supervisor processes found.\n"
+                "On the VPS run: python3 deploy/sync_pairs.py status\n"
+                "Or fix sudo for forge (see README).\n"
+            )
+            return head + "\n\n".join(blocks)
     if not running:
         return f"No supervisors running ({backend})."
     blocks = [status(sym, backend) for sym in running]
