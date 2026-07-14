@@ -130,6 +130,37 @@ Add new exit strategies under `exits/` and register them in `exits/__init__.py`.
 Uses the same env vars as the dashboard bot: `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` in `.env`.
 If unset, alerts are skipped. Notifies: supervise start, grid/DCA re-arm, position open, staged TP1/SL/trail, supervisor errors.
 
+#### Remote start / stop / status (Telegram)
+
+A separate daemon controls supervisors **without closing positions or cancelling orders** on stop:
+
+```bash
+# Mac (pid files in .run/) or VPS (systemd dca-futures@SYMBOL — auto-detected)
+python3 telegram_botctl.py
+```
+
+Commands in Telegram (only from `TELEGRAM_CHAT_ID`):
+
+| Command | Action |
+|---------|--------|
+| `/start SXTUSDT` | Start supervisor for symbol |
+| `/stop SXTUSDT` | Stop supervisor (Binance unchanged) |
+| `/status SXTUSDT` | Process + position + staged phase + PnL |
+| `/list` | All running supervisors |
+| `/help` | Command list |
+
+CLI equivalent: `python3 botctl.py start|stop|status SXTUSDT`
+
+On Ubuntu, run 24/7:
+
+```bash
+sudo cp deploy/dca-telegram-ctl.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dca-telegram-ctl
+```
+
+Optional: `BOTCTL_MODE=pidfile|systemd|auto`, `FUTURES_UNIT=dca-futures`.
+
 Enable manually (not wired into `sync_pairs.py` yet):
 
 ```bash
