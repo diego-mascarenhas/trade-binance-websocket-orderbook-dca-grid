@@ -241,6 +241,125 @@ def quick_volatile_rank(t: TickerRow) -> float:
     return t.range_pct * 2.0 + min(abs(t.change_pct), 30) * 0.4 + math.log10(max(t.quote_volume, 1.0))
 
 
+def collect_universe_scalp(
+    base: str,
+    *,
+    min_volume: float,
+    pool_size: int,
+) -> list[TickerRow]:
+    """Liquid leaders for OB scalp (volume-first, not volatile alts)."""
+    allowed = trading_usdt_perps(base)
+    tickers = fetch_tickers(base, allowed)
+    liquid = [t for t in tickers if t.quote_volume >= min_volume]
+    return sorted(liquid, key=lambda t: t.quote_volume, reverse=True)[:pool_size]
+
+
+def spread_bps_from_depth(symbol: str) -> float:
+    from orderbook_dca_grid import fetch_depth
+
+    depth = fetch_depth(symbol, 20)
+    bids = [[float(p), float(q)] for p, q in depth.get("bids", [])]
+    asks = [[float(p), float(q)] for p, q in depth.get("asks", [])]
+    if not bids or not asks:
+        return 999.0
+    mid = (bids[0][0] + asks[0][0]) / 2
+    if mid <= 0:
+        return 999.0
+    return (asks[0][0] - bids[0][0]) / mid * 10_000
+
+
+def scalp_score(
+    ticker: TickerRow,
+    insight: SymbolInsight,
+    spread_bps: float,
+) -> tuple[float, dict[str, float]]:
+    """Score for OB scalp: liquidity + tight spread + moderate range."""
+    parts: dict[str, float] = {}
+    vol = max(ticker.quote_volume, 1.0)
+    parts["liquidity"] = min(45.0, max(0.0, math.log10(vol) * 9.0 - 22.0))
+
+    rp = ticker.range_pct
+    if 3 <= rp <= 12:
+        parts["range"] = 18.0
+    elif rp <= 18:
+        parts["range"] = 14.0 - (rp - 12) * 0.8
+    elif rp <= 28:
+        parts["range"] = max(2.0, 8.0 - (rp - 18) * 0.6)
+    else:
+        parts["range"] = max(0.0, 2.0 - (rp - 28) * 0.2)
+
+    if spread_bps <= 1.5:
+        parts["spread"] = 20.0
+    elif spread_bps <= 3.0:
+        parts["spread"] = 15.0
+    elif spread_bps <= 6.0:
+        parts["spread"] = 8.0
+    elif spread_bps <= 12.0:
+        parts["spread"] = 3.0
+    else:
+        parts["spread"] = 0.0
+
+    ch = abs(ticker.change_pct)
+    if ch <= 8:
+        parts["stability"] = 10.0
+    elif ch <= 15:
+        parts["stability"] = 6.0
+    elif ch <= 25:
+        parts["stability"] = 2.0
+    else:
+        parts["stability"] = -10.0
+
+    skew = abs(insight.book_bid_share - 50.0)
+    parts["book_skew"] = min(8.0, skew * 0.15)
+    parts["spread_bps"] = spread_bps
+    return sum(v for k, v in parts.items() if k != "spread_bps"), parts
+
+
+def enrich_scalp_candidates(
+    base: str,
+    tickers: list[TickerRow],
+    *,
+    max_analyze: int,
+) -> list[Candidate]:
+    out: list[Candidate] = []
+    for t in tickers[: max_analyze * 2]:
+        try:
+            ins = build_insight(base, t.symbol, t)
+            spread = spread_bps_from_depth(t.symbol)
+            sc, br = scalp_score(t, ins, spread)
+            grid = GridSnapshot(
+                ins.book_direction,
+                ins.book_bid_share,
+                0,
+                0,
+                0,
+                0,
+                False,
+                [],
+            )
+            out.append(Candidate(t, ins, grid, sc, br))
+        except (urllib.error.URLError, ValueError, OSError):
+            continue
+    out.sort(key=lambda c: c.local_score, reverse=True)
+    return out[:max_analyze]
+
+
+def scalp_candidate_payload(c: Candidate) -> dict[str, Any]:
+    spread = float(c.score_breakdown.get("spread_bps", 0))
+    return {
+        "symbol": c.ticker.symbol,
+        "scalp_score": round(c.local_score, 2),
+        "score_breakdown": {k: round(v, 2) for k, v in c.score_breakdown.items() if k != "spread_bps"},
+        "spread_bps": round(spread, 2),
+        "last_price": c.ticker.last,
+        "quote_volume_24h": round(c.ticker.quote_volume, 0),
+        "range_24h_pct": round(c.ticker.range_pct, 2),
+        "change_24h_pct": round(c.ticker.change_pct, 2),
+        "book_bid_share_pct": round(c.insight.book_bid_share, 1),
+        "trend": c.insight.trend,
+    }
+
+
 def collect_universe(
     base: str,
     *,
@@ -369,6 +488,43 @@ def deepseek_pick(candidates: list[Candidate], api_key: str, *, model: str, base
     return json.loads(content)
 
 
+def deepseek_pick_scalp(
+    candidates: list[Candidate], api_key: str, *, model: str, base_url: str,
+) -> dict[str, Any]:
+    payload = [scalp_candidate_payload(c) for c in candidates[:8]]
+    system = (
+        "You pick ONE Binance USDT-M perpetual for a short-term order-book scalp bot. "
+        "Prefer: high 24h quote volume, tight spread (low spread_bps), moderate 24h range (4-15%), "
+        "not extreme blow-offs (>25% 24h move). Avoid illiquid micro-caps. "
+        "Respond JSON only: "
+        '{"symbol":"SYMBOL","confidence":0.0-1.0,"reason":"one short paragraph"}'
+    )
+    user = "Scalp candidates (liquidity + spread + stability):\n" + json.dumps(payload, indent=2)
+
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read())
+    return json.loads(data["choices"][0]["message"]["content"])
+
+
 def print_ranking(candidates: list[Candidate], limit: int = 8) -> None:
     print(f"\n{DIM}Local score ranking (top {limit}):{RESET}")
     for i, c in enumerate(candidates[:limit], 1):
@@ -377,6 +533,18 @@ def print_ranking(candidates: list[Candidate], limit: int = 8) -> None:
             f"  {i:>2}. {c.ticker.symbol:<16} score {c.local_score:5.1f}  "
             f"range {c.ticker.range_pct:5.1f}%  24h {_fmt_pct_plain(c.ticker.change_pct)}  "
             f"{flag}  walls {c.grid.dca_walls}/{c.grid.dca_target}"
+        )
+
+
+def print_ranking_scalp(candidates: list[Candidate], limit: int = 8) -> None:
+    print(f"\n{DIM}Scalp score ranking (top {limit}):{RESET}")
+    for i, c in enumerate(candidates[:limit], 1):
+        spread = c.score_breakdown.get("spread_bps", 0)
+        vol_m = c.ticker.quote_volume / 1_000_000
+        print(
+            f"  {i:>2}. {c.ticker.symbol:<16} score {c.local_score:5.1f}  "
+            f"vol {vol_m:5.0f}M  spread {spread:4.1f}bps  "
+            f"range {c.ticker.range_pct:5.1f}%  24h {_fmt_pct_plain(c.ticker.change_pct)}"
         )
 
 
@@ -400,6 +568,24 @@ def print_pick(pick: dict[str, Any], *, source: str, dry_run: bool = False) -> N
         print(f"\n  {DIM}Preview grid:{RESET}  pick --dry-run")
         print(f"  {DIM}Run:{RESET}  {BOLD}pick -y{RESET}  (or  dca {sym}" + (f" {direction}" if direction in ("long", "short") else "") + ")")
         print(f"  {DIM}Background:{RESET}  pick -y --bg")
+
+
+def print_pick_scalp(pick: dict[str, Any], *, source: str) -> None:
+    sym = pick.get("symbol", "").upper()
+    conf = pick.get("confidence", "?")
+    reason = pick.get("reason", "")
+    cmd = (
+        f"obscalp {sym} --execute --bar-sec 60 --sample-sec 2 "
+        f"--imb-long 0.58 --imb-short 0.42 "
+        f"--tp-pct 0.20 --sl-pct 0.25 --momentum-min-pct 0.05"
+    )
+    print(f"\n{BOLD}{GREEN}▶ OB scalp pick ({source}){RESET}")
+    print(f"  {BOLD}Symbol{RESET}     {CYAN}{sym}{RESET}")
+    print(f"  {BOLD}Confidence{RESET} {conf}")
+    print(f"  {BOLD}Reason{RESET}     {reason}")
+    print(f"\n  {DIM}Observe:{RESET}  obscalp {sym} --dry-run --bar-sec 60")
+    print(f"  {DIM}Run:{RESET}       {BOLD}{cmd}{RESET}")
+    print(f"  {DIM}Auto-run:{RESET}  pick --scalp -y")
 
 
 def run_grid_dry_run(pick: dict[str, Any]) -> int:
@@ -449,6 +635,24 @@ def run_execute(pick: dict[str, Any], *, background: bool) -> int:
         return 130
 
 
+def run_scalp_execute(pick: dict[str, Any]) -> int:
+    sym = pick.get("symbol", "").upper()
+    root = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(root, "obscalp")
+    cmd = [
+        script, sym,
+        "--execute", "--bar-sec", "60", "--sample-sec", "2",
+        "--imb-long", "0.58", "--imb-short", "0.42",
+        "--tp-pct", "0.20", "--sl-pct", "0.25", "--momentum-min-pct", "0.05",
+    ]
+    print(f"\n{BOLD}{GREEN}▶ Executing OB scalp:{RESET} {' '.join(cmd[1:])}\n")
+    try:
+        return subprocess.call(cmd, cwd=root)
+    except KeyboardInterrupt:
+        print(f"\n{DIM}OB scalp stopped (Ctrl+C).{RESET}")
+        return 130
+
+
 def fallback_pick(candidates: list[Candidate]) -> dict[str, Any]:
     for c in candidates:
         if not c.grid.blocked_by_imbalance and c.grid.dca_walls >= 3:
@@ -471,13 +675,35 @@ def fallback_pick(candidates: list[Candidate]) -> dict[str, Any]:
     }
 
 
+def fallback_pick_scalp(candidates: list[Candidate]) -> dict[str, Any]:
+    c = candidates[0]
+    spread = c.score_breakdown.get("spread_bps", 0)
+    vol_m = c.ticker.quote_volume / 1_000_000
+    return {
+        "symbol": c.ticker.symbol,
+        "confidence": min(0.9, 0.5 + c.local_score / 100),
+        "reason": (
+            f"Highest scalp score ({c.local_score:.1f}): "
+            f"{vol_m:.0f}M USDT vol, spread {spread:.1f}bps, "
+            f"range {c.ticker.range_pct:.1f}%, 24h {_fmt_pct_plain(c.ticker.change_pct)}."
+        ),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Pick one volatile futures trade (skips FUTURES_PAIRS fleet).",
+        description="Pick one futures trade: volatile DCA (default) or liquid OB scalp (--scalp).",
     )
-    p.add_argument("--min-volume", type=float, default=5_000_000, metavar="USDT")
+    p.add_argument(
+        "--scalp", action="store_true",
+        help="Pick for orderbook_ob_scalp (liquid + tight spread), not DCA grid",
+    )
+    p.add_argument("--min-volume", type=float, default=None, metavar="USDT",
+                   help="Min 24h quote volume (default: 5M DCA / 50M scalp)")
     p.add_argument("--min-range", type=float, default=8.0, metavar="PCT",
                    help="Min 24h high-low range %% (default: 8 — filters sleepy pairs)")
+    p.add_argument("--max-range", type=float, default=28.0, metavar="PCT",
+                   help="Scalp only: skip if 24h range above this (default: 28)")
     p.add_argument("--pool", type=int, default=20, help="Pool size per volatile/movers list")
     p.add_argument("--analyze", type=int, default=10, help="Deep OB analysis on top N by local score")
     p.add_argument("--base", default=FAPI_BASE)
@@ -503,25 +729,51 @@ def main() -> None:
     load_env_file(None)
     base = args.base.rstrip("/")
 
+    if args.min_volume is None:
+        args.min_volume = 50_000_000 if args.scalp else 5_000_000
+    if args.scalp and args.min_range == 8.0:
+        args.min_range = 2.0
+
     api, sec = load_keys(None)
     if not api or not sec:
-        print(f"{RED}BINANCE_API_KEY / BINANCE_SECRET_KEY required in .env for grid analysis.{RESET}", file=sys.stderr)
+        print(f"{RED}BINANCE_API_KEY / BINANCE_SECRET_KEY required in .env.{RESET}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"{BOLD}Trade pick · volatile one-off (skips FUTURES_PAIRS fleet){RESET}")
-    skip = fleet_pairs_to_skip(include_fleet=args.include_fleet)
-    if skip and not args.json:
-        print(f"{DIM}Skipping fleet (FUTURES_PAIRS): {', '.join(sorted(skip))}{RESET}")
+    if args.scalp:
+        print(f"{BOLD}OB scalp pick · liquid pairs (volume + spread){RESET}")
+        skip = set()
+    else:
+        print(f"{BOLD}Trade pick · volatile one-off (skips FUTURES_PAIRS fleet){RESET}")
+        skip = fleet_pairs_to_skip(include_fleet=args.include_fleet)
+        if skip and not args.json:
+            print(f"{DIM}Skipping fleet (FUTURES_PAIRS): {', '.join(sorted(skip))}{RESET}")
 
     try:
-        universe = collect_universe(base, min_volume=args.min_volume, pool_size=args.pool)
-        universe = apply_skip(universe, skip)
-        universe = [t for t in universe if t.range_pct >= args.min_range]
-        if not universe:
-            print(f"{RED}No volatile candidates left (min range {args.min_range:g}%).{RESET}", file=sys.stderr)
-            print(f"{DIM}Lower --min-range or check FUTURES_PAIRS skip list.{RESET}", file=sys.stderr)
-            sys.exit(1)
-        candidates = enrich_candidates(base, universe, api, sec, max_analyze=args.analyze)
+        if args.scalp:
+            universe = collect_universe_scalp(
+                base, min_volume=args.min_volume, pool_size=args.pool,
+            )
+            universe = apply_skip(universe, skip)
+            universe = [
+                t for t in universe
+                if args.min_range <= t.range_pct <= args.max_range
+            ]
+            if not universe:
+                print(
+                    f"{RED}No scalp candidates (vol≥{args.min_volume/1e6:.0f}M, "
+                    f"range {args.min_range:g}-{args.max_range:g}%).{RESET}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            candidates = enrich_scalp_candidates(base, universe, max_analyze=args.analyze)
+        else:
+            universe = collect_universe(base, min_volume=args.min_volume, pool_size=args.pool)
+            universe = apply_skip(universe, skip)
+            universe = [t for t in universe if t.range_pct >= args.min_range]
+            if not universe:
+                print(f"{RED}No volatile candidates left (min range {args.min_range:g}%).{RESET}", file=sys.stderr)
+                sys.exit(1)
+            candidates = enrich_candidates(base, universe, api, sec, max_analyze=args.analyze)
     except urllib.error.URLError as exc:
         print(f"{RED}API error: {exc}{RESET}", file=sys.stderr)
         sys.exit(1)
@@ -530,13 +782,30 @@ def main() -> None:
         print(f"{RED}No candidates after analysis.{RESET}", file=sys.stderr)
         sys.exit(1)
 
-    print_ranking(candidates)
+    if args.scalp:
+        print_ranking_scalp(candidates)
+    else:
+        print_ranking(candidates)
 
     deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
     source = "local score"
     pick: dict[str, Any]
 
-    if args.local_only or not deepseek_key:
+    if args.scalp:
+        if args.local_only or not deepseek_key:
+            if not deepseek_key and not args.local_only:
+                print(f"\n{YELLOW}DEEPSEEK_API_KEY not set — using local scalp score.{RESET}")
+            pick = fallback_pick_scalp(candidates)
+        else:
+            try:
+                pick = deepseek_pick_scalp(
+                    candidates, deepseek_key, model=args.model, base_url=args.deepseek_base,
+                )
+                source = "DeepSeek"
+            except (urllib.error.URLError, json.JSONDecodeError, KeyError) as exc:
+                print(f"\n{YELLOW}DeepSeek failed ({exc}) — fallback to local score.{RESET}")
+                pick = fallback_pick_scalp(candidates)
+    elif args.local_only or not deepseek_key:
         if not deepseek_key and not args.local_only:
             print(f"\n{YELLOW}DEEPSEEK_API_KEY not set — using local score only.{RESET}")
         pick = fallback_pick(candidates)
@@ -549,13 +818,24 @@ def main() -> None:
             pick = fallback_pick(candidates)
 
     if args.json:
-        print(json.dumps({"pick": pick, "source": source, "candidates": [candidate_payload(c) for c in candidates[:8]]}, indent=2))
+        payload_key = "scalp_candidates" if args.scalp else "candidates"
+        cand_fn = scalp_candidate_payload if args.scalp else candidate_payload
+        print(json.dumps({
+            "mode": "scalp" if args.scalp else "dca",
+            "pick": pick,
+            "source": source,
+            payload_key: [cand_fn(c) for c in candidates[:8]],
+        }, indent=2))
+    elif args.scalp:
+        print_pick_scalp(pick, source=source)
     else:
         print_pick(pick, source=source, dry_run=args.dry_run)
 
-    if args.dry_run and not args.json:
+    if args.scalp and args.execute and not args.json:
+        sys.exit(run_scalp_execute(pick))
+    elif not args.scalp and args.dry_run and not args.json:
         run_grid_dry_run(pick)
-    elif args.execute and not args.dry_run and not args.json:
+    elif not args.scalp and args.execute and not args.dry_run and not args.json:
         sys.exit(run_execute(pick, background=args.bg))
 
 
