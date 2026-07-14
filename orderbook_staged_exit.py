@@ -556,28 +556,9 @@ def cancel_legacy_exit_algos(symbol: str, is_long: bool, api: str, sec: str, rec
 
 def cancel_dca_grid_orders(symbol: str, api: str, sec: str, recv: int) -> int:
     """Cancel obdca* limit orders placed by orderbook_dca_grid.py."""
-    sym = symbol.upper()
-    try:
-        oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, recv) or []
-    except Exception:
-        return 0
-    killed = 0
-    for o in oo:
-        cid = _order_client_id(o)
-        if not cid.startswith("obdca"):
-            continue
-        try:
-            _signed_request(
-                "DELETE", "/fapi/v1/order",
-                {"symbol": sym, "orderId": o.get("orderId")},
-                api, sec, recv,
-            )
-            killed += 1
-        except Exception as exc:
-            print(f"{RED}Cancel DCA order {cid} failed: {exc}{RESET}")
-    if killed:
-        print(f"{YELLOW}Cancelled {killed} DCA grid limit order(s) on {sym}.{RESET}")
-    return killed
+    from orderbook_dca_grid import cancel_dca_grid_orders as _cancel_grid
+
+    return _cancel_grid(symbol, api, sec, recv)
 
 
 def _algo_client_tag(tag: str, symbol: str) -> str:
@@ -1166,12 +1147,19 @@ def manage_staged_once(
 
     if side_is_long is None or qty <= 0:
         state = load_state(sym)
-        if state.get("phase", PHASE_IDLE) != PHASE_IDLE:
+        had_staged = state.get("phase", PHASE_IDLE) != PHASE_IDLE
+        if had_staged:
             print(f"{DIM}{sym} flat — clearing staged state.{RESET}")
             if not args.dry_run:
                 cancel_all_staged_algos(sym, api, sec, args.recv_window)
+                cancel_dca_grid_orders(sym, api, sec, args.recv_window)
             clear_state(sym)
-        elif args.once or args.dry_run:
+        elif not args.dry_run:
+            n_dca = _count_dca_orders(sym, api, sec, args.recv_window)
+            if n_dca > 0 and not _entry_order_open(sym, api, sec, args.recv_window):
+                print(f"{YELLOW}{sym} flat — cancelling {n_dca} leftover DCA limit(s).{RESET}")
+                cancel_dca_grid_orders(sym, api, sec, args.recv_window)
+        if args.once or args.dry_run:
             _print_flat_status(sym, args, api, sec)
         return
 

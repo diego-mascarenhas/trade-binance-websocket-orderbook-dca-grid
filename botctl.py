@@ -229,9 +229,12 @@ def list_running(backend: str | None = None) -> list[str]:
     return sorted(out)
 
 
-def start(symbol: str, backend: str | None = None) -> str:
+def start(symbol: str, backend: str | None = None, direction: str | None = None) -> str:
     sym = symbol.upper()
     backend = backend or detect_backend()
+    dir_arg = (direction or "").lower()
+    if dir_arg and dir_arg not in ("long", "short", "auto"):
+        dir_arg = ""
     allow = allowed_symbols()
     if allow is not None and sym not in allow:
         return f"⛔ {sym} is not in FUTURES_PAIRS."
@@ -253,10 +256,17 @@ def start(symbol: str, backend: str | None = None) -> str:
 
     log = _log_path(sym)
     pid_file = _pid_path(sym)
+    cmd = [
+        sys.executable, "-u", str(GRID_SCRIPT), sym,
+        "--supervise", "--recv-window", os.getenv("RECV_WINDOW", "15000"),
+    ]
+    if dir_arg:
+        cmd.extend(["--direction", dir_arg])
+
     with open(log, "a", encoding="utf-8") as logfh:
         logfh.write(f"\n--- start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
         proc = subprocess.Popen(
-            [sys.executable, "-u", str(GRID_SCRIPT), sym, "--supervise"],
+            cmd,
             cwd=str(ROOT),
             stdout=logfh,
             stderr=subprocess.STDOUT,

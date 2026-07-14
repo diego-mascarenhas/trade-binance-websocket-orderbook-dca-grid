@@ -426,6 +426,32 @@ def cancel_all_symbol_orders(symbol: str, api: str, sec: str, recv: int) -> None
     )
 
 
+def cancel_dca_grid_orders(symbol: str, api: str, sec: str, recv: int) -> int:
+    """Cancel obdca* limit orders (entry + DCA safety grid)."""
+    sym = symbol.upper()
+    try:
+        oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, recv) or []
+    except Exception:
+        return 0
+    killed = 0
+    for o in oo:
+        cid = _order_client_id(o)
+        if not cid.startswith("obdca"):
+            continue
+        try:
+            _signed_request(
+                "DELETE", "/fapi/v1/order",
+                {"symbol": sym, "orderId": o.get("orderId")},
+                api, sec, recv,
+            )
+            killed += 1
+        except Exception as exc:
+            print(f"{RED}Cancel DCA order {cid} failed: {exc}{RESET}")
+    if killed:
+        print(f"{YELLOW}Cancelled {killed} DCA grid limit order(s) on {sym}.{RESET}")
+    return killed
+
+
 def grid_age_sec(orders: list[dict]) -> float:
     """Age in seconds of the oldest open order (by Binance `time` field)."""
     times = [int(o.get("time", 0) or 0) for o in orders]
@@ -1218,6 +1244,16 @@ def supervise_loop(args: argparse.Namespace) -> None:
                     if not args.keep_sl:
                         cancel_foreign_sl(args.symbol, True, api, sec, args.recv_window)
                         cancel_foreign_sl(args.symbol, False, api, sec, args.recv_window)
+                    if position_just_closed:
+                        try:
+                            killed = cancel_dca_grid_orders(sym, api, sec, args.recv_window)
+                            if killed:
+                                print(
+                                    f"{GREEN}Trade closed → cleared {killed} leftover "
+                                    f"DCA limit order(s).{RESET}",
+                                )
+                        except Exception as exc:
+                            print(f"{RED}Cancel leftover DCA after close failed: {exc}{RESET}")
                     oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window)
                     if oo and grid_is_orphaned(oo, sym):
                         armed_log_state = None
@@ -1303,10 +1339,23 @@ def supervise_loop(args: argparse.Namespace) -> None:
                                 sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
                                 print(f"{DIM}Grid refresh failed → retrying in {sleep_s:g}s.{RESET}")
                     elif oo:
-                        state = f"armed:{len(oo)}"
-                        if state != armed_log_state:
-                            print(f"{DIM}Flat · grid armed ({len(oo)} orders waiting to fill)…{RESET}")
-                            armed_log_state = state
+                        if count_dca_orders(oo, sym) > 0 and not grid_entry_order_open(oo, sym):
+                            armed_log_state = None
+                            print(
+                                f"{YELLOW}Flat with leftover DCA limits ({count_dca_orders(oo, sym)}) "
+                                f"→ cancelling…{RESET}",
+                            )
+                            try:
+                                cancel_dca_grid_orders(sym, api, sec, args.recv_window)
+                            except Exception as exc:
+                                print(f"{RED}Cancel leftover DCA failed: {exc}{RESET}")
+                            else:
+                                oo = []
+                        if oo:
+                            state = f"armed:{len(oo)}"
+                            if state != armed_log_state:
+                                print(f"{DIM}Flat · grid armed ({len(oo)} orders waiting to fill)…{RESET}")
+                                armed_log_state = state
                     else:
                         armed_log_state = None
                         if position_just_closed:
