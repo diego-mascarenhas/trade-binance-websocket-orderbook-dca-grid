@@ -307,6 +307,29 @@ def get_position(symbol: str, is_long: bool, hedge: bool, api: str, sec: str, re
     return 0.0, 0.0
 
 
+def position_pnl(
+    symbol: str, is_long: bool, hedge: bool, api: str, sec: str, recv: int,
+) -> tuple[float, float]:
+    """Return (notional_usdt, unrealized_pnl) for the open position side."""
+    rows = _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()}, api, sec, recv)
+    want_side = ("LONG" if is_long else "SHORT") if hedge else "BOTH"
+    for r in rows if isinstance(rows, list) else []:
+        if str(r.get("positionSide", "BOTH")).upper() != want_side:
+            continue
+        amt = float(r.get("positionAmt", 0) or 0)
+        if abs(amt) <= 0:
+            continue
+        entry = float(r.get("entryPrice", 0) or 0)
+        mark = float(r.get("markPrice", 0) or 0)
+        raw_n = r.get("notional", "")
+        if raw_n not in ("", None):
+            notional = abs(float(raw_n))
+        else:
+            notional = abs(amt) * (mark if mark > 0 else entry)
+        return notional, float(r.get("unRealizedProfit", 0) or 0)
+    return 0.0, 0.0
+
+
 def get_symbol_leverage(symbol: str, api: str, sec: str, recv: int) -> int:
     rows = _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()}, api, sec, recv)
     for r in rows if isinstance(rows, list) else []:
@@ -877,10 +900,12 @@ def arm_staged_exit(
         import telegram_notify as telegram
         direction = "LONG" if is_long else "SHORT"
         lev = get_symbol_leverage(symbol, api, sec, args.recv_window)
+        _, pnl = position_pnl(symbol, is_long, hedge, api, sec, args.recv_window)
         telegram.notify_staged_armed(
             symbol.upper(), direction, float(total_d), entry, tp1_target, args.tp1_profit_pct,
             tp1_qty=float(state.get("tp1_qty", 0) or 0),
             leverage=lev,
+            pnl_usdt=pnl,
         )
     return state
 
@@ -904,12 +929,14 @@ def execute_tp1_at_profit(
 
 
 def _tp1_filled(state: dict[str, Any], qty: float, step: Decimal) -> bool:
-    initial = float(state.get("pre_armed_qty", state.get("armed_qty", 0)) or 0)
+    initial = float(state.get("armed_qty", state.get("pre_armed_qty", 0)) or 0)
     if initial <= 0:
         return False
     tp1 = float(state.get("tp1_qty", 0) or 0)
     remain_expected = float(state.get("remain_qty", initial - tp1) or 0)
     tol = float(step) * 1.5
+    if remain_expected > 0 and abs(qty - remain_expected) <= tol and qty < initial - tol:
+        return True
     return qty <= remain_expected + tol and qty < initial - tol
 
 
@@ -1004,18 +1031,19 @@ def _transition_to_partial(
     runner_pct = (float(qty_d) / initial * 100) if initial > 0 else (100.0 - closed_pct)
     lev = get_symbol_leverage(symbol, api, sec, args.recv_window)
     tp1_price = float(state.get("tp1_price", entry_anchor) or entry_anchor)
+    _, pnl = position_pnl(symbol, is_long, hedge, api, sec, args.recv_window)
     telegram.notify_tp1_filled(
         symbol.upper(), direction, tp1_qty, float(qty_d), entry_anchor,
-        tp1_price=tp1_price, leverage=lev,
+        tp1_price=tp1_price, leverage=lev, pnl_usdt=pnl,
     )
     telegram.notify_profit_lock_sl(
         symbol.upper(), direction, float(qty_d), entry_anchor, float(be),
         closed_pct=closed_pct,
         runner_pct=runner_pct,
         trigger=f"+{args.tp1_profit_pct:g}%",
-        profit_pct=args.tp1_profit_pct,
         closed_qty=tp1_qty,
         leverage=lev,
+        pnl_usdt=pnl,
     )
     state.update({
         "phase": PHASE_PARTIAL,
@@ -1067,9 +1095,10 @@ def _transition_to_trail(
     direction = "LONG" if is_long else "SHORT"
     lev = get_symbol_leverage(symbol, api, sec, args.recv_window)
     entry_anchor = float(state.get("entry_anchor", state.get("entry", 0)) or 0)
+    _, pnl = position_pnl(symbol, is_long, hedge, api, sec, args.recv_window)
     telegram.notify_trail_started(
         symbol.upper(), direction, float(qty_d), tp1_price, args.tp_callback,
-        entry=entry_anchor, leverage=lev,
+        entry=entry_anchor, leverage=lev, pnl_usdt=pnl,
     )
     state.update({
         "phase": PHASE_TRAIL,
@@ -1184,6 +1213,8 @@ def manage_staged_once(
         if not args.dry_run:
             reconcile_staged_algos(sym, phase, api, sec, args.recv_window)
         tp1_algo = find_our_algo(sym, "TP1", api, sec, args.recv_window)
+        armed = float(state.get("armed_qty", 0) or 0)
+        remain = float(state.get("remain_qty", 0) or 0)
         pre = float(state.get("pre_armed_qty", 0) or 0)
         partial_pct = args.tp_partial_pct / 100.0
         if pre <= 0 and partial_pct < 1.0 and qty > 0:
@@ -1202,6 +1233,14 @@ def manage_staged_once(
                 )
                 save_state(sym, state)
                 return
+        if not tp1_algo and armed > qty + float(step) and (
+            remain <= 0 or abs(qty - remain) <= float(step) * 1.5
+        ):
+            state = _transition_to_partial(
+                sym, side_is_long, qty, state, args, hedge, api, sec, filt,
+            )
+            save_state(sym, state)
+            return
         if not tp1_algo and pre > 0 and qty < pre - float(step) / 2:
             state = _transition_to_partial(
                 sym, side_is_long, qty, state, args, hedge, api, sec, filt,

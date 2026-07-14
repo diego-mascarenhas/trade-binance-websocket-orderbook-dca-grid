@@ -95,6 +95,61 @@ def send_warn(message: str) -> None:
     _send_async(f"⚠️ {message}")
 
 
+def fmt_pnl(pnl_usdt: float, notional: float, leverage: float | int | None = None) -> str:
+    """Standard PnL line: PnL: +X.XX USDT (+Y.YY% ROI)."""
+    lev = float(leverage) if leverage else 0.0
+    margin = notional / lev if lev > 0 and notional > 0 else 0.0
+    roi = (pnl_usdt / margin * 100.0) if margin > 0 else None
+    line = f"PnL: {pnl_usdt:+,.2f} USDT"
+    if roi is not None:
+        line += f" ({roi:+.2f}% ROI)"
+    return line
+
+
+def pnl_suffix(
+    pnl_usdt: float | None,
+    notional: float,
+    leverage: float | int | None = None,
+) -> str:
+    """Newline-prefixed PnL line, or empty if unknown."""
+    if pnl_usdt is None:
+        return ""
+    return f"\n{fmt_pnl(pnl_usdt, notional, leverage)}"
+
+
+def _close_emoji(pnl_usdt: float | None) -> str:
+    if pnl_usdt is None:
+        return "🤖"
+    if pnl_usdt > 0:
+        return "🥳"
+    if pnl_usdt < 0:
+        return "😢"
+    return "🤖"
+
+
+def notify_dca_filled(
+    symbol: str,
+    direction: str,
+    fill_qty: float,
+    fill_price: float,
+    pos_qty: float,
+    entry: float,
+    *,
+    vol_usdt: float | None = None,
+    leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
+) -> None:
+    notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(pos_qty) * abs(entry)
+    fill_vol = abs(fill_qty) * abs(fill_price)
+    send_position(
+        direction,
+        f"{symbol.upper()} futures\n#DCA {direction.upper()}\n"
+        f"+{fill_qty:g} @ {fill_price:g} · Vol: {fill_vol:,.2f} USDT\n"
+        f"Position {pos_qty:g} @ {entry:g} · {fmt_vol_usdt(notional, leverage)}"
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}",
+    )
+
+
 def notify_supervise_started(symbol: str, exit_mode: str) -> None:
     send_bot(f"{symbol.upper()} DCA supervise started\nExit: {exit_mode}")
 
@@ -126,12 +181,14 @@ def notify_position_open(
     *,
     vol_usdt: float | None = None,
     leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
 ) -> None:
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(qty) * abs(entry)
     send_position(
         direction,
         f"{symbol.upper()} futures\n#OPEN {direction.upper()}\n"
-        f"Qty {qty:g} @ {entry:g} · {fmt_vol_usdt(notional, leverage)}",
+        f"Qty {qty:g} @ {entry:g} · {fmt_vol_usdt(notional, leverage)}"
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}",
     )
 
 
@@ -143,12 +200,14 @@ def notify_orphan_recovery(
     *,
     vol_usdt: float | None = None,
     leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
 ) -> None:
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else (abs(qty) * abs(entry) if entry > 0 else 0)
     vol = f" · {fmt_vol_usdt(notional, leverage)}" if notional > 0 else ""
     send_warn(
         f"{symbol.upper()} futures\nEntry filled (no orphan cancel)\n"
-        f"DCA-only re-arm · {direction.upper()} qty {qty:g}{vol}",
+        f"DCA-only re-arm · {direction.upper()} qty {qty:g}{vol}"
+        f"{pnl_suffix(pnl_usdt, notional, leverage) if notional > 0 else ''}",
     )
 
 
@@ -167,13 +226,16 @@ def notify_staged_armed(
     *,
     tp1_qty: float | None = None,
     leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
 ) -> None:
     tp1_q = tp1_qty if tp1_qty is not None else qty * 0.7
+    notional = abs(qty) * abs(entry)
     send_position(
         direction,
         f"{symbol.upper()} futures · staged exit\n"
         f"TP1 {tp1_pct:g}% @ {tp1_price:g} · {fmt_vol(tp1_q, tp1_price, leverage)}\n"
-        f"Position {qty:g} @ {entry:g} · {fmt_vol(qty, entry, leverage)}",
+        f"Position {qty:g} @ {entry:g} · {fmt_vol(qty, entry, leverage)}"
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}",
     )
 
 
@@ -186,12 +248,15 @@ def notify_tp1_filled(
     *,
     tp1_price: float | None = None,
     leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
 ) -> None:
     price = tp1_price if tp1_price and tp1_price > 0 else entry
+    notional = abs(remain_qty) * abs(entry)
     send_tp(
         f"{symbol.upper()} futures\nTP1 filled · {direction.upper()}\n"
         f"Closed {tp1_qty:g} · {fmt_vol(tp1_qty, price, leverage)}\n"
-        f"Runner {remain_qty:g} · {fmt_vol(remain_qty, entry, leverage)}",
+        f"Runner {remain_qty:g} · {fmt_vol(remain_qty, entry, leverage)}"
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}",
     )
 
 
@@ -205,15 +270,13 @@ def notify_profit_lock_sl(
     closed_pct: float = 70.0,
     runner_pct: float | None = None,
     trigger: str = "tp1_partial",
-    profit_pct: float | None = None,
     closed_qty: float | None = None,
     leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
 ) -> None:
     """Profit lock after partial TP — shield icon (matches dashboard format)."""
     run_pct = runner_pct if runner_pct is not None else max(0.0, 100.0 - closed_pct)
-    profit_line = (
-        f"PnL +{profit_pct:.2f}%\n" if profit_pct is not None and float(profit_pct) > 0 else ""
-    )
+    notional = abs(runner_qty) * abs(entry)
     closed_vol = ""
     if closed_qty is not None and closed_qty > 0:
         closed_vol = f" · {fmt_vol(closed_qty, entry, leverage)}"
@@ -221,8 +284,8 @@ def notify_profit_lock_sl(
         f"{symbol.upper()} futures\n"
         f"PROFIT LOCK SL · {direction.upper()}\n"
         f"Trigger: {trigger}\n"
-        f"~{closed_pct:.0f}% closed{closed_vol} · runner {run_pct:.0f}% · {fmt_vol(runner_qty, entry, leverage)}\n"
-        f"{profit_line}"
+        f"~{closed_pct:.0f}% closed{closed_vol} · runner {run_pct:.0f}% · {fmt_vol(runner_qty, entry, leverage)}"
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}\n"
         f"SL → {sl_price:g}"
     )
 
@@ -234,12 +297,12 @@ def notify_position_closed(
     after_runner: bool = False,
     vol_usdt: float | None = None,
     leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
 ) -> None:
     vol = f" · {fmt_vol_usdt(vol_usdt, leverage)}" if vol_usdt and vol_usdt > 0 else ""
-    if after_runner:
-        send_trailing(f"{symbol.upper()} futures\n#CLOSED {direction.upper()}{vol}")
-    else:
-        send_bot(f"{symbol.upper()} futures\n#CLOSED {direction.upper()}{vol}")
+    emoji = _close_emoji(pnl_usdt)
+    pnl_line = pnl_suffix(pnl_usdt, vol_usdt or 0.0, leverage) if pnl_usdt is not None else ""
+    _send_async(f"{emoji} {symbol.upper()} futures\n#CLOSED {direction.upper()}{vol}{pnl_line}")
 
 
 def notify_sl_at_entry(symbol: str, direction: str, qty: float, entry: float) -> None:
@@ -255,10 +318,13 @@ def notify_trail_started(
     *,
     entry: float | None = None,
     leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
 ) -> None:
     ref = entry if entry and entry > 0 else activate
+    notional = abs(qty) * abs(ref)
     send_trailing(
         f"{symbol.upper()} futures\nTrailing runner · {direction.upper()}\n"
         f"Qty {qty:g} · {fmt_vol(qty, ref, leverage)}\n"
-        f"Activate {activate:g} · callback {callback:g}%",
+        f"Activate {activate:g} · callback {callback:g}%"
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}",
     )

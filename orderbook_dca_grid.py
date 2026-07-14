@@ -723,7 +723,9 @@ def get_position_meta(
     symbol: str, is_long: bool, hedge: bool, api: str, sec: str, recv: int,
 ) -> dict[str, float | int]:
     """Return qty, entry, notional (USDT), leverage for the open position side."""
-    empty: dict[str, float | int] = {"qty": 0.0, "entry": 0.0, "notional": 0.0, "leverage": 0}
+    empty: dict[str, float | int] = {
+        "qty": 0.0, "entry": 0.0, "notional": 0.0, "leverage": 0, "unrealized_pnl": 0.0,
+    }
     rows = _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()}, api, sec, recv)
     want_side = ("LONG" if is_long else "SHORT") if hedge else "BOTH"
     for r in rows if isinstance(rows, list) else []:
@@ -745,6 +747,7 @@ def get_position_meta(
             "entry": entry,
             "notional": notional,
             "leverage": lev,
+            "unrealized_pnl": float(r.get("unRealizedProfit", 0) or 0),
         }
     return empty
 
@@ -1130,11 +1133,30 @@ def supervise_loop(args: argparse.Namespace) -> None:
                     direction = "LONG" if side_is_long else "SHORT"
                     pos_meta = get_position_meta(sym, side_is_long, hedge, api, sec, args.recv_window)
                     min_open_vol = _env_float("TELEGRAM_MIN_OPEN_VOL", 5.0)
-                    if last_position_qty <= 0 and qty > 0 and pos_meta["notional"] >= min_open_vol:
+                    lev = int(pos_meta["leverage"]) or get_symbol_leverage(sym, api, sec, args.recv_window)
+                    pnl = float(pos_meta.get("unrealized_pnl", 0) or 0)
+                    notional = float(pos_meta["notional"])
+                    if last_position_qty <= 0 and qty > 0 and notional >= min_open_vol:
                         telegram.notify_position_open(
                             sym, direction, qty, entry,
-                            vol_usdt=float(pos_meta["notional"]),
-                            leverage=int(pos_meta["leverage"]) or get_symbol_leverage(sym, api, sec, args.recv_window),
+                            vol_usdt=notional,
+                            leverage=lev,
+                            pnl_usdt=pnl,
+                        )
+                    elif last_position_qty > 0 and qty > last_position_qty + float(filt["step_size"]) / 2:
+                        dca_qty = qty - last_position_qty
+                        old_notional = float(last_pos_meta.get("notional", 0) or 0)
+                        fill_notional = max(0.0, notional - old_notional)
+                        fill_price = fill_notional / dca_qty if dca_qty > 0 else entry
+                        telegram.notify_dca_filled(
+                            sym, direction,
+                            fill_qty=dca_qty,
+                            fill_price=fill_price,
+                            pos_qty=qty,
+                            entry=entry,
+                            vol_usdt=notional,
+                            leverage=lev,
+                            pnl_usdt=pnl,
                         )
                     last_position_qty = qty
                     last_direction = direction
@@ -1185,6 +1207,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             after_runner=after_runner,
                             vol_usdt=float(last_pos_meta.get("notional", 0) or 0),
                             leverage=lev,
+                            pnl_usdt=float(last_pos_meta.get("unrealized_pnl", 0) or 0),
                         )
                     last_position_qty = 0.0
                     last_direction = None
@@ -1205,12 +1228,14 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             direction = "LONG" if side_chk else "SHORT"
                             print(f"{YELLOW}Entry filled — {direction} {qty_chk:g} @ {price_fmt(entry_chk)} "
                                   f"→ DCA-only re-arm (skip orphan cancel){RESET}")
+                            pos_chk = get_position_meta(
+                                sym, side_chk, hedge, api, sec, args.recv_window,
+                            )
                             telegram.notify_orphan_recovery(
                                 sym, direction, qty_chk, entry_chk,
-                                vol_usdt=float(get_position_meta(
-                                    sym, side_chk, hedge, api, sec, args.recv_window,
-                                )["notional"]),
+                                vol_usdt=float(pos_chk["notional"]),
                                 leverage=get_symbol_leverage(sym, api, sec, args.recv_window),
+                                pnl_usdt=float(pos_chk.get("unrealized_pnl", 0) or 0),
                             )
                             if exit_mode != EXIT_STAGED or dca_rearm_allowed(sym):
                                 placed = build_and_place_grid(
