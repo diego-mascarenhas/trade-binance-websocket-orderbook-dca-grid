@@ -1020,11 +1020,17 @@ def rearm_grid(args: argparse.Namespace) -> bool:
             args, api, sec, filt, verbose=True,
             dca_only=True, force=True, direction=direction,
         )
-        if placed and not args.no_tp:
-            print(f"{DIM}Syncing trailing TP…{RESET}")
-            _manage_tp_once(args.symbol, side_is_long, qty, pos_entry, args, hedge, api, sec, filt)
-        elif placed and args.no_tp:
-            print(f"{DIM}--no-tp: skipping trailing TP sync.{RESET}")
+        from exits import resolve_exit_mode, run_exit_once
+
+        exit_mode = resolve_exit_mode(args)
+        if placed and exit_mode != "none":
+            print(f"{DIM}Syncing exit ({exit_mode})…{RESET}")
+            run_exit_once(
+                exit_mode, args.symbol, side_is_long, qty, pos_entry,
+                args, hedge, api, sec, filt,
+            )
+        elif placed:
+            print(f"{DIM}Exit mode none — skipping exit sync.{RESET}")
     else:
         placed = build_and_place_grid(args, api, sec, filt, verbose=True, force=True)
 
@@ -1032,8 +1038,7 @@ def rearm_grid(args: argparse.Namespace) -> bool:
 
 
 def supervise_loop(args: argparse.Namespace) -> None:
-    """Fully autonomous: re-place the grid whenever the symbol is flat, and keep
-    the trailing TP synced while a position is open."""
+    """Fully autonomous: re-place the grid when flat; run exit plugin when in position."""
     api, sec = load_keys(args.env_file)
     if not api or not sec:
         print(f"{RED}No API keys — cannot supervise.{RESET}")
@@ -1043,10 +1048,13 @@ def supervise_loop(args: argparse.Namespace) -> None:
     except Exception as exc:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
+    from exits import exit_mode_label, resolve_exit_mode, run_exit_once
+
     hedge = _resolve_hedge(args, api, sec)
+    exit_mode = resolve_exit_mode(args)
     ttl_note = f", grid refresh {args.grid_ttl:g}s" if args.grid_ttl > 0 else ""
     print(f"\n{BOLD}{CYAN}Supervising {args.symbol.upper()} "
-          f"(auto re-arm grid{'' if args.no_tp else ' + trailing TP'}, poll {args.tp_poll_sec:g}s{ttl_note}). "
+          f"(auto re-arm grid + exit: {exit_mode_label(exit_mode)}, poll {args.tp_poll_sec:g}s{ttl_note}). "
           f"Ctrl+C to stop.{RESET}")
     armed_log_state: str | None = None
     try:
@@ -1056,8 +1064,10 @@ def supervise_loop(args: argparse.Namespace) -> None:
                 side_is_long, qty, entry = _detect_open_side(args.symbol, hedge, api, sec, args.recv_window)
                 if side_is_long is not None:
                     armed_log_state = None
-                    if not args.no_tp:
-                        _manage_tp_once(args.symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
+                    run_exit_once(
+                        exit_mode, args.symbol, side_is_long, qty, entry,
+                        args, hedge, api, sec, filt,
+                    )
                 else:
                     if not args.keep_sl:
                         cancel_foreign_sl(args.symbol, True, api, sec, args.recv_window)
@@ -1201,8 +1211,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-max-leverage", action="store_true", help="Do NOT auto-set the symbol's max leverage")
     p.add_argument("--recv-window", type=int, default=5000)
     p.add_argument("--env-file", default=None, help="Path to .env with API keys (default: project root)")
-    # Trailing TP on the opposite order book (AUTOMATIC by default when executing)
-    p.add_argument("--no-tp", action="store_true", help="Do NOT auto-manage the trailing TP after placing the grid")
+    # Exit strategy (plugins in exits/ — default trailing TP on opposite OB wall)
+    p.add_argument("--exit", dest="exit_mode", choices=["trailing", "staged", "none"], default=None,
+                   help="Exit strategy with open position (default: trailing; none if --no-tp)")
+    p.add_argument("--no-tp", action="store_true",
+                   help="Legacy alias for --exit none (skip automatic exit management)")
+    p.add_argument("--tp1-profit-pct", type=float, default=None,
+                   help="[--exit staged] Profit %% for first partial. Env: TP1_PROFIT_PCT")
+    p.add_argument("--tp-partial-pct", type=float, default=None,
+                   help="[--exit staged] First partial size %%. Env: TP_PARTIAL_PCT")
     p.add_argument("--tp-only", action="store_true", help="Skip the grid; only auto-manage the trailing TP for the position")
     p.add_argument("--supervise", action="store_true", help="Autonomous: re-arm the grid when flat + manage the trailing TP (loop)")
     p.add_argument("--tp-callback", type=float, default=0.2, help="Trailing callback rate %% (0.1..10)")
@@ -1530,23 +1547,30 @@ def main() -> None:
 
     if not args.execute:
         print(f"\n{DIM}DRY-RUN — no orders sent. Remove --dry-run to place the grid "
-              f"and auto-manage the TP (or --no-tp to skip the TP).{RESET}")
+              f"and auto-manage exit (or --exit none to skip).{RESET}")
         return
 
     placed_ok = place_orders(args.symbol, is_long, prepared, args)
     if not placed_ok:
         return
 
-    # TP is AUTOMATIC: after placing the grid, keep the trailing TP synced to the position.
-    if args.no_tp:
-        print(f"\n{DIM}--no-tp set: skipping automatic TP management.{RESET}")
+    from exits import EXIT_TRAILING, resolve_exit_mode, run_exit_once
+
+    exit_mode = resolve_exit_mode(args)
+    if exit_mode == "none":
+        print(f"\n{DIM}Exit mode none — skipping automatic exit management.{RESET}")
         return
     api, sec = load_keys(args.env_file)
     if not api or not sec:
-        print(f"{RED}No API keys — cannot auto-manage trailing TP.{RESET}")
+        print(f"{RED}No API keys — cannot auto-manage exit.{RESET}")
         return
     hedge = _resolve_hedge(args, api, sec)
-    manage_trailing_tp(args.symbol, is_long, args, hedge, api, sec, filt)
+    if exit_mode == EXIT_TRAILING:
+        manage_trailing_tp(args.symbol, is_long, args, hedge, api, sec, filt)
+        return
+    side_is_long, qty, entry = _detect_open_side(args.symbol, hedge, api, sec, args.recv_window, is_long)
+    if side_is_long is not None and qty > 0:
+        run_exit_once(exit_mode, args.symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
 
 
 if __name__ == "__main__":

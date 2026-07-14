@@ -6,7 +6,8 @@ Runs alongside orderbook_dca_grid.py on test pairs. When a position is open:
   2. On TP1 fill: cancels DCA, SL on runner at original entry
   3. Trailing on the opposite order-book wall for the runner
 
-Default mode is automatic (supervise loop).
+Default mode is automatic (supervise loop). Or use the main bot:
+  python3 orderbook_dca_grid.py SYMBOL --supervise --exit staged
 """
 
 from __future__ import annotations
@@ -598,14 +599,20 @@ def place_tp1_order(
         "armed_qty": float(_round_to(qty, step, ROUND_DOWN)),
         "trail_wall_price": wall["activation"],
     })
+    if "pre_armed_qty" not in state:
+        state["pre_armed_qty"] = float(_round_to(qty, step, ROUND_DOWN))
     return state
 
 
 def _tp1_qty_needs_sync(state: dict[str, Any], qty: float, step: Decimal) -> bool:
+    """True when DCA increased position size — not when TP1 partial reduced it."""
     armed = float(state.get("armed_qty", 0) or 0)
     if armed <= 0:
         return True
-    return abs(qty - armed) > float(step) / 2
+    tol = float(step) / 2
+    if qty < armed - tol:
+        return False
+    return qty > armed + tol
 
 
 def arm_staged_exit(
@@ -673,13 +680,13 @@ def execute_tp1_at_profit(
 
 
 def _tp1_filled(state: dict[str, Any], qty: float, step: Decimal) -> bool:
-    armed = float(state.get("armed_qty", 0) or 0)
-    if armed <= 0:
+    initial = float(state.get("pre_armed_qty", state.get("armed_qty", 0)) or 0)
+    if initial <= 0:
         return False
     tp1 = float(state.get("tp1_qty", 0) or 0)
-    remain_expected = float(state.get("remain_qty", armed - tp1) or 0)
+    remain_expected = float(state.get("remain_qty", initial - tp1) or 0)
     tol = float(step) * 1.5
-    return qty <= remain_expected + tol and qty < armed - tol
+    return qty <= remain_expected + tol and qty < initial - tol
 
 
 def _transition_to_partial(
@@ -848,7 +855,8 @@ def manage_staged_once(
         state["phase"] = PHASE_WAITING
 
     if not state.get("takeover_done") or phase == PHASE_IDLE:
-        if _entry_order_open(sym, api, sec, args.recv_window):
+        entry_open = _entry_order_open(sym, api, sec, args.recv_window)
+        if entry_open:
             if args.once:
                 print(f"{DIM}{sym} entry limit still open — waiting for fill before staged exit.{RESET}")
             return
@@ -875,9 +883,27 @@ def manage_staged_once(
         return
 
     if phase == PHASE_TP1:
-        if _tp1_qty_needs_sync(state, qty, step):
-            print(f"{YELLOW}Position size changed {state.get('armed_qty', 0):g} → {qty:g} — updating TP1{RESET}")
-            state = place_tp1_order(
+        tp1_algo = find_our_algo(sym, "TP1", api, sec, args.recv_window)
+        pre = float(state.get("pre_armed_qty", 0) or 0)
+        partial_pct = args.tp_partial_pct / 100.0
+        if pre <= 0 and partial_pct < 1.0 and qty > 0:
+            pre = qty / (1.0 - partial_pct)
+        if tp1_algo and pre > qty + float(step) * 2:
+            try:
+                aq = float(tp1_algo.get("quantity", 0) or 0)
+            except (TypeError, ValueError):
+                aq = 0.0
+            if abs(aq - qty) < float(step):
+                cancel_our_algos(sym, "TP1", api, sec, args.recv_window)
+                state["pre_armed_qty"] = pre
+                state["remain_qty"] = qty
+                state = _transition_to_partial(
+                    sym, side_is_long, qty, state, args, hedge, api, sec, filt,
+                )
+                save_state(sym, state)
+                return
+        if not tp1_algo and pre > 0 and qty < pre - float(step) / 2:
+            state = _transition_to_partial(
                 sym, side_is_long, qty, state, args, hedge, api, sec, filt,
             )
             save_state(sym, state)
@@ -887,6 +913,14 @@ def manage_staged_once(
                 sym, side_is_long, qty, state, args, hedge, api, sec, filt,
             )
             save_state(sym, state)
+            return
+        if _tp1_qty_needs_sync(state, qty, step):
+            print(f"{YELLOW}Position size changed {state.get('armed_qty', 0):g} → {qty:g} — updating TP1{RESET}")
+            state = place_tp1_order(
+                sym, side_is_long, qty, state, args, hedge, api, sec, filt,
+            )
+            save_state(sym, state)
+            return
         elif args.once:
             side = "LONG" if side_is_long else "SHORT"
             print(f"{DIM}{sym} {side} {qty:g} @ {price_fmt(entry_anchor)} — TP1 @ {price_fmt(float(state.get('tp1_price', 0) or 0))} "

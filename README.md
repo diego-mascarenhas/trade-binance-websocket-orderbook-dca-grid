@@ -89,38 +89,41 @@ Run `python3 orderbook_dca_grid.py --help` for all flags.
 
 ---
 
-## Staged exit addon (`orderbook_staged_exit.py`) — experimental
+## Staged exit (`--exit staged`) — experimental
 
-Separate script to **test** a new exit strategy without changing the main DCA bot. Runs in parallel on chosen pairs.
-
-When a position is open (entry/DCA fill from `orderbook_dca_grid.py`):
-
-1. Waits until profit reaches **TP1_PROFIT_PCT** (default **0.3%**) — **DCA grid stays active**
-2. At target: **cancels all DCA**, closes **TP_PARTIAL_PCT** (70%) at the profit price
-3. Places **SL on the runner at the original entry** (breakeven on remainder)
-4. **Trailing** on the opposite order-book wall for the runner
-
-By default **does not** place an initial adverse SL or cancel DCA before profit target.
-
-**Default mode is automatic** — just run the script (or systemd unit); no `--tp-only --once` after fills.
+Staged exit lives in `exits/staged.py` (logic in `orderbook_staged_exit.py`). Prefer **one process**:
 
 ```bash
-# DCA bot on the test pair — grid only, no trailing TP
-python3 orderbook_dca_grid.py LINKUSDT --supervise --no-tp
+# Grid + staged exit together (replaces two terminals)
+python3 orderbook_dca_grid.py 1000RATSUSDT --supervise --exit staged --direction short
 
-# Staged exit addon — auto TP/SL (foreground loop)
-python3 orderbook_staged_exit.py LINKUSDT
-
-python3 orderbook_staged_exit.py LINKUSDT --audit    # read-only status
-python3 orderbook_staged_exit.py LINKUSDT --once     # single sync pass
-python3 orderbook_staged_exit.py LINKUSDT --dry-run --once  # preview
+python3 orderbook_dca_grid.py LINKUSDT --audit
+python3 orderbook_staged_exit.py LINKUSDT --audit   # still works standalone
 ```
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `TP1_PROFIT_PCT` | `0.3` | Profit % to trigger first partial (70%) |
-| `TP_PARTIAL_PCT` | `70` | First take-profit size (%) |
-| `STAGED_POLL_SEC` | `5` | Supervisor poll interval |
+When a position is open:
+
+1. Places **TP1 (70%)** as TAKE_PROFIT at **+TP1_PROFIT_PCT** (default **0.3%**) — DCA grid stays active
+2. On TP1 fill: **cancels DCA**, **SL on runner at original entry**
+3. **Trailing** on the opposite order-book wall for the runner
+
+Legacy two-process mode (still valid):
+
+```bash
+python3 orderbook_dca_grid.py LINKUSDT --supervise --no-tp
+python3 orderbook_staged_exit.py LINKUSDT
+```
+
+| Flag / env | Default | Description |
+|------------|---------|-------------|
+| `--exit staged` | — | Use staged exit plugin |
+| `--exit trailing` | default | Trailing TP @ OB wall |
+| `--exit none` / `--no-tp` | — | Grid only |
+| `TP1_PROFIT_PCT` | `0.3` | First partial trigger (%) |
+| `TP_PARTIAL_PCT` | `70` | First partial size (%) |
+| `STAGED_POLL_SEC` | `5` | Staged state poll (via grid `--tp-poll-sec` loop) |
+
+Add new exit strategies under `exits/` and register them in `exits/__init__.py`.
 
 Enable manually (not wired into `sync_pairs.py` yet):
 
