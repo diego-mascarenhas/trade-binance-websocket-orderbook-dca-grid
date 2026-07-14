@@ -2,10 +2,9 @@
 """Experimental staged exit manager for Binance Futures (addon to the DCA grid bot).
 
 Runs alongside orderbook_dca_grid.py on test pairs. When a position is open:
-  1. Waits until profit reaches TP1_PROFIT_PCT (default 0.3%) — DCA grid stays active
-  2. At target: cancels DCA, closes TP_PARTIAL_PCT (70%) at the profit price
-  3. Places SL on the runner at the original entry (breakeven on remainder)
-  4. Trailing on the opposite order-book wall for the runner
+  1. Places TP1 (70%) as TAKE_PROFIT at +TP1_PROFIT_PCT (default 0.3%) — DCA grid stays active
+  2. On TP1 fill: cancels DCA, SL on runner at original entry
+  3. Trailing on the opposite order-book wall for the runner
 
 Default mode is automatic (supervise loop).
 """
@@ -547,51 +546,7 @@ def _qty_strings(tp1: Decimal, remain: Decimal, qty_dp: int) -> tuple[str, str]:
     return f"{tp1:.{qty_dp}f}", f"{remain:.{qty_dp}f}"
 
 
-def arm_staged_exit(
-    symbol: str,
-    is_long: bool,
-    qty: float,
-    entry: float,
-    args: argparse.Namespace,
-    hedge: bool,
-    api: str,
-    sec: str,
-    filt: dict[str, Decimal],
-) -> dict[str, Any]:
-    """Attach to an open position: clear legacy TP, watch for profit target (DCA stays)."""
-    tick = filt["tick_size"]
-    step = filt["step_size"]
-    total_d = _round_to(qty, step, ROUND_DOWN)
-    tp1_target = profit_target_price(entry, is_long, args.tp1_profit_pct, tick)
-    wall = trail_wall_plan(symbol, entry, is_long, args, tick)
-
-    close_side = "SELL" if is_long else "BUY"
-    print(f"\n{BOLD}{CYAN}Armed {symbol.upper()} {'LONG' if is_long else 'SHORT'} "
-          f"qty {total_d} @ {price_fmt(entry)}{RESET}")
-    print(f"  Waiting +{args.tp1_profit_pct:g}% profit → TP1 {args.tp_partial_pct:g}% @ {price_fmt(tp1_target)}")
-    print(f"  Then SL runner @ entry {price_fmt(entry)} · trailing wall @ {price_fmt(wall['activation'])}")
-    print(f"  DCA grid kept until profit target (then cancelled)")
-
-    if not args.dry_run:
-        cancel_legacy_exit_algos(symbol, is_long, api, sec, args.recv_window)
-        for tag in ("SL", "TP1", "BE", "TR"):
-            cancel_our_algos(symbol, tag, api, sec, args.recv_window)
-
-    return {
-        "phase": PHASE_WAITING,
-        "takeover_done": True,
-        "is_long": is_long,
-        "entry_anchor": entry,
-        "entry": entry,
-        "tp1_profit_pct": args.tp1_profit_pct,
-        "tp1_price": tp1_target,
-        "trail_wall_price": wall["activation"],
-        "armed_qty": float(total_d),
-        "algo_ids": {},
-    }
-
-
-def execute_tp1_at_profit(
+def place_tp1_order(
     symbol: str,
     is_long: bool,
     qty: float,
@@ -601,8 +556,10 @@ def execute_tp1_at_profit(
     api: str,
     sec: str,
     filt: dict[str, Decimal],
+    *,
+    reason: str = "",
 ) -> dict[str, Any]:
-    """Hit profit target: cancel DCA, place TP1 partial at profit price."""
+    """Place (or replace) TP1 partial at the profit target price. DCA grid is kept."""
     tick = filt["tick_size"]
     step = filt["step_size"]
     price_dp = _dec_places(tick)
@@ -617,14 +574,12 @@ def execute_tp1_at_profit(
     )
     tp1_str, remain_str = _qty_strings(tp1_d, remain_d, qty_dp)
     close_side = "SELL" if is_long else "BUY"
-    pnow = profit_pct(entry, get_mark_price(symbol, api, sec, args.recv_window), is_long)
+    prefix = f"{reason} " if reason else ""
 
-    print(f"\n{YELLOW}Profit {pnow:+.2f}% ≥ {args.tp1_profit_pct:g}% → TP1 + cancel DCA{RESET}")
-    print(f"  {close_side} TAKE_PROFIT_MARKET {tp1_str} ({args.tp_partial_pct:g}%) @ {tp1_trig}")
-    print(f"  Runner {remain_str} → SL @ entry {price_fmt(entry)} then trail @ wall {price_fmt(wall['activation'])}")
+    print(f"{prefix}{close_side} TAKE_PROFIT_MARKET {tp1_str} ({args.tp_partial_pct:g}%) @ {tp1_trig} "
+          f"(+{args.tp1_profit_pct:g}% from entry)")
 
     if not args.dry_run:
-        cancel_dca_grid_orders(symbol, api, sec, args.recv_window)
         cancel_our_algos(symbol, "TP1", api, sec, args.recv_window)
         tp1_resp = place_algo_order(
             symbol, is_long, "TAKE_PROFIT_MARKET", tp1_str, tp1_trig,
@@ -644,6 +599,77 @@ def execute_tp1_at_profit(
         "trail_wall_price": wall["activation"],
     })
     return state
+
+
+def _tp1_qty_needs_sync(state: dict[str, Any], qty: float, step: Decimal) -> bool:
+    armed = float(state.get("armed_qty", 0) or 0)
+    if armed <= 0:
+        return True
+    return abs(qty - armed) > float(step) / 2
+
+
+def arm_staged_exit(
+    symbol: str,
+    is_long: bool,
+    qty: float,
+    entry: float,
+    args: argparse.Namespace,
+    hedge: bool,
+    api: str,
+    sec: str,
+    filt: dict[str, Decimal],
+) -> dict[str, Any]:
+    """Attach to an open position: place TP1 at profit target (DCA stays until TP1 fills)."""
+    tick = filt["tick_size"]
+    step = filt["step_size"]
+    total_d = _round_to(qty, step, ROUND_DOWN)
+    tp1_target = profit_target_price(entry, is_long, args.tp1_profit_pct, tick)
+    wall = trail_wall_plan(symbol, entry, is_long, args, tick)
+
+    print(f"\n{BOLD}{CYAN}Armed {symbol.upper()} {'LONG' if is_long else 'SHORT'} "
+          f"qty {total_d} @ {price_fmt(entry)}{RESET}")
+    print(f"  TP1 {args.tp_partial_pct:g}% @ {price_fmt(tp1_target)} (+{args.tp1_profit_pct:g}% profit)")
+    print(f"  Then SL runner @ entry {price_fmt(entry)} · trailing wall @ {price_fmt(wall['activation'])}")
+    print(f"  DCA grid kept until TP1 fills")
+
+    if not args.dry_run:
+        cancel_legacy_exit_algos(symbol, is_long, api, sec, args.recv_window)
+        for tag in ("SL", "TP1", "BE", "TR"):
+            cancel_our_algos(symbol, tag, api, sec, args.recv_window)
+
+    state: dict[str, Any] = {
+        "takeover_done": True,
+        "is_long": is_long,
+        "entry_anchor": entry,
+        "entry": entry,
+        "tp1_profit_pct": args.tp1_profit_pct,
+        "tp1_price": tp1_target,
+        "trail_wall_price": wall["activation"],
+        "armed_qty": float(total_d),
+        "algo_ids": {},
+    }
+    return place_tp1_order(
+        symbol, is_long, qty, state, args, hedge, api, sec, filt,
+        reason=f"{YELLOW}Placing TP1:{RESET}",
+    )
+
+
+def execute_tp1_at_profit(
+    symbol: str,
+    is_long: bool,
+    qty: float,
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    hedge: bool,
+    api: str,
+    sec: str,
+    filt: dict[str, Decimal],
+) -> dict[str, Any]:
+    """Legacy: migrate waiting_profit state → place TP1 on exchange."""
+    print(f"\n{YELLOW}Migrating to exchange TP1 (was waiting for poll){RESET}")
+    return place_tp1_order(
+        symbol, is_long, qty, state, args, hedge, api, sec, filt,
+    )
 
 
 def _tp1_filled(state: dict[str, Any], qty: float, step: Decimal) -> bool:
@@ -684,12 +710,13 @@ def _transition_to_partial(
     wall = trail_wall_plan(symbol, entry_anchor, is_long, args, tick)
     state["trail_wall_price"] = wall["activation"]
 
-    print(f"{YELLOW}TP1 filled → SL runner {qty_str} @ entry {be_str}{RESET}")
+    print(f"{YELLOW}TP1 filled → cancel DCA · SL runner {qty_str} @ entry {be_str}{RESET}")
 
     if args.dry_run:
         state.update({"phase": PHASE_PARTIAL, "remain_qty": float(qty_d), "be_price": be, "algo_ids": {}})
         return state
 
+    cancel_dca_grid_orders(symbol, api, sec, args.recv_window)
     be_resp = place_algo_order(
         symbol, is_long, "STOP_MARKET", qty_str, be_str,
         hedge, api, sec, args.recv_window, client_tag="BE",
@@ -841,26 +868,29 @@ def manage_staged_once(
     pnow = profit_pct(entry_anchor, mark, side_is_long)
 
     if phase == PHASE_WAITING:
-        if profit_target_hit(entry_anchor, mark, side_is_long, args.tp1_profit_pct):
-            state = execute_tp1_at_profit(
-                sym, side_is_long, qty, state, args, hedge, api, sec, filt,
-            )
-            save_state(sym, state)
-        elif args.once:
-            side = "LONG" if side_is_long else "SHORT"
-            print(f"{DIM}{sym} {side} {qty:g} @ {price_fmt(entry_anchor)} — waiting profit "
-                  f"{pnow:+.2f}% / {args.tp1_profit_pct:g}% (DCA kept){RESET}")
+        state = execute_tp1_at_profit(
+            sym, side_is_long, qty, state, args, hedge, api, sec, filt,
+        )
+        save_state(sym, state)
         return
 
     if phase == PHASE_TP1:
+        if _tp1_qty_needs_sync(state, qty, step):
+            print(f"{YELLOW}Position size changed {state.get('armed_qty', 0):g} → {qty:g} — updating TP1{RESET}")
+            state = place_tp1_order(
+                sym, side_is_long, qty, state, args, hedge, api, sec, filt,
+            )
+            save_state(sym, state)
+            return
         if _tp1_filled(state, qty, step):
             state = _transition_to_partial(
                 sym, side_is_long, qty, state, args, hedge, api, sec, filt,
             )
             save_state(sym, state)
         elif args.once:
-            print(f"{DIM}{sym} TP1 {args.tp_partial_pct:g}% armed @ {price_fmt(float(state.get('tp1_price', 0) or 0))} "
-                  f"· profit now {pnow:+.2f}%{RESET}")
+            side = "LONG" if side_is_long else "SHORT"
+            print(f"{DIM}{sym} {side} {qty:g} @ {price_fmt(entry_anchor)} — TP1 @ {price_fmt(float(state.get('tp1_price', 0) or 0))} "
+                  f"· profit now {pnow:+.2f}% (DCA kept){RESET}")
         return
 
     wall_price = float(state.get("trail_wall_price", 0) or 0)
@@ -1032,7 +1062,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=100, help="Order book depth limit")
     p.add_argument("--poll-sec", type=float, default=_env_float("STAGED_POLL_SEC", 5.0))
     p.add_argument("--position-mode", choices=["auto", "hedge", "oneway"], default="auto")
-    p.add_argument("--recv-window", type=int, default=5000)
+    p.add_argument("--recv-window", type=int, default=15000)
     p.add_argument("--env-file", default=None)
     return p.parse_args()
 
