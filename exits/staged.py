@@ -67,3 +67,44 @@ def run_once(
     staged.manage_staged_once(
         symbol, staged_args, hedge, api, sec, filt, prefer_is_long=prefer,
     )
+
+
+def sync_flat(
+    symbol: str,
+    args: argparse.Namespace,
+    hedge: bool,
+    api: str,
+    sec: str,
+    filt: dict[str, Decimal],
+) -> None:
+    """When flat: clear staged state via manage_staged_once (no-op if already idle)."""
+    import orderbook_staged_exit as staged
+
+    staged_args = _staged_args(args)
+    prefer = None
+    if staged_args.direction == "long":
+        prefer = True
+    elif staged_args.direction == "short":
+        prefer = False
+    staged.manage_staged_once(
+        symbol, staged_args, hedge, api, sec, filt, prefer_is_long=prefer,
+    )
+
+
+def staged_blocks_grid_rearm(symbol: str) -> bool:
+    """True while staged runner is active (no DCA / no new grid until flat + closed)."""
+    import orderbook_staged_exit as staged
+
+    phase = staged.load_state(symbol.upper()).get("phase", staged.PHASE_IDLE)
+    return phase in (staged.PHASE_PARTIAL, staged.PHASE_TRAIL)
+
+
+def dca_rearm_allowed(symbol: str) -> bool:
+    """False after TP1 — DCA was cancelled on purpose; runner is SL/trail only."""
+    return not staged_blocks_grid_rearm(symbol)
+
+
+def staged_phase(symbol: str) -> str:
+    import orderbook_staged_exit as staged
+
+    return str(staged.load_state(symbol.upper()).get("phase", staged.PHASE_IDLE))

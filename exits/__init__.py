@@ -6,6 +6,7 @@ Add new strategies here; the main bot only dispatches via run_exit_once().
 from __future__ import annotations
 
 import argparse
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -23,11 +24,16 @@ _LABELS = {
 
 
 def resolve_exit_mode(args: argparse.Namespace) -> str:
-    """Effective exit mode from --exit and legacy --no-tp."""
+    """Effective exit mode from --exit, EXIT_MODE env, and legacy --no-tp."""
     mode = getattr(args, "exit_mode", None)
     if mode is not None:
         return mode
-    return EXIT_NONE if getattr(args, "no_tp", False) else EXIT_TRAILING
+    if getattr(args, "no_tp", False):
+        return EXIT_NONE
+    env_mode = os.getenv("EXIT_MODE", "").strip().lower()
+    if env_mode in (EXIT_TRAILING, EXIT_STAGED, EXIT_NONE):
+        return env_mode
+    return EXIT_STAGED
 
 
 def exit_mode_label(mode: str) -> str:
@@ -55,3 +61,19 @@ def run_exit_once(
     else:
         raise ValueError(f"Unknown exit mode: {mode}")
     run_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
+
+
+def run_exit_when_flat(
+    mode: str,
+    symbol: str,
+    args: argparse.Namespace,
+    hedge: bool,
+    api: str,
+    sec: str,
+    filt: dict[str, Decimal],
+) -> None:
+    """Clear staged state (and stray algos) when flat — supervise calls this each poll."""
+    if mode != EXIT_STAGED:
+        return
+    from exits.staged import sync_flat
+    sync_flat(symbol, args, hedge, api, sec, filt)

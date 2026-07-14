@@ -43,6 +43,13 @@ PHASE_WAITING = "waiting_profit"
 PHASE_TP1 = "tp1_armed"
 PHASE_PARTIAL = "staged_partial"
 PHASE_TRAIL = "staged_trail"
+
+STAGED_TAGS = ("TP1", "BE", "TR", "SL")
+ALLOWED_ALGOS_BY_PHASE: dict[str, set[str]] = {
+    PHASE_TP1: {"TP1"},
+    PHASE_PARTIAL: {"BE"},
+    PHASE_TRAIL: {"TR"},
+}
 # legacy alias
 PHASE_FULL = PHASE_WAITING
 
@@ -291,13 +298,22 @@ def trail_wall_plan(
 def get_position(symbol: str, is_long: bool, hedge: bool, api: str, sec: str, recv: int) -> tuple[float, float]:
     rows = _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()}, api, sec, recv)
     want_side = ("LONG" if is_long else "SHORT") if hedge else "BOTH"
-    for r in rows:
+    for r in rows if isinstance(rows, list) else []:
         if str(r.get("positionSide", "BOTH")).upper() != want_side:
             continue
         amt = float(r.get("positionAmt", 0) or 0)
         if abs(amt) > 0:
             return abs(amt), float(r.get("entryPrice", 0) or 0)
     return 0.0, 0.0
+
+
+def get_symbol_leverage(symbol: str, api: str, sec: str, recv: int) -> int:
+    rows = _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()}, api, sec, recv)
+    for r in rows if isinstance(rows, list) else []:
+        lev = int(float(r.get("leverage", 0) or 0))
+        if lev > 0:
+            return lev
+    return 10
 
 
 def _detect_open_side(
@@ -335,6 +351,16 @@ def _env_float(name: str, default: float) -> float:
         return default
     try:
         return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
     except ValueError:
         return default
 
@@ -393,26 +419,94 @@ def list_open_algo_orders(symbol: str, api: str, sec: str, recv: int) -> list[di
     return resp.get("orders", resp.get("data", [])) or []
 
 
-def cancel_algo_order(symbol: str, algo_id: int | str, api: str, sec: str, recv: int) -> None:
-    _signed_request(
-        "DELETE", "/fapi/v1/algoOrder",
-        {"symbol": symbol.upper(), "algoId": algo_id},
-        api, sec, recv,
+def _cancel_error_benign(exc: BaseException) -> bool:
+    """True when the algo is already gone (UI may still show a ghost line)."""
+    text = str(exc).lower()
+    return any(
+        x in text
+        for x in ("-2011", "-2013", "unknown order", "already been canceled", "does not exist")
     )
 
 
+def _staged_tag_from_cid(cid: str, symbol: str) -> str | None:
+    sym = symbol.upper()
+    if not cid.startswith(ALGO_PREFIX):
+        return None
+    rest = cid[len(ALGO_PREFIX):]
+    if rest.endswith(sym):
+        return rest[:-len(sym)]
+    return None
+
+
+def cancel_algo_order(symbol: str, algo_id: int | str, api: str, sec: str, recv: int) -> bool:
+    """Cancel one algo order. Returns False if already gone (benign)."""
+    try:
+        _signed_request(
+            "DELETE", "/fapi/v1/algoOrder",
+            {"symbol": symbol.upper(), "algoId": algo_id},
+            api, sec, recv,
+        )
+        return True
+    except Exception as exc:
+        if _cancel_error_benign(exc):
+            return False
+        raise
+
+
 def cancel_our_algos(symbol: str, tag: str, api: str, sec: str, recv: int) -> int:
-    """Cancel our algo orders matching clientAlgoId prefix obstage{tag}."""
-    want = f"{ALGO_PREFIX}{tag}{symbol.upper()}"
+    """Cancel our algo orders matching clientAlgoId obstage{tag}{symbol}."""
+    want = _algo_client_tag(tag, symbol)
     killed = 0
     for o in list_open_algo_orders(symbol, api, sec, recv):
         cid = _algo_client_id(o)
-        if cid.startswith(want) or cid == want:
-            try:
-                cancel_algo_order(symbol, o.get("algoId"), api, sec, recv)
+        if cid == want or cid.startswith(want):
+            if cancel_algo_order(symbol, o.get("algoId"), api, sec, recv):
                 killed += 1
-            except Exception as exc:
-                print(f"{RED}Cancel algo {cid} failed: {exc}{RESET}")
+            else:
+                print(f"{DIM}Algo {cid} already gone (chart may show ghost until refresh).{RESET}")
+    return killed
+
+
+def cancel_all_staged_algos(symbol: str, api: str, sec: str, recv: int) -> int:
+    """Cancel every open obstage* conditional order on the symbol."""
+    killed = 0
+    for tag in STAGED_TAGS:
+        killed += cancel_our_algos(symbol, tag, api, sec, recv)
+    return killed
+
+
+def reconcile_staged_algos(
+    symbol: str,
+    phase: str,
+    api: str,
+    sec: str,
+    recv: int,
+) -> int:
+    """Drop stray/duplicate staged algos that do not match the current phase."""
+    allowed = ALLOWED_ALGOS_BY_PHASE.get(phase, set())
+    by_tag: dict[str, list[dict]] = {}
+    for o in list_open_algo_orders(symbol, api, sec, recv):
+        tag = _staged_tag_from_cid(_algo_client_id(o), symbol)
+        if tag is None:
+            continue
+        by_tag.setdefault(tag, []).append(o)
+
+    killed = 0
+    for tag, orders in by_tag.items():
+        if tag not in allowed:
+            for o in orders:
+                cid = _algo_client_id(o)
+                if cancel_algo_order(symbol, o.get("algoId"), api, sec, recv):
+                    print(f"{YELLOW}Removed stray {tag} algo {cid} (phase={phase}).{RESET}")
+                    killed += 1
+            continue
+        if len(orders) > 1:
+            orders.sort(key=lambda x: int(x.get("algoId") or 0))
+            for o in orders[:-1]:
+                cid = _algo_client_id(o)
+                if cancel_algo_order(symbol, o.get("algoId"), api, sec, recv):
+                    print(f"{YELLOW}Removed duplicate {tag} algo {cid}.{RESET}")
+                    killed += 1
     return killed
 
 
@@ -429,9 +523,9 @@ def cancel_legacy_exit_algos(symbol: str, is_long: bool, api: str, sec: str, rec
             continue
         if otype in ("TRAILING_STOP_MARKET", "STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
             try:
-                cancel_algo_order(symbol, o.get("algoId"), api, sec, recv)
-                print(f"{DIM}Cancelled legacy {otype} algoId={o.get('algoId')}{RESET}")
-                killed += 1
+                if cancel_algo_order(symbol, o.get("algoId"), api, sec, recv):
+                    print(f"{DIM}Cancelled legacy {otype} algoId={o.get('algoId')}{RESET}")
+                    killed += 1
             except Exception as exc:
                 print(f"{RED}Cancel legacy {otype} failed: {exc}{RESET}")
     return killed
@@ -547,6 +641,111 @@ def _qty_strings(tp1: Decimal, remain: Decimal, qty_dp: int) -> tuple[str, str]:
     return f"{tp1:.{qty_dp}f}", f"{remain:.{qty_dp}f}"
 
 
+def _is_immediate_trigger_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "-2021" in text or "immediately trigger" in text
+
+
+def _stop_would_immediately_trigger(is_long: bool, trigger: float, mark: float, tick: Decimal) -> bool:
+    """STOP_MARKET that closes the position would fire on placement."""
+    tol = float(tick) * 0.5
+    if is_long:
+        return mark <= trigger + tol
+    return mark >= trigger - tol
+
+
+def _tp_would_immediately_trigger(is_long: bool, trigger: float, mark: float, tick: Decimal) -> bool:
+    """TAKE_PROFIT_MARKET that closes the position would fire on placement."""
+    tol = float(tick) * 0.5
+    if is_long:
+        return mark >= trigger - tol
+    return mark <= trigger + tol
+
+
+def _market_reduce_qty(
+    symbol: str,
+    is_long: bool,
+    qty: Decimal,
+    hedge: bool,
+    filt: dict[str, Decimal],
+    api: str,
+    sec: str,
+    recv: int,
+) -> float:
+    """Reduce-only MARKET close for a partial quantity."""
+    step = filt["step_size"]
+    qty_dp = _dec_places(step)
+    qty_d = _round_to(float(qty), step, ROUND_DOWN)
+    if qty_d <= 0:
+        return 0.0
+    side = "SELL" if is_long else "BUY"
+    params: dict[str, Any] = {
+        "symbol": symbol.upper(),
+        "side": side,
+        "type": "MARKET",
+        "quantity": f"{qty_d:.{qty_dp}f}",
+    }
+    if hedge:
+        params["positionSide"] = "LONG" if is_long else "SHORT"
+    else:
+        params["reduceOnly"] = "true"
+    _signed_request("POST", "/fapi/v1/order", params, api, sec, recv)
+    return float(qty_d)
+
+
+def _execute_tp1_market(
+    symbol: str,
+    is_long: bool,
+    qty: float,
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    hedge: bool,
+    api: str,
+    sec: str,
+    filt: dict[str, Decimal],
+    *,
+    tp1_d: Decimal,
+    remain_d: Decimal,
+    tp1_trig_f: float,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Close TP1 portion at market when the profit target is already reached."""
+    step = filt["step_size"]
+    qty_dp = _dec_places(step)
+    tp1_str, _ = _qty_strings(tp1_d, remain_d, qty_dp)
+    close_side = "SELL" if is_long else "BUY"
+    prefix = f"{reason} " if reason else ""
+    mark = get_mark_price(symbol, api, sec, args.recv_window)
+
+    print(f"{prefix}{YELLOW}Profit target already hit (mark {price_fmt(mark)}) — "
+          f"{close_side} MARKET {tp1_str} instead of conditional TP1{RESET}")
+
+    wall = trail_wall_plan(symbol, float(state.get("entry_anchor", state.get("entry", 0)) or 0),
+                           is_long, args, filt["tick_size"])
+    armed = float(_round_to(qty, step, ROUND_DOWN))
+    state.update({
+        "phase": PHASE_TP1,
+        "tp1_price": tp1_trig_f,
+        "tp1_qty": float(tp1_d),
+        "remain_qty": float(remain_d),
+        "armed_qty": armed,
+        "trail_wall_price": wall["activation"],
+    })
+    if "pre_armed_qty" not in state or float(state.get("pre_armed_qty", 0) or 0) < armed:
+        state["pre_armed_qty"] = armed
+
+    if args.dry_run:
+        state["algo_ids"] = {}
+        return state
+
+    cancel_all_staged_algos(symbol, api, sec, args.recv_window)
+    _market_reduce_qty(symbol, is_long, tp1_d, hedge, filt, api, sec, args.recv_window)
+
+    _, runner_qty, _ = _detect_open_side(symbol, hedge, api, sec, args.recv_window, is_long)
+    runner = float(runner_qty) if runner_qty > 0 else float(remain_d)
+    return _transition_to_partial(symbol, is_long, runner, state, args, hedge, api, sec, filt)
+
+
 def place_tp1_order(
     symbol: str,
     is_long: bool,
@@ -580,14 +779,30 @@ def place_tp1_order(
     print(f"{prefix}{close_side} TAKE_PROFIT_MARKET {tp1_str} ({args.tp_partial_pct:g}%) @ {tp1_trig} "
           f"(+{args.tp1_profit_pct:g}% from entry)")
 
-    if not args.dry_run:
-        cancel_our_algos(symbol, "TP1", api, sec, args.recv_window)
-        tp1_resp = place_algo_order(
-            symbol, is_long, "TAKE_PROFIT_MARKET", tp1_str, tp1_trig,
-            hedge, api, sec, args.recv_window, client_tag="TP1",
+    mark = get_mark_price(symbol, api, sec, args.recv_window)
+    if profit_target_hit(entry, mark, is_long, args.tp1_profit_pct):
+        return _execute_tp1_market(
+            symbol, is_long, qty, state, args, hedge, api, sec, filt,
+            tp1_d=tp1_d, remain_d=remain_d, tp1_trig_f=tp1_trig_f, reason=prefix.strip(),
         )
-        print(f"{GREEN}✓ TP1 algoId={tp1_resp.get('algoId')}{RESET}")
-        state["algo_ids"] = {"tp1": tp1_resp.get("algoId")}
+
+    if not args.dry_run:
+        cancel_all_staged_algos(symbol, api, sec, args.recv_window)
+        try:
+            tp1_resp = place_algo_order(
+                symbol, is_long, "TAKE_PROFIT_MARKET", tp1_str, tp1_trig,
+                hedge, api, sec, args.recv_window, client_tag="TP1",
+            )
+            print(f"{GREEN}✓ TP1 algoId={tp1_resp.get('algoId')}{RESET}")
+            state["algo_ids"] = {"tp1": tp1_resp.get("algoId")}
+        except RuntimeError as exc:
+            if _is_immediate_trigger_error(exc):
+                print(f"{YELLOW}TP1 conditional rejected (-2021) — falling back to market partial{RESET}")
+                return _execute_tp1_market(
+                    symbol, is_long, qty, state, args, hedge, api, sec, filt,
+                    tp1_d=tp1_d, remain_d=remain_d, tp1_trig_f=tp1_trig_f,
+                )
+            raise
     else:
         state["algo_ids"] = {}
 
@@ -641,8 +856,7 @@ def arm_staged_exit(
 
     if not args.dry_run:
         cancel_legacy_exit_algos(symbol, is_long, api, sec, args.recv_window)
-        for tag in ("SL", "TP1", "BE", "TR"):
-            cancel_our_algos(symbol, tag, api, sec, args.recv_window)
+        cancel_all_staged_algos(symbol, api, sec, args.recv_window)
 
     state: dict[str, Any] = {
         "takeover_done": True,
@@ -655,10 +869,20 @@ def arm_staged_exit(
         "armed_qty": float(total_d),
         "algo_ids": {},
     }
-    return place_tp1_order(
+    state = place_tp1_order(
         symbol, is_long, qty, state, args, hedge, api, sec, filt,
         reason=f"{YELLOW}Placing TP1:{RESET}",
     )
+    if not args.dry_run and state.get("phase") == PHASE_TP1:
+        import telegram_notify as telegram
+        direction = "LONG" if is_long else "SHORT"
+        lev = get_symbol_leverage(symbol, api, sec, args.recv_window)
+        telegram.notify_staged_armed(
+            symbol.upper(), direction, float(total_d), entry, tp1_target, args.tp1_profit_pct,
+            tp1_qty=float(state.get("tp1_qty", 0) or 0),
+            leverage=lev,
+        )
+    return state
 
 
 def execute_tp1_at_profit(
@@ -706,7 +930,7 @@ def _transition_to_partial(
     qty_dp = _dec_places(step)
     entry_anchor = float(state.get("entry_anchor", state.get("entry", 0)) or 0)
 
-    cancel_our_algos(symbol, "TP1", api, sec, args.recv_window)
+    cancel_all_staged_algos(symbol, api, sec, args.recv_window)
 
     qty_d = _round_to(qty, step, ROUND_DOWN)
     qty_str = f"{qty_d:.{qty_dp}f}"
@@ -724,11 +948,75 @@ def _transition_to_partial(
         return state
 
     cancel_dca_grid_orders(symbol, api, sec, args.recv_window)
-    be_resp = place_algo_order(
-        symbol, is_long, "STOP_MARKET", qty_str, be_str,
-        hedge, api, sec, args.recv_window, client_tag="BE",
-    )
+    mark = get_mark_price(symbol, api, sec, args.recv_window)
+    if _stop_would_immediately_trigger(is_long, be, mark, tick):
+        print(f"{YELLOW}Entry SL would trigger immediately (mark {price_fmt(mark)}) — "
+              f"closing runner {close_side} MARKET {qty_str}{RESET}")
+        _market_reduce_qty(symbol, is_long, qty_d, hedge, filt, api, sec, args.recv_window)
+        _, runner_qty, _ = _detect_open_side(symbol, hedge, api, sec, args.recv_window, is_long)
+        if runner_qty <= 0:
+            cancel_all_staged_algos(symbol, api, sec, args.recv_window)
+            state.update({"phase": PHASE_IDLE, "remain_qty": 0.0, "algo_ids": {}})
+            return state
+        if _wall_retested(is_long, mark, wall["activation"], tick):
+            return _transition_to_trail(symbol, is_long, runner_qty, state, args, hedge, api, sec, filt)
+        runner_d = _round_to(runner_qty, step, ROUND_DOWN)
+        state.update({
+            "phase": PHASE_PARTIAL,
+            "remain_qty": float(runner_d),
+            "be_price": be,
+            "algo_ids": {},
+        })
+        return state
+
+    try:
+        be_resp = place_algo_order(
+            symbol, is_long, "STOP_MARKET", qty_str, be_str,
+            hedge, api, sec, args.recv_window, client_tag="BE",
+        )
+    except RuntimeError as exc:
+        if not _is_immediate_trigger_error(exc):
+            raise
+        print(f"{YELLOW}BE conditional rejected (-2021) — closing runner at market{RESET}")
+        _market_reduce_qty(symbol, is_long, qty_d, hedge, filt, api, sec, args.recv_window)
+        _, runner_qty, _ = _detect_open_side(symbol, hedge, api, sec, args.recv_window, is_long)
+        if runner_qty <= 0:
+            cancel_all_staged_algos(symbol, api, sec, args.recv_window)
+            state.update({"phase": PHASE_IDLE, "remain_qty": 0.0, "algo_ids": {}})
+            return state
+        if _wall_retested(is_long, mark, wall["activation"], tick):
+            return _transition_to_trail(symbol, is_long, runner_qty, state, args, hedge, api, sec, filt)
+        runner_d = _round_to(runner_qty, step, ROUND_DOWN)
+        state.update({
+            "phase": PHASE_PARTIAL,
+            "remain_qty": float(runner_d),
+            "be_price": be,
+            "algo_ids": {},
+        })
+        return state
+
     print(f"{GREEN}✓ SL @ entry {close_side} {qty_str} @ {be_str} algoId={be_resp.get('algoId')}{RESET}")
+    import telegram_notify as telegram
+    direction = "LONG" if is_long else "SHORT"
+    tp1_qty = float(state.get("tp1_qty", 0) or 0)
+    initial = float(state.get("pre_armed_qty", state.get("armed_qty", 0)) or 0)
+    closed_pct = (tp1_qty / initial * 100) if initial > 0 else args.tp_partial_pct
+    runner_pct = (float(qty_d) / initial * 100) if initial > 0 else (100.0 - closed_pct)
+    lev = get_symbol_leverage(symbol, api, sec, args.recv_window)
+    tp1_price = float(state.get("tp1_price", entry_anchor) or entry_anchor)
+    telegram.notify_tp1_filled(
+        symbol.upper(), direction, tp1_qty, float(qty_d), entry_anchor,
+        tp1_price=tp1_price, leverage=lev,
+    )
+    telegram.notify_profit_lock_sl(
+        symbol.upper(), direction, float(qty_d), entry_anchor, float(be),
+        closed_pct=closed_pct,
+        runner_pct=runner_pct,
+        trigger=f"+{args.tp1_profit_pct:g}%",
+        profit_pct=args.tp1_profit_pct,
+        closed_qty=tp1_qty,
+        leverage=lev,
+    )
     state.update({
         "phase": PHASE_PARTIAL,
         "remain_qty": float(qty_d),
@@ -756,7 +1044,7 @@ def _transition_to_trail(
     tp1_price = float(state.get("trail_wall_price", 0) or state.get("tp1_price", 0) or 0)
     act_str = f"{tp1_price:.{price_dp}f}"
 
-    cancel_our_algos(symbol, "BE", api, sec, args.recv_window)
+    cancel_all_staged_algos(symbol, api, sec, args.recv_window)
 
     qty_d = _round_to(qty, step, ROUND_DOWN)
     qty_str = f"{qty_d:.{qty_dp}f}"
@@ -775,6 +1063,14 @@ def _transition_to_trail(
     )
     print(f"{GREEN}✓ Trail {close_side} {qty_str} activate @ {act_str} "
           f"callback {args.tp_callback:g}% algoId={tr_resp.get('algoId')}{RESET}")
+    import telegram_notify as telegram
+    direction = "LONG" if is_long else "SHORT"
+    lev = get_symbol_leverage(symbol, api, sec, args.recv_window)
+    entry_anchor = float(state.get("entry_anchor", state.get("entry", 0)) or 0)
+    telegram.notify_trail_started(
+        symbol.upper(), direction, float(qty_d), tp1_price, args.tp_callback,
+        entry=entry_anchor, leverage=lev,
+    )
     state.update({
         "phase": PHASE_TRAIL,
         "remain_qty": float(qty_d),
@@ -843,6 +1139,8 @@ def manage_staged_once(
         state = load_state(sym)
         if state.get("phase", PHASE_IDLE) != PHASE_IDLE:
             print(f"{DIM}{sym} flat — clearing staged state.{RESET}")
+            if not args.dry_run:
+                cancel_all_staged_algos(sym, api, sec, args.recv_window)
             clear_state(sym)
         elif args.once or args.dry_run:
             _print_flat_status(sym, args, api, sec)
@@ -855,11 +1153,11 @@ def manage_staged_once(
         state["phase"] = PHASE_WAITING
 
     if not state.get("takeover_done") or phase == PHASE_IDLE:
-        entry_open = _entry_order_open(sym, api, sec, args.recv_window)
-        if entry_open:
-            if args.once:
-                print(f"{DIM}{sym} entry limit still open — waiting for fill before staged exit.{RESET}")
-            return
+        if _entry_order_open(sym, api, sec, args.recv_window) and args.once:
+            print(
+                f"{DIM}{sym} entry limit still on book — arming TP1 on open position "
+                f"{qty:g} @ {price_fmt(entry)}{RESET}",
+            )
         state = arm_staged_exit(sym, side_is_long, qty, entry, args, hedge, api, sec, filt)
         save_state(sym, state)
         return
@@ -883,6 +1181,8 @@ def manage_staged_once(
         return
 
     if phase == PHASE_TP1:
+        if not args.dry_run:
+            reconcile_staged_algos(sym, phase, api, sec, args.recv_window)
         tp1_algo = find_our_algo(sym, "TP1", api, sec, args.recv_window)
         pre = float(state.get("pre_armed_qty", 0) or 0)
         partial_pct = args.tp_partial_pct / 100.0
@@ -929,6 +1229,8 @@ def manage_staged_once(
 
     wall_price = float(state.get("trail_wall_price", 0) or 0)
     if phase == PHASE_PARTIAL:
+        if not args.dry_run:
+            reconcile_staged_algos(sym, phase, api, sec, args.recv_window)
         wall = trail_wall_plan(sym, entry_anchor, side_is_long, args, filt["tick_size"])
         wall_price = wall["activation"]
         state["trail_wall_price"] = wall_price
@@ -941,6 +1243,8 @@ def manage_staged_once(
         return
 
     if phase == PHASE_TRAIL:
+        if not args.dry_run:
+            reconcile_staged_algos(sym, phase, api, sec, args.recv_window)
         existing = find_our_algo(sym, "TR", api, sec, args.recv_window)
         qty_d = _round_to(qty, step, ROUND_DOWN)
         qty_dp = _dec_places(step)
@@ -955,7 +1259,7 @@ def manage_staged_once(
                     print(f"{DIM}{sym} phase staged_trail — trailing {qty_str} in sync.{RESET}")
                 return
         if not args.dry_run:
-            cancel_our_algos(sym, "TR", api, sec, args.recv_window)
+            cancel_all_staged_algos(sym, api, sec, args.recv_window)
             state = _transition_to_trail(sym, side_is_long, qty, state, args, hedge, api, sec, filt)
             save_state(sym, state)
         elif args.once:
@@ -1026,9 +1330,19 @@ def audit_symbol(args: argparse.Namespace) -> None:
     prefer = args.direction == "long" if args.direction in ("long", "short") else None
     side_is_long, qty, entry = _detect_open_side(sym, hedge, api, sec, args.recv_window, prefer)
     state = load_state(sym)
+    phase = state.get("phase", PHASE_IDLE)
+
+    if getattr(args, "cleanup", False) and not args.dry_run:
+        n = cancel_all_staged_algos(sym, api, sec, args.recv_window)
+        print(f"{GREEN}Cleanup: cancelled {n} open obstage* algo(s) on {sym}.{RESET}")
+        print(f"{DIM}If the chart still shows Stop/TP lines, refresh the page — "
+              f"FINISHED algos often leave ghost overlays.{RESET}")
+
     algos = list_open_algo_orders(sym, api, sec, args.recv_window)
     ours = [o for o in algos if _algo_client_id(o).startswith(ALGO_PREFIX)]
     legacy = [o for o in algos if not _algo_client_id(o).startswith(ALGO_PREFIX)]
+    allowed = ALLOWED_ALGOS_BY_PHASE.get(phase, set())
+    stray = [o for o in ours if _staged_tag_from_cid(_algo_client_id(o), sym) not in allowed]
 
     try:
         oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window) or []
@@ -1037,7 +1351,11 @@ def audit_symbol(args: argparse.Namespace) -> None:
     dca = [o for o in oo if _order_client_id(o).startswith("obdca")]
 
     print(f"\n{BOLD}{CYAN}=== {sym} staged exit audit ==={RESET}")
-    print(f"  State phase: {state.get('phase', PHASE_IDLE)}  takeover={state.get('takeover_done', False)}")
+    print(f"  State phase: {phase}  takeover={state.get('takeover_done', False)}")
+    if allowed:
+        print(f"  Allowed algos this phase: {', '.join(sorted(allowed))}")
+    if stray:
+        print(f"  {YELLOW}Stray algos (wrong phase): {len(stray)}{RESET}")
     if side_is_long is not None:
         mark = get_mark_price(sym, api, sec, args.recv_window)
         entry_a = float(state.get("entry_anchor", entry) or entry)
@@ -1053,11 +1371,16 @@ def audit_symbol(args: argparse.Namespace) -> None:
             print(f"  SL @ entry: {price_fmt(float(state['be_price']))}")
     else:
         print(f"  Position: flat")
-    print(f"  DCA limits (obdca*): {len(dca)}  ·  our algos: {len(ours)}  ·  legacy algos: {len(legacy)}")
+    print(f"  DCA limits (obdca*): {len(dca)}  ·  our algos (open): {len(ours)}  ·  legacy algos: {len(legacy)}")
     for o in ours:
         otype = o.get("orderType") or o.get("type")
+        tag = _staged_tag_from_cid(_algo_client_id(o), sym)
+        flag = f" {YELLOW}[stray for phase {phase}]{RESET}" if tag not in allowed else ""
         print(f"    {DIM}{_algo_client_id(o)} {otype} qty={o.get('quantity')} "
-              f"trigger={o.get('triggerPrice')}{RESET}")
+              f"trigger={o.get('triggerPrice')}{RESET}{flag}")
+    if not ours and phase in ALLOWED_ALGOS_BY_PHASE:
+        print(f"  {DIM}No open obstage* algos — chart Stop/TP lines may be ghosts from FINISHED orders.{RESET}")
+        print(f"  {DIM}Refresh the Binance page (F5) to clear them.{RESET}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1077,6 +1400,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--supervise", action="store_true", help="Autonomous loop (default if no --once/--audit)")
     p.add_argument("--once", action="store_true", help="Single sync pass then exit")
     p.add_argument("--audit", action="store_true", help="Read-only status")
+    p.add_argument("--cleanup", action="store_true",
+                   help="With --audit: cancel all open obstage* algos on the symbol")
     p.add_argument("--dry-run", action="store_true", help="Preview only — no orders")
     p.add_argument("--direction", choices=["long", "short"], default=None,
                    help="Pin position side detection (default: auto-detect)")
@@ -1096,7 +1421,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=100, help="Order book depth limit")
     p.add_argument("--poll-sec", type=float, default=_env_float("STAGED_POLL_SEC", 5.0))
     p.add_argument("--position-mode", choices=["auto", "hedge", "oneway"], default="auto")
-    p.add_argument("--recv-window", type=int, default=15000)
+    p.add_argument("--recv-window", type=int, default=_env_int("RECV_WINDOW", 15000),
+                   help="Binance recvWindow ms. Env: RECV_WINDOW")
     p.add_argument("--env-file", default=None)
     return p.parse_args()
 

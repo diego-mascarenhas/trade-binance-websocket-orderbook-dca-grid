@@ -401,6 +401,25 @@ def grid_is_orphaned(open_orders: list[dict], symbol: str) -> bool:
     return any(_order_client_id(o).startswith(prefix) for o in open_orders)
 
 
+def count_dca_orders(open_orders: list[dict], symbol: str) -> int:
+    prefix = f"obdcaS{symbol.upper()}"
+    return sum(1 for o in open_orders if _order_client_id(o).startswith(prefix))
+
+
+def sum_dca_notional(open_orders: list[dict], symbol: str) -> float:
+    """Total USDT notional of open obdca* limit orders."""
+    prefix = f"obdcaS{symbol.upper()}"
+    total = 0.0
+    for o in open_orders:
+        if not _order_client_id(o).startswith(prefix):
+            continue
+        try:
+            total += float(o.get("origQty", 0) or 0) * float(o.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
 def cancel_all_symbol_orders(symbol: str, api: str, sec: str, recv: int) -> None:
     _signed_request(
         "DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol.upper()}, api, sec, recv,
@@ -696,15 +715,51 @@ def account_imbalance_blocks(
 
 def get_position(symbol: str, is_long: bool, hedge: bool, api: str, sec: str, recv: int) -> tuple[float, float]:
     """Return (abs_qty, entry_price) for the relevant position side (0,0 if none)."""
+    meta = get_position_meta(symbol, is_long, hedge, api, sec, recv)
+    return meta["qty"], meta["entry"]
+
+
+def get_position_meta(
+    symbol: str, is_long: bool, hedge: bool, api: str, sec: str, recv: int,
+) -> dict[str, float | int]:
+    """Return qty, entry, notional (USDT), leverage for the open position side."""
+    empty: dict[str, float | int] = {"qty": 0.0, "entry": 0.0, "notional": 0.0, "leverage": 0}
     rows = _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()}, api, sec, recv)
     want_side = ("LONG" if is_long else "SHORT") if hedge else "BOTH"
-    for r in rows:
+    for r in rows if isinstance(rows, list) else []:
         if str(r.get("positionSide", "BOTH")).upper() != want_side:
             continue
         amt = float(r.get("positionAmt", 0) or 0)
-        if abs(amt) > 0:
-            return abs(amt), float(r.get("entryPrice", 0) or 0)
-    return 0.0, 0.0
+        if abs(amt) <= 0:
+            continue
+        entry = float(r.get("entryPrice", 0) or 0)
+        mark = float(r.get("markPrice", 0) or 0)
+        raw_n = r.get("notional", "")
+        if raw_n not in ("", None):
+            notional = abs(float(raw_n))
+        else:
+            notional = abs(amt) * (mark if mark > 0 else entry)
+        lev = int(float(r.get("leverage", 0) or 0))
+        return {
+            "qty": abs(amt),
+            "entry": entry,
+            "notional": notional,
+            "leverage": lev,
+        }
+    return empty
+
+
+def get_symbol_leverage(symbol: str, api: str, sec: str, recv: int) -> int:
+    """Configured leverage for the symbol (from positionRisk, even when flat)."""
+    rows = _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()}, api, sec, recv)
+    for r in rows if isinstance(rows, list) else []:
+        lev = int(float(r.get("leverage", 0) or 0))
+        if lev > 0:
+            return lev
+    try:
+        return get_max_leverage(symbol, api, sec, recv)
+    except Exception:
+        return 10
 
 
 def open_trailing_tp(symbol: str, is_long: bool, api: str, sec: str, recv: int) -> dict | None:
@@ -1048,7 +1103,8 @@ def supervise_loop(args: argparse.Namespace) -> None:
     except Exception as exc:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
-    from exits import exit_mode_label, resolve_exit_mode, run_exit_once
+    from exits import EXIT_STAGED, exit_mode_label, resolve_exit_mode, run_exit_once, run_exit_when_flat
+    from exits.staged import dca_rearm_allowed, staged_phase
 
     hedge = _resolve_hedge(args, api, sec)
     exit_mode = resolve_exit_mode(args)
@@ -1056,7 +1112,14 @@ def supervise_loop(args: argparse.Namespace) -> None:
     print(f"\n{BOLD}{CYAN}Supervising {args.symbol.upper()} "
           f"(auto re-arm grid + exit: {exit_mode_label(exit_mode)}, poll {args.tp_poll_sec:g}s{ttl_note}). "
           f"Ctrl+C to stop.{RESET}")
+    import telegram_notify as telegram
+    telegram.notify_supervise_started(args.symbol.upper(), exit_mode_label(exit_mode))
     armed_log_state: str | None = None
+    last_position_qty: float = 0.0
+    last_direction: str | None = None
+    last_pos_meta: dict[str, float | int] = {}
+    dca_missing_retry_at: float = 0.0
+    sym = args.symbol.upper()
     try:
         while True:
             sleep_s = args.tp_poll_sec
@@ -1064,29 +1127,142 @@ def supervise_loop(args: argparse.Namespace) -> None:
                 side_is_long, qty, entry = _detect_open_side(args.symbol, hedge, api, sec, args.recv_window)
                 if side_is_long is not None:
                     armed_log_state = None
+                    direction = "LONG" if side_is_long else "SHORT"
+                    pos_meta = get_position_meta(sym, side_is_long, hedge, api, sec, args.recv_window)
+                    min_open_vol = _env_float("TELEGRAM_MIN_OPEN_VOL", 5.0)
+                    if last_position_qty <= 0 and qty > 0 and pos_meta["notional"] >= min_open_vol:
+                        telegram.notify_position_open(
+                            sym, direction, qty, entry,
+                            vol_usdt=float(pos_meta["notional"]),
+                            leverage=int(pos_meta["leverage"]) or get_symbol_leverage(sym, api, sec, args.recv_window),
+                        )
+                    last_position_qty = qty
+                    last_direction = direction
+                    last_pos_meta = pos_meta
+                    try:
+                        oo_pos = _signed_request(
+                            "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
+                        ) or []
+                    except Exception:
+                        oo_pos = []
+                    if (
+                        count_dca_orders(oo_pos, sym) == 0
+                        and time.time() >= dca_missing_retry_at
+                        and (exit_mode != EXIT_STAGED or dca_rearm_allowed(sym))
+                    ):
+                        print(f"{YELLOW}Position open, no DCA grid → DCA-only re-arm…{RESET}")
+                        placed = build_and_place_grid(
+                            args, api, sec, filt, verbose=True,
+                            dca_only=True, force=True,
+                            direction=direction.lower(),
+                        )
+                        if placed:
+                            oo_after = _signed_request(
+                                "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
+                            ) or []
+                            lev = get_symbol_leverage(sym, api, sec, args.recv_window)
+                            telegram.notify_grid_armed(
+                                sym, direction, count_dca_orders(oo_after, sym), dca_only=True,
+                                grid_vol_usdt=sum_dca_notional(oo_after, sym),
+                                leverage=lev,
+                            )
+                        else:
+                            dca_missing_retry_at = time.time() + args.rearm_backoff
                     run_exit_once(
                         exit_mode, args.symbol, side_is_long, qty, entry,
                         args, hedge, api, sec, filt,
                     )
                 else:
+                    position_just_closed = last_position_qty > 0 and bool(last_direction)
+                    close_phase = staged_phase(sym) if exit_mode == EXIT_STAGED else ""
+                    if position_just_closed and last_direction:
+                        after_runner = close_phase in ("staged_partial", "staged_trail")
+                        lev = int(last_pos_meta.get("leverage", 0) or 0) or get_symbol_leverage(
+                            sym, api, sec, args.recv_window,
+                        )
+                        telegram.notify_position_closed(
+                            sym, last_direction,
+                            after_runner=after_runner,
+                            vol_usdt=float(last_pos_meta.get("notional", 0) or 0),
+                            leverage=lev,
+                        )
+                    last_position_qty = 0.0
+                    last_direction = None
+                    last_pos_meta = {}
+                    run_exit_when_flat(
+                        exit_mode, args.symbol, args, hedge, api, sec, filt,
+                    )
                     if not args.keep_sl:
                         cancel_foreign_sl(args.symbol, True, api, sec, args.recv_window)
                         cancel_foreign_sl(args.symbol, False, api, sec, args.recv_window)
-                    oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": args.symbol.upper()}, api, sec, args.recv_window)
-                    sym = args.symbol.upper()
+                    oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window)
                     if oo and grid_is_orphaned(oo, sym):
                         armed_log_state = None
-                        print(f"{YELLOW}Entry expired → cancelling orphan grid ({len(oo)} orders)…{RESET}")
-                        try:
-                            cancel_all_symbol_orders(sym, api, sec, args.recv_window)
-                        except Exception as exc:
-                            print(f"{RED}Cancel orphan grid failed: {exc}{RESET}")
-                        else:
-                            print(f"{BOLD}Flat after entry expiry → re-arming grid…{RESET}")
-                            placed = build_and_place_grid(args, api, sec, filt, verbose=True)
+                        side_chk, qty_chk, entry_chk = _detect_open_side(
+                            args.symbol, hedge, api, sec, args.recv_window,
+                        )
+                        if side_chk is not None:
+                            direction = "LONG" if side_chk else "SHORT"
+                            print(f"{YELLOW}Entry filled — {direction} {qty_chk:g} @ {price_fmt(entry_chk)} "
+                                  f"→ DCA-only re-arm (skip orphan cancel){RESET}")
+                            telegram.notify_orphan_recovery(
+                                sym, direction, qty_chk, entry_chk,
+                                vol_usdt=float(get_position_meta(
+                                    sym, side_chk, hedge, api, sec, args.recv_window,
+                                )["notional"]),
+                                leverage=get_symbol_leverage(sym, api, sec, args.recv_window),
+                            )
+                            if exit_mode != EXIT_STAGED or dca_rearm_allowed(sym):
+                                placed = build_and_place_grid(
+                                    args, api, sec, filt, verbose=True,
+                                    dca_only=True, force=True,
+                                    direction=direction.lower(),
+                                )
+                            else:
+                                placed = False
+                            if placed:
+                                oo2 = _signed_request(
+                                    "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
+                                ) or []
+                                lev = get_symbol_leverage(sym, api, sec, args.recv_window)
+                                telegram.notify_grid_armed(
+                                    sym, direction, count_dca_orders(oo2, sym), dca_only=True,
+                                    grid_vol_usdt=sum_dca_notional(oo2, sym),
+                                    leverage=lev,
+                                )
+                            run_exit_once(
+                                exit_mode, args.symbol, side_chk, qty_chk, entry_chk,
+                                args, hedge, api, sec, filt,
+                            )
                             if not placed:
                                 sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
-                                print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
+                        else:
+                            print(f"{YELLOW}Entry expired → cancelling orphan grid ({len(oo)} orders)…{RESET}")
+                            try:
+                                cancel_all_symbol_orders(sym, api, sec, args.recv_window)
+                            except Exception as exc:
+                                print(f"{RED}Cancel orphan grid failed: {exc}{RESET}")
+                            else:
+                                if not position_just_closed:
+                                    print(f"{BOLD}Flat after entry expiry → re-arming grid…{RESET}")
+                                    placed = build_and_place_grid(args, api, sec, filt, verbose=True)
+                                    if placed:
+                                        oo_new = _signed_request(
+                                            "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
+                                        ) or []
+                                        lev = get_symbol_leverage(sym, api, sec, args.recv_window)
+                                        telegram.notify_grid_armed(
+                                            sym,
+                                            args.direction.upper() if args.direction in ("long", "short") else "AUTO",
+                                            count_dca_orders(oo_new, sym) + (1 if grid_entry_order_open(oo_new, sym) else 0),
+                                            grid_vol_usdt=sum_dca_notional(oo_new, sym),
+                                            leverage=lev,
+                                        )
+                                    elif not placed:
+                                        sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
+                                        print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
+                                else:
+                                    print(f"{DIM}Position just closed — deferring grid re-arm to next poll.{RESET}")
                     elif oo and args.grid_ttl > 0 and grid_age_sec(oo) >= args.grid_ttl:
                         armed_log_state = None
                         age_h = grid_age_sec(oo) / 3600
@@ -1108,15 +1284,34 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             armed_log_state = state
                     else:
                         armed_log_state = None
-                        print(f"{BOLD}Flat and no orders → re-arming grid…{RESET}")
-                        placed = build_and_place_grid(args, api, sec, filt, verbose=True)
-                        if not placed:
-                            # Could not arm (imbalance guard, no walls, etc.) — back off
-                            # so we don't hammer the API / spam logs every poll.
-                            sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
-                            print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
+                        if position_just_closed:
+                            print(f"{DIM}Flat after close — deferring grid re-arm to next poll.{RESET}")
+                        else:
+                            print(f"{BOLD}Flat and no orders → re-arming grid…{RESET}")
+                            placed = build_and_place_grid(args, api, sec, filt, verbose=True)
+                            if placed:
+                                oo_new = _signed_request(
+                                    "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
+                                ) or []
+                                lev = get_symbol_leverage(sym, api, sec, args.recv_window)
+                                n_orders = count_dca_orders(oo_new, sym) + (
+                                    1 if grid_entry_order_open(oo_new, sym) else 0
+                                )
+                                dir_label = (
+                                    args.direction.upper()
+                                    if args.direction in ("long", "short") else "AUTO"
+                                )
+                                telegram.notify_grid_armed(
+                                    sym, dir_label, n_orders,
+                                    grid_vol_usdt=sum_dca_notional(oo_new, sym),
+                                    leverage=lev,
+                                )
+                            elif not placed:
+                                sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
+                                print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
             except Exception as exc:
                 print(f"{RED}Supervisor pass error: {exc}{RESET}")
+                telegram.notify_supervisor_error(sym, str(exc))
             time.sleep(sleep_s)
     except KeyboardInterrupt:
         print(f"\n{RESET}Stopped supervising (open orders/TP left in place).")
@@ -1153,6 +1348,21 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_direction(default: str = "auto") -> str:
+    raw = os.getenv("DIRECTION", default).strip().lower()
+    return raw if raw in ("long", "short", "auto") else default
+
+
 def parse_args() -> argparse.Namespace:
     # Load .env early so config vars (e.g. WALLET_PCT) can drive the defaults.
     # --env-file is honoured on the second pass inside load_keys().
@@ -1168,8 +1378,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="DCA grid anchored to real order-book walls")
     p.add_argument("symbol", nargs="?", default=None, help="Symbol, e.g. MORPHOUSDT")
     p.add_argument("--price", type=float, default=None, help="Entry price (default: live mid)")
-    p.add_argument("--direction", choices=["long", "short", "auto"], default="auto",
-                   help="auto = decide from bid/ask imbalance in the book")
+    p.add_argument("--direction", choices=["long", "short", "auto"], default=_env_direction(),
+                   help="auto = decide from bid/ask imbalance in the book (Env: DIRECTION)")
     p.add_argument("--auto-range", type=float, default=1.0, help="%% band around mid for auto-direction imbalance")
     p.add_argument("--max-imbalance", type=float, default=_env_float("MAX_IMBALANCE", 30.0),
                    help="Skip opening on a side if the account's LONG vs SHORT exposure "
@@ -1209,11 +1419,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--position-mode", choices=["auto", "hedge", "oneway"], default="auto")
     p.add_argument("--set-leverage", type=int, default=0, help="Force a specific leverage (0=use symbol max)")
     p.add_argument("--no-max-leverage", action="store_true", help="Do NOT auto-set the symbol's max leverage")
-    p.add_argument("--recv-window", type=int, default=5000)
+    p.add_argument("--recv-window", type=int, default=_env_int("RECV_WINDOW", 15000),
+                   help="Binance recvWindow ms (use 15000 on Mac if -1021). Env: RECV_WINDOW")
     p.add_argument("--env-file", default=None, help="Path to .env with API keys (default: project root)")
     # Exit strategy (plugins in exits/ — default trailing TP on opposite OB wall)
     p.add_argument("--exit", dest="exit_mode", choices=["trailing", "staged", "none"], default=None,
-                   help="Exit strategy with open position (default: trailing; none if --no-tp)")
+                   help="Exit strategy with open position (default: staged; override with EXIT_MODE env)")
     p.add_argument("--no-tp", action="store_true",
                    help="Legacy alias for --exit none (skip automatic exit management)")
     p.add_argument("--tp1-profit-pct", type=float, default=None,

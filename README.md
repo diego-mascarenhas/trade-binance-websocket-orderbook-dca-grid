@@ -125,6 +125,11 @@ python3 orderbook_staged_exit.py LINKUSDT
 
 Add new exit strategies under `exits/` and register them in `exits/__init__.py`.
 
+### Telegram (optional)
+
+Uses the same env vars as the dashboard bot: `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` in `.env`.
+If unset, alerts are skipped. Notifies: supervise start, grid/DCA re-arm, position open, staged TP1/SL/trail, supervisor errors.
+
 Enable manually (not wired into `sync_pairs.py` yet):
 
 ```bash
