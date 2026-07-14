@@ -1020,9 +1020,11 @@ def rearm_grid(args: argparse.Namespace) -> bool:
             args, api, sec, filt, verbose=True,
             dca_only=True, force=True, direction=direction,
         )
-        if placed:
+        if placed and not args.no_tp:
             print(f"{DIM}Syncing trailing TP…{RESET}")
             _manage_tp_once(args.symbol, side_is_long, qty, pos_entry, args, hedge, api, sec, filt)
+        elif placed and args.no_tp:
+            print(f"{DIM}--no-tp: skipping trailing TP sync.{RESET}")
     else:
         placed = build_and_place_grid(args, api, sec, filt, verbose=True, force=True)
 
