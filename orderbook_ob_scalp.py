@@ -21,7 +21,14 @@ from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 from ob_bars import BarBuilder, depth_to_levels
-from ob_signals import SignalConfig, entry_signal, exit_on_flip, profit_pct
+from ob_signals import (
+    SignalConfig,
+    entry_signal,
+    exit_on_flip,
+    profit_pct,
+    should_discretionary_close,
+    should_tp_close,
+)
 
 from orderbook_dca_grid import (
     BOLD,
@@ -229,7 +236,8 @@ def run_loop(args: argparse.Namespace) -> None:
         f"  bar {args.bar_sec:g}s  sample {args.sample_sec:g}s  band ±{args.band_pct:g}%\n"
         f"  entry imb long≥{args.imb_long:.2f} short≤{args.imb_short:.2f}  "
         f"TP +{args.tp_pct:g}%  SL -{args.sl_pct:g}%  max {args.max_bars} bars\n"
-        f"  size {size_note}  Ctrl+C to stop\n",
+        f"  fee buffer {args.fee_buffer:g}% (no TP/flip close if net ≤ 0)  "
+        f"size {size_note}  Ctrl+C to stop\n",
     )
 
     pos: PositionState | None = None
@@ -271,11 +279,17 @@ def run_loop(args: argparse.Namespace) -> None:
 
             if pos is not None:
                 pnl = profit_pct(pos.entry, mark, pos.is_long)
-                if pnl >= args.tp_pct:
-                    print(f"{GREEN}TP hit {pnl:+.3f}% @ {price_fmt(mark)}{RESET}")
+                if should_tp_close(pnl, args.tp_pct, args.fee_buffer):
+                    net = pnl - args.fee_buffer
+                    print(f"{GREEN}TP hit {pnl:+.3f}% (est. net {net:+.3f}%) @ {price_fmt(mark)}{RESET}")
                     if not args.dry_run:
                         market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
                     pos = None
+                elif pnl >= args.tp_pct and not should_tp_close(pnl, args.tp_pct, args.fee_buffer):
+                    print(
+                        f"{DIM}TP gross {pnl:+.3f}% but est. net "
+                        f"{pnl - args.fee_buffer:+.3f}% ≤ 0 — holding{RESET}",
+                    )
                 elif pnl <= -args.sl_pct:
                     print(f"{RED}SL hit {pnl:+.3f}% @ {price_fmt(mark)}{RESET}")
                     if not args.dry_run:
@@ -294,16 +308,26 @@ def run_loop(args: argparse.Namespace) -> None:
                 pos.bars_held += 1
                 if exit_on_flip(pos.is_long, bar, sig_cfg):
                     pnl = profit_pct(pos.entry, bar.mid_c, pos.is_long)
-                    print(f"{YELLOW}Imbalance flip → exit {pnl:+.3f}%{RESET}")
-                    if not args.dry_run:
-                        market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
-                    pos = None
+                    if should_discretionary_close(pnl, args.fee_buffer):
+                        print(f"{YELLOW}Imbalance flip → exit {pnl:+.3f}% (est. net {pnl - args.fee_buffer:+.3f}%){RESET}")
+                        if not args.dry_run:
+                            market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
+                        pos = None
+                    else:
+                        print(
+                            f"{DIM}Flip signal but est. net {pnl - args.fee_buffer:+.3f}% ≤ 0 — holding{RESET}",
+                        )
                 elif pos.bars_held >= args.max_bars:
                     pnl = profit_pct(pos.entry, bar.mid_c, pos.is_long)
-                    print(f"{YELLOW}Max bars ({args.max_bars}) → exit {pnl:+.3f}%{RESET}")
-                    if not args.dry_run:
-                        market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
-                    pos = None
+                    if should_discretionary_close(pnl, args.fee_buffer):
+                        print(f"{YELLOW}Max bars ({args.max_bars}) → exit {pnl:+.3f}%{RESET}")
+                        if not args.dry_run:
+                            market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
+                        pos = None
+                    else:
+                        print(
+                            f"{DIM}Max bars but est. net {pnl - args.fee_buffer:+.3f}% ≤ 0 — holding{RESET}",
+                        )
 
             elif signal and not args.dry_run:
                 is_long = signal == "long"
@@ -364,6 +388,8 @@ def parse_args() -> argparse.Namespace:
                    help="Take profit %% (default: 0.25)")
     p.add_argument("--sl-pct", type=float, default=_env_float("OB_SL_PCT", 0.15),
                    help="Stop loss %% (default: 0.15)")
+    p.add_argument("--fee-buffer", type=float, default=_env_float("OB_FEE_BUFFER", 0.08),
+                   help="Round-trip fee estimate %%; TP/flip/max-bars skip close if gross-fee ≤ 0")
     p.add_argument("--max-bars", type=int, default=int(_env_float("OB_MAX_BARS", 5)),
                    help="Max bars to hold before time exit (default: 5)")
     p.add_argument(

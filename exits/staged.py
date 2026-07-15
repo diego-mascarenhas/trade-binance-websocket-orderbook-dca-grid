@@ -1,4 +1,4 @@
-"""Staged exit: TP1 partial @ profit target, SL runner @ entry, trailing wall."""
+"""Staged exit: TP1 partial @ profit target, SL runner @ entry+BE_PROFIT_PCT, trailing wall."""
 
 from __future__ import annotations
 
@@ -20,6 +20,11 @@ def _staged_args(grid_args: argparse.Namespace) -> argparse.Namespace:
             grid_args.tp1_profit_pct
             if getattr(grid_args, "tp1_profit_pct", None) is not None
             else staged._env_float("TP1_PROFIT_PCT", 0.3)
+        ),
+        be_profit_pct=(
+            grid_args.be_profit_pct
+            if getattr(grid_args, "be_profit_pct", None) is not None
+            else staged._env_float("BE_PROFIT_PCT", 0.1)
         ),
         tp_partial_pct=(
             grid_args.tp_partial_pct

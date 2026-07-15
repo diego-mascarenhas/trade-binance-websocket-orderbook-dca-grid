@@ -1503,6 +1503,8 @@ def parse_args() -> argparse.Namespace:
                    help="Legacy alias for --exit none (skip automatic exit management)")
     p.add_argument("--tp1-profit-pct", type=float, default=None,
                    help="[--exit staged] Profit %% for first partial. Env: TP1_PROFIT_PCT")
+    p.add_argument("--be-profit-pct", type=float, default=None,
+                   help="[--exit staged] Runner SL profit lock %% after TP1. Env: BE_PROFIT_PCT")
     p.add_argument("--tp-partial-pct", type=float, default=None,
                    help="[--exit staged] First partial size %%. Env: TP_PARTIAL_PCT")
     p.add_argument("--tp-only", action="store_true", help="Skip the grid; only auto-manage the trailing TP for the position")

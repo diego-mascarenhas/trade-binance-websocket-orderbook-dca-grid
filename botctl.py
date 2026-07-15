@@ -395,7 +395,9 @@ def trading_status(symbol: str) -> str:
                 if state.get("tp1_price"):
                     lines.append(f"TP1 @ {float(state['tp1_price']):g}")
                 if state.get("be_price"):
-                    lines.append(f"SL @ entry {float(state['be_price']):g}")
+                    be_pct = float(state.get("be_profit_pct", 0.1) or 0)
+                    be_tag = f"entry+{be_pct:g}%" if be_pct > 0 else "entry"
+                    lines.append(f"SL @ {be_tag} {float(state['be_price']):g}")
         except Exception:
             pass
     except Exception as exc:

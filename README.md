@@ -110,8 +110,8 @@ python3 orderbook_staged_exit.py LINKUSDT --audit --cleanup   # optional standal
 When a position is open:
 
 1. Places **TP1 (70%)** as TAKE_PROFIT at **+TP1_PROFIT_PCT** (default **0.3%**) — DCA grid stays active
-2. On TP1 fill: **cancels DCA**, **SL on runner at original entry**
-3. **Trailing** on the opposite order-book wall for the runner
+2. On TP1 fill: **cancels DCA**, **SL on runner at entry + BE_PROFIT_PCT** (default **0.1%** profit lock)
+3. **Trailing** on the opposite order-book wall for the runner — **profit-lock SL stays active** alongside the trail
 
 **Do not** run `orderbook_staged_exit.py` in parallel on the same symbol as `--supervise`.
 
@@ -131,6 +131,7 @@ python3 orderbook_staged_exit.py LINKUSDT
 | `DIRECTION` | `auto` | `auto` \| `long` \| `short` |
 | `RECV_WINDOW` | `15000` | Binance recvWindow ms |
 | `TP1_PROFIT_PCT` | `0.3` | First partial trigger (%) |
+| `BE_PROFIT_PCT` | `0.1` | Runner SL profit lock after TP1 (%) |
 | `TP_PARTIAL_PCT` | `70` | First partial size (%) |
 | `STAGED_POLL_SEC` | `5` | Staged state poll (via grid `--tp-poll-sec` loop) |
 
@@ -290,6 +291,7 @@ REARM_BACKOFF=60
 | `GRID_TTL` | `3600` | futures + spot | Refresh stale flat grid (seconds; `0` = off) |
 | `REARM_BACKOFF` | `60` | both | Wait when flat but grid can't be armed |
 | `TP1_PROFIT_PCT` | `0.3` | futures staged | First partial trigger (%) |
+| `BE_PROFIT_PCT` | `0.1` | futures staged | Runner SL profit lock after TP1 (%) |
 | `TP_PARTIAL_PCT` | `70` | futures staged | First partial size (%) |
 | `TELEGRAM_BOT_TOKEN` | — | telegram | Bot token for alerts + remote control |
 | `TELEGRAM_CHAT_ID` | — | telegram | Allowed chat for alerts + commands |

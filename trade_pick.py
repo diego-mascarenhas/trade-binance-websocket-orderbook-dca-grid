@@ -577,7 +577,7 @@ def print_pick_scalp(pick: dict[str, Any], *, source: str) -> None:
     cmd = (
         f"obscalp {sym} --execute --bar-sec 60 --sample-sec 2 "
         f"--imb-long 0.58 --imb-short 0.42 "
-        f"--tp-pct 0.20 --sl-pct 0.25 --momentum-min-pct 0.05"
+        f"--tp-pct 0.35 --sl-pct 0.25 --fee-buffer 0.08 --momentum-min-pct 0.05"
     )
     print(f"\n{BOLD}{GREEN}▶ OB scalp pick ({source}){RESET}")
     print(f"  {BOLD}Symbol{RESET}     {CYAN}{sym}{RESET}")
@@ -643,7 +643,8 @@ def run_scalp_execute(pick: dict[str, Any]) -> int:
         script, sym,
         "--execute", "--bar-sec", "60", "--sample-sec", "2",
         "--imb-long", "0.58", "--imb-short", "0.42",
-        "--tp-pct", "0.20", "--sl-pct", "0.25", "--momentum-min-pct", "0.05",
+        "--tp-pct", "0.35", "--sl-pct", "0.25", "--fee-buffer", "0.08",
+        "--momentum-min-pct", "0.05",
     ]
     print(f"\n{BOLD}{GREEN}▶ Executing OB scalp:{RESET} {' '.join(cmd[1:])}\n")
     try:

@@ -48,3 +48,18 @@ def profit_pct(entry: float, mark: float, is_long: bool) -> float:
     if is_long:
         return (mark - entry) / entry * 100
     return (entry - mark) / entry * 100
+
+
+def estimated_net_pct(gross_pct: float, fee_buffer_pct: float) -> float:
+    """Rough net %% after round-trip taker fees (entry + exit market)."""
+    return gross_pct - fee_buffer_pct
+
+
+def should_tp_close(gross_pct: float, tp_pct: float, fee_buffer_pct: float) -> bool:
+    """TP only when gross target hit and estimated net stays positive."""
+    return gross_pct >= tp_pct and estimated_net_pct(gross_pct, fee_buffer_pct) > 0
+
+
+def should_discretionary_close(gross_pct: float, fee_buffer_pct: float) -> bool:
+    """Flip / time exit — skip if estimated net would be zero or negative."""
+    return estimated_net_pct(gross_pct, fee_buffer_pct) > 0

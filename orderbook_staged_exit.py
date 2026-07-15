@@ -3,8 +3,8 @@
 
 Runs alongside orderbook_dca_grid.py on test pairs. When a position is open:
   1. Places TP1 (70%) as TAKE_PROFIT at +TP1_PROFIT_PCT (default 0.3%) — DCA grid stays active
-  2. On TP1 fill: cancels DCA, SL on runner at original entry
-  3. Trailing on the opposite order-book wall for the runner
+  2. On TP1 fill: cancels DCA, SL on runner at entry + BE_PROFIT_PCT (default 0.1% profit lock)
+  3. Trailing on the opposite order-book wall for the runner — profit-lock SL stays alongside trail
 
 Default mode is automatic (supervise loop). Or use the main bot:
   python3 orderbook_dca_grid.py SYMBOL --supervise --exit staged
@@ -48,7 +48,7 @@ STAGED_TAGS = ("TP1", "BE", "TR", "SL")
 ALLOWED_ALGOS_BY_PHASE: dict[str, set[str]] = {
     PHASE_TP1: {"TP1"},
     PHASE_PARTIAL: {"BE"},
-    PHASE_TRAIL: {"TR"},
+    PHASE_TRAIL: {"BE", "TR"},
 }
 # legacy alias
 PHASE_FULL = PHASE_WAITING
@@ -257,11 +257,13 @@ def breakeven_price(entry: float, is_long: bool, fee_buffer: float, tick: Decima
     return float(_round_to(entry * (1 - fee_buffer / 100), tick, ROUND_UP))
 
 
-def entry_stop_price(entry: float, is_long: bool, tick: Decimal) -> float:
-    """SL trigger at the original entry (breakeven on the runner after partial TP)."""
-    if is_long:
-        return float(_round_to(entry, tick, ROUND_DOWN))
-    return float(_round_to(entry, tick, ROUND_UP))
+def runner_sl_price(entry: float, is_long: bool, profit_pct: float, tick: Decimal) -> float:
+    """SL on runner after TP1 — locks profit_pct % from entry (0 = exact entry)."""
+    if profit_pct <= 0:
+        if is_long:
+            return float(_round_to(entry, tick, ROUND_DOWN))
+        return float(_round_to(entry, tick, ROUND_UP))
+    return breakeven_price(entry, is_long, profit_pct, tick)
 
 
 def profit_pct(entry: float, mark: float, is_long: bool) -> float:
@@ -921,6 +923,94 @@ def _tp1_filled(state: dict[str, Any], qty: float, step: Decimal) -> bool:
     return qty <= remain_expected + tol and qty < initial - tol
 
 
+def _algo_qty_matches(algo: dict | None, qty_str: str, step: Decimal) -> bool:
+    if not algo:
+        return False
+    try:
+        return abs(float(algo.get("quantity", 0) or 0) - float(qty_str)) < float(step) / 2
+    except (TypeError, ValueError):
+        return False
+
+
+def _ensure_be_algo(
+    symbol: str,
+    is_long: bool,
+    qty: float,
+    state: dict[str, Any],
+    args: argparse.Namespace,
+    hedge: bool,
+    api: str,
+    sec: str,
+    filt: dict[str, Decimal],
+    *,
+    close_if_triggered: bool = True,
+) -> dict[str, Any]:
+    """Place or resync runner SL (entry + BE_PROFIT_PCT) after TP1; kept through trail phase."""
+    tick = filt["tick_size"]
+    step = filt["step_size"]
+    price_dp = _dec_places(tick)
+    qty_dp = _dec_places(step)
+    entry_anchor = float(state.get("entry_anchor", state.get("entry", 0)) or 0)
+    qty_d = _round_to(qty, step, ROUND_DOWN)
+    qty_str = f"{qty_d:.{qty_dp}f}"
+    profit_pct = float(getattr(args, "be_profit_pct", 0.1) or 0)
+    be = runner_sl_price(entry_anchor, is_long, profit_pct, tick)
+    be_str = f"{be:.{price_dp}f}"
+    close_side = "SELL" if is_long else "BUY"
+    be_label = f"entry+{profit_pct:g}%" if profit_pct > 0 else "entry"
+
+    existing = find_our_algo(symbol, "BE", api, sec, args.recv_window)
+    if existing and _algo_qty_matches(existing, qty_str, step):
+        try:
+            trigger = float(existing.get("triggerPrice", 0) or 0)
+        except (TypeError, ValueError):
+            trigger = 0.0
+        if abs(trigger - be) <= float(tick):
+            algo_ids = dict(state.get("algo_ids") or {})
+            algo_ids["be"] = existing.get("algoId")
+            state.update({"be_price": be, "be_profit_pct": profit_pct, "algo_ids": algo_ids})
+            return state
+
+    if existing:
+        cancel_our_algos(symbol, "BE", api, sec, args.recv_window)
+
+    if args.dry_run:
+        state.update({"be_price": be, "be_profit_pct": profit_pct})
+        return state
+
+    mark = get_mark_price(symbol, api, sec, args.recv_window)
+    if _stop_would_immediately_trigger(is_long, be, mark, tick):
+        if close_if_triggered:
+            print(f"{YELLOW}Runner SL ({be_label}) would trigger now (mark {price_fmt(mark)}) — "
+                  f"closing runner {close_side} MARKET {qty_str}{RESET}")
+            _market_reduce_qty(symbol, is_long, qty_d, hedge, filt, api, sec, args.recv_window)
+        else:
+            print(f"{YELLOW}Runner SL ({be_label}) would trigger now (mark {price_fmt(mark)}) — "
+                  f"skipping SL placement.{RESET}")
+        return state
+
+    try:
+        be_resp = place_algo_order(
+            symbol, is_long, "STOP_MARKET", qty_str, be_str,
+            hedge, api, sec, args.recv_window, client_tag="BE",
+        )
+    except RuntimeError as exc:
+        if not _is_immediate_trigger_error(exc):
+            raise
+        if close_if_triggered:
+            print(f"{YELLOW}BE conditional rejected (-2021) — closing runner at market{RESET}")
+            _market_reduce_qty(symbol, is_long, qty_d, hedge, filt, api, sec, args.recv_window)
+        else:
+            print(f"{YELLOW}BE conditional rejected (-2021) — skipping BE placement.{RESET}")
+        return state
+
+    print(f"{GREEN}✓ SL @ {be_label} {close_side} {qty_str} @ {be_str} algoId={be_resp.get('algoId')}{RESET}")
+    algo_ids = dict(state.get("algo_ids") or {})
+    algo_ids["be"] = be_resp.get("algoId")
+    state.update({"be_price": be, "be_profit_pct": profit_pct, "algo_ids": algo_ids})
+    return state
+
+
 def _transition_to_partial(
     symbol: str,
     is_long: bool,
@@ -942,14 +1032,16 @@ def _transition_to_partial(
 
     qty_d = _round_to(qty, step, ROUND_DOWN)
     qty_str = f"{qty_d:.{qty_dp}f}"
-    be = entry_stop_price(entry_anchor, is_long, tick)
+    profit_pct = float(getattr(args, "be_profit_pct", 0.1) or 0)
+    be = runner_sl_price(entry_anchor, is_long, profit_pct, tick)
     be_str = f"{be:.{price_dp}f}"
     close_side = "SELL" if is_long else "BUY"
+    be_label = f"entry+{profit_pct:g}%" if profit_pct > 0 else "entry"
 
     wall = trail_wall_plan(symbol, entry_anchor, is_long, args, tick)
     state["trail_wall_price"] = wall["activation"]
 
-    print(f"{YELLOW}TP1 filled → cancel DCA · SL runner {qty_str} @ entry {be_str}{RESET}")
+    print(f"{YELLOW}TP1 filled → cancel DCA · SL runner {qty_str} @ {be_label} {be_str}{RESET}")
 
     if args.dry_run:
         state.update({"phase": PHASE_PARTIAL, "remain_qty": float(qty_d), "be_price": be, "algo_ids": {}})
@@ -1003,7 +1095,7 @@ def _transition_to_partial(
         })
         return state
 
-    print(f"{GREEN}✓ SL @ entry {close_side} {qty_str} @ {be_str} algoId={be_resp.get('algoId')}{RESET}")
+    print(f"{GREEN}✓ SL @ {be_label} {close_side} {qty_str} @ {be_str} algoId={be_resp.get('algoId')}{RESET}")
     import telegram_notify as telegram
     direction = "LONG" if is_long else "SHORT"
     tp1_qty = float(state.get("tp1_qty", 0) or 0)
@@ -1013,6 +1105,7 @@ def _transition_to_partial(
     lev = get_symbol_leverage(symbol, api, sec, args.recv_window)
     tp1_price = float(state.get("tp1_price", entry_anchor) or entry_anchor)
     _, pnl = position_pnl(symbol, is_long, hedge, api, sec, args.recv_window)
+    sl_trigger = f"entry+{profit_pct:g}%" if profit_pct > 0 else "entry"
     telegram.notify_tp1_filled(
         symbol.upper(), direction, tp1_qty, float(qty_d), entry_anchor,
         tp1_price=tp1_price, leverage=lev, pnl_usdt=pnl,
@@ -1021,7 +1114,7 @@ def _transition_to_partial(
         symbol.upper(), direction, float(qty_d), entry_anchor, float(be),
         closed_pct=closed_pct,
         runner_pct=runner_pct,
-        trigger=f"+{args.tp1_profit_pct:g}%",
+        trigger=f"TP1 +{args.tp1_profit_pct:g}% → SL {sl_trigger}",
         closed_qty=tp1_qty,
         leverage=lev,
         pnl_usdt=pnl,
@@ -1030,6 +1123,7 @@ def _transition_to_partial(
         "phase": PHASE_PARTIAL,
         "remain_qty": float(qty_d),
         "be_price": be,
+        "be_profit_pct": profit_pct,
         "algo_ids": {"be": be_resp.get("algoId")},
     })
     return state
@@ -1053,17 +1147,31 @@ def _transition_to_trail(
     tp1_price = float(state.get("trail_wall_price", 0) or state.get("tp1_price", 0) or 0)
     act_str = f"{tp1_price:.{price_dp}f}"
 
-    cancel_all_staged_algos(symbol, api, sec, args.recv_window)
+    cancel_our_algos(symbol, "TR", api, sec, args.recv_window)
 
     qty_d = _round_to(qty, step, ROUND_DOWN)
     qty_str = f"{qty_d:.{qty_dp}f}"
     close_side = "SELL" if is_long else "BUY"
 
-    print(f"{CYAN}Opposite wall @ {act_str} → trailing on runner {qty_str}{RESET}")
+    profit_pct = float(getattr(args, "be_profit_pct", 0.1) or 0)
+    be_label = f"entry+{profit_pct:g}%" if profit_pct > 0 else "entry"
+    print(f"{CYAN}Opposite wall @ {act_str} → trailing on runner {qty_str} (SL @ {be_label} kept){RESET}")
 
     if args.dry_run:
-        state.update({"phase": PHASE_TRAIL, "remain_qty": float(qty_d), "algo_ids": {}})
+        state.update({"phase": PHASE_TRAIL, "remain_qty": float(qty_d)})
         return state
+
+    state = _ensure_be_algo(
+        symbol, is_long, qty, state, args, hedge, api, sec, filt, close_if_triggered=False,
+    )
+    _, runner_qty, _ = _detect_open_side(symbol, hedge, api, sec, args.recv_window, is_long)
+    if runner_qty <= 0:
+        cancel_all_staged_algos(symbol, api, sec, args.recv_window)
+        state.update({"phase": PHASE_IDLE, "remain_qty": 0.0, "algo_ids": {}})
+        return state
+    if runner_qty != qty:
+        qty_d = _round_to(runner_qty, step, ROUND_DOWN)
+        qty_str = f"{qty_d:.{qty_dp}f}"
 
     tr_resp = place_algo_order(
         symbol, is_long, "TRAILING_STOP_MARKET", qty_str, act_str,
@@ -1081,10 +1189,12 @@ def _transition_to_trail(
         symbol.upper(), direction, float(qty_d), tp1_price, args.tp_callback,
         entry=entry_anchor, leverage=lev, pnl_usdt=pnl,
     )
+    algo_ids = dict(state.get("algo_ids") or {})
+    algo_ids["trail"] = tr_resp.get("algoId")
     state.update({
         "phase": PHASE_TRAIL,
         "remain_qty": float(qty_d),
-        "algo_ids": {"trail": tr_resp.get("algoId")},
+        "algo_ids": algo_ids,
     })
     return state
 
@@ -1264,7 +1374,10 @@ def manage_staged_once(
         if _wall_retested(side_is_long, mark, wall_price, filt["tick_size"]):
             state = _transition_to_trail(sym, side_is_long, qty, state, args, hedge, api, sec, filt)
         elif args.once:
-            print(f"{DIM}{sym} SL @ entry {price_fmt(float(state.get('be_price', entry_anchor) or entry_anchor))} "
+            be_px = float(state.get("be_price", entry_anchor) or entry_anchor)
+            be_pct = float(state.get("be_profit_pct", getattr(args, "be_profit_pct", 0.1)) or 0)
+            be_tag = f"entry+{be_pct:g}%" if be_pct > 0 else "entry"
+            print(f"{DIM}{sym} SL @ {be_tag} {price_fmt(be_px)} "
                   f"· waiting trail wall {price_fmt(wall_price)} (mark {price_fmt(mark)}){RESET}")
         save_state(sym, state)
         return
@@ -1272,25 +1385,39 @@ def manage_staged_once(
     if phase == PHASE_TRAIL:
         if not args.dry_run:
             reconcile_staged_algos(sym, phase, api, sec, args.recv_window)
-        existing = find_our_algo(sym, "TR", api, sec, args.recv_window)
         qty_d = _round_to(qty, step, ROUND_DOWN)
         qty_dp = _dec_places(step)
         qty_str = f"{qty_d:.{qty_dp}f}"
-        if existing:
-            try:
-                eq = abs(float(existing.get("quantity", 0) or 0) - float(qty_str)) < float(step) / 2
-            except (TypeError, ValueError):
-                eq = False
-            if eq:
-                if args.once:
-                    print(f"{DIM}{sym} phase staged_trail — trailing {qty_str} in sync.{RESET}")
-                return
+        existing_tr = find_our_algo(sym, "TR", api, sec, args.recv_window)
+        existing_be = find_our_algo(sym, "BE", api, sec, args.recv_window)
+        tr_ok = _algo_qty_matches(existing_tr, qty_str, step)
+        be_ok = _algo_qty_matches(existing_be, qty_str, step)
+        if tr_ok and be_ok:
+            if args.once:
+                be_px = float(state.get("be_price", entry_anchor) or entry_anchor)
+                print(f"{DIM}{sym} phase staged_trail — BE @ {price_fmt(be_px)} + trail {qty_str} in sync.{RESET}")
+            save_state(sym, state)
+            return
         if not args.dry_run:
-            cancel_all_staged_algos(sym, api, sec, args.recv_window)
-            state = _transition_to_trail(sym, side_is_long, qty, state, args, hedge, api, sec, filt)
+            if not be_ok:
+                state = _ensure_be_algo(
+                    sym, side_is_long, qty, state, args, hedge, api, sec, filt,
+                )
+                _, qty, _ = _detect_open_side(sym, hedge, api, sec, args.recv_window, side_is_long)
+                if qty <= 0:
+                    save_state(sym, {**state, "phase": PHASE_IDLE, "remain_qty": 0.0, "algo_ids": {}})
+                    return
+            if not tr_ok:
+                state = _transition_to_trail(sym, side_is_long, qty, state, args, hedge, api, sec, filt)
             save_state(sym, state)
         elif args.once:
-            print(f"{DIM}{sym} phase staged_trail — would resync trailing qty → {qty_str}.{RESET}")
+            missing = []
+            if not tr_ok:
+                missing.append("trail")
+            if not be_ok:
+                missing.append("BE")
+            print(f"{DIM}{sym} phase staged_trail — would resync {' + '.join(missing)} → {qty_str}.{RESET}")
+        return
 
 
 def supervise_loop(args: argparse.Namespace) -> None:
@@ -1395,7 +1522,9 @@ def audit_symbol(args: argparse.Namespace) -> None:
         if state.get("trail_wall_price"):
             print(f"  Trail wall: {price_fmt(float(state['trail_wall_price']))}")
         if state.get("be_price"):
-            print(f"  SL @ entry: {price_fmt(float(state['be_price']))}")
+            be_pct = float(state.get("be_profit_pct", getattr(args, "be_profit_pct", 0.1)) or 0)
+            be_tag = f"entry+{be_pct:g}%" if be_pct > 0 else "entry"
+            print(f"  SL @ {be_tag}: {price_fmt(float(state['be_price']))}")
     else:
         print(f"  Position: flat")
     print(f"  DCA limits (obdca*): {len(dca)}  ·  our algos (open): {len(ours)}  ·  legacy algos: {len(legacy)}")
@@ -1420,7 +1549,7 @@ def parse_args() -> argparse.Namespace:
     load_env_file(env_file)
 
     p = argparse.ArgumentParser(
-        description="Staged futures exit addon (70% @ profit target + SL @ entry + trailing wall). "
+        description="Staged futures exit addon (70% @ profit target + SL @ entry+BE_PROFIT_PCT + trail; SL kept with trail). "
                     "Default: automatic supervise loop.",
     )
     p.add_argument("symbol", nargs="?", help="Symbol, e.g. LINKUSDT")
@@ -1434,6 +1563,8 @@ def parse_args() -> argparse.Namespace:
                    help="Pin position side detection (default: auto-detect)")
     p.add_argument("--tp1-profit-pct", type=float, default=_env_float("TP1_PROFIT_PCT", 0.3),
                    help="Take first partial when profit reaches this %%. Env: TP1_PROFIT_PCT")
+    p.add_argument("--be-profit-pct", type=float, default=_env_float("BE_PROFIT_PCT", 0.1),
+                   help="Runner SL profit lock %% after TP1 (default 0.1). Env: BE_PROFIT_PCT")
     p.add_argument("--tp-partial-pct", type=float, default=_env_float("TP_PARTIAL_PCT", 70.0),
                    help="First take-profit size %%. Env: TP_PARTIAL_PCT")
     p.add_argument("--tp-callback", type=float, default=_env_float("TP_CALLBACK", 0.2))
