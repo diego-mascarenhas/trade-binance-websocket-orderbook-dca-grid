@@ -95,6 +95,10 @@ def send_warn(message: str) -> None:
     _send_async(f"⚠️ {message}")
 
 
+def send_grid(message: str) -> None:
+    _send_async(f"🧱 {message}")
+
+
 def fmt_pnl(pnl_usdt: float, notional: float, leverage: float | int | None = None) -> str:
     """Standard PnL line: PnL: +X.XX USDT (+Y.YY% ROI)."""
     lev = float(leverage) if leverage else 0.0
@@ -167,8 +171,7 @@ def notify_grid_armed(
     vol_line = ""
     if grid_vol_usdt and grid_vol_usdt > 0:
         vol_line = f"\n{fmt_vol_usdt(grid_vol_usdt, leverage)}"
-    send_position(
-        direction,
+    send_grid(
         f"{symbol.upper()} futures\n{kind} · {order_count} limit(s) · {direction.upper()}{vol_line}",
     )
 
