@@ -78,7 +78,7 @@ class Candidate:
 
 
 def _grid_args(symbol: str) -> argparse.Namespace:
-    from orderbook_dca_grid import _env_float
+    from orderbook_dca_grid import _env_bool, _env_float
 
     return argparse.Namespace(
         symbol=symbol.upper(),
@@ -88,7 +88,12 @@ def _grid_args(symbol: str) -> argparse.Namespace:
         price=None,
         base_size=_env_float("BASE_SIZE", 0.0),
         wallet_pct=_env_float("WALLET_PCT", 10.0),
-        max_imbalance=_env_float("MAX_IMBALANCE", 30.0),
+        max_imbalance=_env_float("MAX_IMBALANCE", 20.0),
+        max_margin_pct=_env_float("MAX_MARGIN_PCT", 50.0),
+        min_liq_distance_pct=_env_float("MIN_LIQ_DISTANCE_PCT", 20.0),
+        max_account_notional_pct=_env_float("MAX_ACCOUNT_NOTIONAL_PCT", 80.0),
+        risk_use_full_grid=_env_bool("RISK_USE_FULL_GRID", True),
+        leverage=_env_float("LEVERAGE", 10.0),
         force=False,
         recv_window=int(_env_float("RECV_WINDOW", 15000)),
         position_mode="auto",
@@ -107,11 +112,13 @@ def _grid_args(symbol: str) -> argparse.Namespace:
 
 def analyze_grid(symbol: str, api: str, sec: str) -> GridSnapshot | None:
     from orderbook_dca_grid import (
-        account_imbalance_blocks,
+        account_risk_blocks,
         build_grid,
         decide_direction,
         fetch_depth,
+        get_max_leverage,
         get_wallet_balance,
+        grid_add_notional,
         load_symbol_filters,
         prepare_orders,
         select_walls,
@@ -145,13 +152,20 @@ def analyze_grid(symbol: str, api: str, sec: str) -> GridSnapshot | None:
         except Exception:
             return None
 
-    blocked = account_imbalance_blocks(args, is_long, base_size, api, sec, verbose=False)
+    blocked = False
     levels = bids if is_long else asks
     entry = mid
     walls = select_walls(
         levels, entry, is_long, args.so_count, args.min_gap, args.min_dist, args.max_range,
     )
     if not walls:
+        try:
+            lev = float(get_max_leverage(sym, api, sec, args.recv_window))
+        except Exception:
+            lev = float(args.leverage or 10.0)
+        blocked = account_risk_blocks(
+            args, is_long, base_size, api, sec, leverage=lev, verbose=False,
+        )
         return GridSnapshot(
             auto_direction=direction,
             bid_share_pct=d["imbalance"] * 100,
@@ -166,6 +180,14 @@ def analyze_grid(symbol: str, api: str, sec: str) -> GridSnapshot | None:
     orders = build_grid(
         entry, is_long, walls, base_size, args.tp, args.size_mode,
         args.comp_factor, args.so_size, args.volume_scale,
+    )
+    try:
+        lev = float(get_max_leverage(sym, api, sec, args.recv_window))
+    except Exception:
+        lev = float(args.leverage or 10.0)
+    add_notional = grid_add_notional(orders, args, dca_only=False)
+    blocked = account_risk_blocks(
+        args, is_long, add_notional, api, sec, leverage=lev, verbose=False,
     )
     prepared = prepare_orders(orders, sym, is_long, filt)
     notional = sum(float(o["price"]) * float(o["quantity"]) for o in prepared)

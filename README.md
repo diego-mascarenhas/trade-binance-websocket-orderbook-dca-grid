@@ -84,7 +84,13 @@ python3 orderbook_dca_grid.py OPUSDT --rearm --rearm-flat  # close position, the
 ### Key behavior
 
 - **Direction**: `--direction auto` (default) from bid/ask imbalance; or `long` / `short`.
-- **Account balance guard**: `MAX_IMBALANCE=30` (default) skips new orders on the heavier side when `|LONG − SHORT| / total` exceeds the limit; the lighter side is still allowed. `--force` overrides.
+- **Account risk guards** (futures, before arming a grid):
+  - `MAX_IMBALANCE=20` (default): skip new grids on the heavier LONG/SHORT side when imbalance exceeds 20%.
+  - `MAX_MARGIN_PCT=50`: skip if projected initial margin usage exceeds 50% of balance.
+  - `MIN_LIQ_DISTANCE_PCT=20`: skip if any open position is within 20% of liquidation.
+  - `MAX_ACCOUNT_NOTIONAL_PCT=80`: skip if total |notional| + new grid exceeds 80% of `wallet × leverage`.
+  - `RISK_USE_FULL_GRID=true` (default): checks use full-grid notional, not entry only.
+  - Lighter-side opens still allowed for imbalance; `--force` overrides all guards.
 - **Entry size**: 10% of wallet (`WALLET_PCT=10`) or fixed `BASE_SIZE` in USDT.
 - **Leverage**: symbol max set automatically (`--no-max-leverage` / `--set-leverage N`).
 - **DCA walls**: real order-book levels within `--max-range` % (default 12).
@@ -264,7 +270,11 @@ EXIT_MODE=staged          # staged | trailing | none
 DIRECTION=auto            # auto | long | short
 RECV_WINDOW=15000         # raise if you see -1021 timestamp errors
 WALLET_PCT=10
-MAX_IMBALANCE=30          # 0 = off
+MAX_IMBALANCE=20          # 0 = off
+# MAX_MARGIN_PCT=50
+# MIN_LIQ_DISTANCE_PCT=20
+# MAX_ACCOUNT_NOTIONAL_PCT=80
+# RISK_USE_FULL_GRID=true
 ORDER_TTL=3600
 GRID_TTL=3600
 REARM_BACKOFF=60
@@ -286,7 +296,11 @@ REARM_BACKOFF=60
 | `RECV_WINDOW` | `15000` | futures | Binance recvWindow (ms) |
 | `WALLET_PCT` | `10` | both | Entry size as % of wallet/free USDT |
 | `BASE_SIZE` | `0` | both | Fixed entry USDT (`0` = use `WALLET_PCT`) |
-| `MAX_IMBALANCE` | `30` | futures | Account LONG/SHORT balance guard (`0` = off) |
+| `MAX_IMBALANCE` | `20` | futures | Account LONG/SHORT balance guard (`0` = off) |
+| `MAX_MARGIN_PCT` | `50` | futures | Max projected initial margin / balance (`0` = off) |
+| `MIN_LIQ_DISTANCE_PCT` | `20` | futures | Min distance to liq on any position (`0` = off) |
+| `MAX_ACCOUNT_NOTIONAL_PCT` | `80` | futures | Cap on total \|notional\| + grid vs wallet×lev |
+| `RISK_USE_FULL_GRID` | `true` | futures | Risk checks use full grid notional |
 | `ORDER_TTL` | `3600` | futures | Entry order GTD in seconds; DCA orders stay GTC (`0` = all GTC) |
 | `GRID_TTL` | `3600` | futures + spot | Refresh stale flat grid (seconds; `0` = off) |
 | `REARM_BACKOFF` | `60` | both | Wait when flat but grid can't be armed |

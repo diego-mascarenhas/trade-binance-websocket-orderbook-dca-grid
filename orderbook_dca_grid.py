@@ -739,6 +739,182 @@ def account_imbalance_blocks(
     return not args.force
 
 
+def grid_add_notional(orders: list[dict], args: argparse.Namespace, *, dca_only: bool = False) -> float:
+    """USDT notional used for risk guards (full grid by default, entry only if disabled)."""
+    if not orders:
+        return 0.0
+    if dca_only:
+        return sum(float(o.get("size_usdt", 0) or 0) for o in orders)
+    if getattr(args, "risk_use_full_grid", True) and orders[-1].get("cum_usdt") is not None:
+        return float(orders[-1]["cum_usdt"])
+    return float(orders[0].get("size_usdt", 0) or 0)
+
+
+def account_total_notional(api: str, sec: str, recv: int) -> float:
+    """Sum |notional| across all open futures positions."""
+    rows = _signed_request("GET", "/fapi/v2/positionRisk", {}, api, sec, recv)
+    total = 0.0
+    for r in rows if isinstance(rows, list) else []:
+        amt = float(r.get("positionAmt", 0) or 0)
+        if amt == 0:
+            continue
+        raw = r.get("notional", "")
+        if raw not in ("", None):
+            total += abs(float(raw))
+        else:
+            total += abs(amt) * float(r.get("markPrice", 0) or 0)
+    return total
+
+
+def liq_distance_pct(amt: float, mark: float, liq_price: float) -> float | None:
+    """Distance from mark to liquidation as % of mark (None if unknown)."""
+    if mark <= 0 or liq_price <= 0:
+        return None
+    if amt > 0:
+        return (mark - liq_price) / mark * 100.0
+    return (liq_price - mark) / mark * 100.0
+
+
+def account_margin_snapshot(api: str, sec: str, recv: int) -> dict[str, float]:
+    acc = _signed_request("GET", "/fapi/v2/account", {}, api, sec, recv)
+    return {
+        "margin_balance": float(acc.get("totalMarginBalance", 0) or 0),
+        "initial_margin": float(acc.get("totalInitialMargin", 0) or 0),
+        "available": float(acc.get("availableBalance", 0) or 0),
+    }
+
+
+def account_liq_distance_blocks(
+    args: argparse.Namespace, api: str, sec: str, verbose: bool = True,
+) -> bool:
+    """True if any open position is closer to liquidation than --min-liq-distance-pct."""
+    min_dist = getattr(args, "min_liq_distance_pct", 0.0)
+    if min_dist <= 0:
+        return False
+    try:
+        rows = _signed_request("GET", "/fapi/v2/positionRisk", {}, api, sec, args.recv_window)
+    except Exception as exc:
+        if verbose:
+            print(f"{YELLOW}Could not read liquidation prices ({exc}); skipping liq check.{RESET}")
+        return False
+    worst_sym = ""
+    worst_dist: float | None = None
+    for r in rows if isinstance(rows, list) else []:
+        amt = float(r.get("positionAmt", 0) or 0)
+        if amt == 0:
+            continue
+        mark = float(r.get("markPrice", 0) or 0)
+        liq = float(r.get("liquidationPrice", 0) or 0)
+        dist = liq_distance_pct(amt, mark, liq)
+        if dist is None:
+            continue
+        if worst_dist is None or dist < worst_dist:
+            worst_dist = dist
+            worst_sym = str(r.get("symbol", ""))
+    if worst_dist is None or worst_dist >= min_dist:
+        return False
+    if verbose:
+        if args.force:
+            print(f"{YELLOW}Liquidation distance {worst_dist:.1f}% on {worst_sym} "
+                  f"< min {min_dist:g}% — continuing due to --force.{RESET}")
+        else:
+            print(f"{RED}Liquidation too close: {worst_sym} {worst_dist:.1f}% from liq "
+                  f"(min {min_dist:g}%) — skipping new grid "
+                  f"(use --force or --min-liq-distance-pct 0 to disable).{RESET}")
+    return not args.force
+
+
+def account_margin_blocks(
+    args: argparse.Namespace, add_notional: float, leverage: float,
+    api: str, sec: str, verbose: bool = True,
+) -> bool:
+    """True if projected initial margin usage exceeds --max-margin-pct."""
+    limit = getattr(args, "max_margin_pct", 0.0)
+    if limit <= 0:
+        return False
+    try:
+        snap = account_margin_snapshot(api, sec, args.recv_window)
+    except Exception as exc:
+        if verbose:
+            print(f"{YELLOW}Could not read account margin ({exc}); skipping margin check.{RESET}")
+        return False
+    bal = snap["margin_balance"]
+    if bal <= 0:
+        return False
+    lev = max(leverage, 1.0)
+    est_add = add_notional / lev
+    usage = (snap["initial_margin"] + est_add) / bal * 100.0
+    if usage <= limit:
+        return False
+    if verbose:
+        if args.force:
+            print(f"{YELLOW}Projected margin usage {usage:.1f}% > max {limit:g}% "
+                  f"— continuing due to --force.{RESET}")
+        else:
+            print(f"{RED}Margin usage too high: projected {usage:.1f}% > max {limit:g}% "
+                  f"(balance {bal:,.2f} USDT) — skipping new grid "
+                  f"(use --force or --max-margin-pct 0 to disable).{RESET}")
+    return not args.force
+
+
+def account_notional_cap_blocks(
+    args: argparse.Namespace, add_notional: float, leverage: float,
+    api: str, sec: str, verbose: bool = True,
+) -> bool:
+    """True if total |notional| + add would exceed wallet × leverage × cap %."""
+    limit = getattr(args, "max_account_notional_pct", 0.0)
+    if limit <= 0:
+        return False
+    try:
+        wallet = get_wallet_balance(api, sec, args.recv_window)
+        current = account_total_notional(api, sec, args.recv_window)
+    except Exception as exc:
+        if verbose:
+            print(f"{YELLOW}Could not read account notional ({exc}); skipping cap check.{RESET}")
+        return False
+    if wallet <= 0:
+        return False
+    lev = max(leverage, 1.0)
+    cap = wallet * lev * (limit / 100.0)
+    projected = current + add_notional
+    if projected <= cap:
+        return False
+    usage_pct = projected / cap * 100.0 if cap > 0 else 100.0
+    if verbose:
+        if args.force:
+            print(f"{YELLOW}Account notional {projected:,.0f} USDT ({usage_pct:.0f}% of cap) "
+                  f"> {limit:g}% cap — continuing due to --force.{RESET}")
+        else:
+            print(f"{RED}Account notional cap: {projected:,.0f} USDT projected "
+                  f"(current {current:,.0f} + new {add_notional:,.0f}) > "
+                  f"{limit:g}% of wallet×lev ({cap:,.0f} USDT) — skipping new grid "
+                  f"(use --force or --max-account-notional-pct 0 to disable).{RESET}")
+    return not args.force
+
+
+def account_risk_blocks(
+    args: argparse.Namespace,
+    is_long: bool,
+    add_notional: float,
+    api: str,
+    sec: str,
+    *,
+    leverage: float | None = None,
+    verbose: bool = True,
+) -> bool:
+    """True if any account risk guard blocks opening `add_notional` on this side."""
+    lev = leverage if leverage and leverage > 0 else getattr(args, "leverage", 10.0)
+    if account_imbalance_blocks(args, is_long, add_notional, api, sec, verbose):
+        return True
+    if account_liq_distance_blocks(args, api, sec, verbose):
+        return True
+    if account_margin_blocks(args, add_notional, lev, api, sec, verbose):
+        return True
+    if account_notional_cap_blocks(args, add_notional, lev, api, sec, verbose):
+        return True
+    return False
+
+
 def get_position(symbol: str, is_long: bool, hedge: bool, api: str, sec: str, recv: int) -> tuple[float, float]:
     """Return (abs_qty, entry_price) for the relevant position side (0,0 if none)."""
     meta = get_position_meta(symbol, is_long, hedge, api, sec, recv)
@@ -994,27 +1170,34 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
     if force:
         args.force = True
     try:
-        if account_imbalance_blocks(args, is_long, base_size, api, sec, verbose):
+        levels = bids if is_long else asks
+        walls = select_walls(levels, entry, is_long, args.so_count, args.min_gap, args.min_dist, args.max_range)
+        if not walls:
+            print(f"{RED}No qualifying walls found (adjust --min-gap/--max-range/--limit).{RESET}")
+            return False
+
+        orders = build_grid(entry, is_long, walls, base_size, args.tp, args.size_mode,
+                            args.comp_factor, args.so_size, args.volume_scale)
+        if dca_only:
+            orders = orders[1:]
+            if not orders:
+                print(f"{RED}No DCA levels to place.{RESET}")
+                return False
+            if verbose:
+                print(f"{BOLD}{CYAN}Re-arm DCA only ({len(orders)} safety orders, "
+                      f"{'LONG' if is_long else 'SHORT'}){RESET}")
+
+        lev = float(args.leverage or 10.0)
+        if not args.no_max_leverage:
+            try:
+                lev = float(get_max_leverage(args.symbol, api, sec, args.recv_window))
+            except Exception:
+                pass
+        add_notional = grid_add_notional(orders, args, dca_only=dca_only)
+        if account_risk_blocks(args, is_long, add_notional, api, sec, leverage=lev, verbose=verbose):
             return False
     finally:
         args.force = prev_force
-
-    levels = bids if is_long else asks
-    walls = select_walls(levels, entry, is_long, args.so_count, args.min_gap, args.min_dist, args.max_range)
-    if not walls:
-        print(f"{RED}No qualifying walls found (adjust --min-gap/--max-range/--limit).{RESET}")
-        return False
-
-    orders = build_grid(entry, is_long, walls, base_size, args.tp, args.size_mode,
-                        args.comp_factor, args.so_size, args.volume_scale)
-    if dca_only:
-        orders = orders[1:]
-        if not orders:
-            print(f"{RED}No DCA levels to place.{RESET}")
-            return False
-        if verbose:
-            print(f"{BOLD}{CYAN}Re-arm DCA only ({len(orders)} safety orders, "
-                  f"{'LONG' if is_long else 'SHORT'}){RESET}")
 
     prepared = prepare_orders(orders, args.symbol, is_long, filt)
     return place_orders(args.symbol, is_long, prepared, args, force=force, dca_only=dca_only)
@@ -1412,6 +1595,13 @@ def print_tp_plan(symbol: str, is_long: bool, args: argparse.Namespace,
           f"{'✓ guaranteed in profit' if ok else '✗ NOT in profit'}{RESET}")
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name, "")
     if not raw:
@@ -1455,10 +1645,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--direction", choices=["long", "short", "auto"], default=_env_direction(),
                    help="auto = decide from bid/ask imbalance in the book (Env: DIRECTION)")
     p.add_argument("--auto-range", type=float, default=1.0, help="%% band around mid for auto-direction imbalance")
-    p.add_argument("--max-imbalance", type=float, default=_env_float("MAX_IMBALANCE", 30.0),
+    p.add_argument("--max-imbalance", type=float, default=_env_float("MAX_IMBALANCE", 20.0),
                    help="Skip opening on a side if the account's LONG vs SHORT exposure "
                         "would differ by more than this %% (0=off). Env: MAX_IMBALANCE. "
                         "Override with --force")
+    p.add_argument("--max-margin-pct", type=float, default=_env_float("MAX_MARGIN_PCT", 50.0),
+                   help="Skip new grid if projected initial margin / balance exceeds this %% "
+                        "(0=off). Env: MAX_MARGIN_PCT")
+    p.add_argument("--min-liq-distance-pct", type=float, default=_env_float("MIN_LIQ_DISTANCE_PCT", 20.0),
+                   help="Skip new grid if any open position is closer to liquidation than this %% "
+                        "(0=off). Env: MIN_LIQ_DISTANCE_PCT")
+    p.add_argument("--max-account-notional-pct", type=float, default=_env_float("MAX_ACCOUNT_NOTIONAL_PCT", 80.0),
+                   help="Skip if total |notional| + new grid exceeds wallet×leverage×this%% "
+                        "(0=off). Env: MAX_ACCOUNT_NOTIONAL_PCT")
+    p.add_argument("--risk-use-full-grid", action="store_true", default=_env_bool("RISK_USE_FULL_GRID", True),
+                   help="Risk checks use full-grid notional, not entry only (default on). "
+                        "Env: RISK_USE_FULL_GRID")
+    p.add_argument("--no-risk-use-full-grid", dest="risk_use_full_grid", action="store_false",
+                   help="Risk checks use base entry size only")
     p.add_argument("--so-count", type=int, default=8, help="Number of DCA orders (walls to place)")
     p.add_argument("--limit", type=int, default=1000, help="Order book depth to fetch (5..1000)")
     p.add_argument("--min-gap", type=float, default=0.8, help="Min %% spacing between chosen walls")
@@ -1788,12 +1992,6 @@ def main() -> None:
             except Exception:
                 pass
 
-    # Account-level LONG/SHORT exposure guard (needs API keys).
-    if args.max_imbalance > 0:
-        api, sec = load_keys(args.env_file)
-        if api and sec and account_imbalance_blocks(args, is_long, args.base_size, api, sec):
-            return
-
     levels = bids if is_long else asks
     walls = select_walls(
         levels, entry, is_long, args.so_count, args.min_gap, args.min_dist, args.max_range
@@ -1815,12 +2013,25 @@ def main() -> None:
     )
     print(render(args.symbol.upper(), args, orders, entry, len(walls)))
 
-    # Prepare orders with exchange precision (price/qty rounding, min notional)
     try:
         filt = load_symbol_filters(args.symbol)
     except Exception as exc:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
+
+    # Account-level risk guards (needs API keys).
+    api, sec = load_keys(args.env_file)
+    if api and sec:
+        lev = float(args.leverage or 10.0)
+        if not args.no_max_leverage:
+            try:
+                lev = float(get_max_leverage(args.symbol, api, sec, args.recv_window))
+            except Exception:
+                pass
+        add_notional = grid_add_notional(orders, args, dca_only=False)
+        if account_risk_blocks(args, is_long, add_notional, api, sec, leverage=lev):
+            return
+
     prepared = prepare_orders(orders, args.symbol, is_long, filt)
 
     side = "BUY" if is_long else "SELL"
