@@ -79,6 +79,7 @@ def handle_command(cmd: str, args: list[str]) -> str:
             "/start SYMBOL — start bot (position unchanged)\n"
             "/stop SYMBOL — stop bot (orders & position stay on Binance)\n"
             "/status SYMBOL — process + trading state\n"
+            "/review SYMBOL — DeepSeek situational review (position + market)\n"
             "/list — all running supervisors\n"
             f"Backend: {backend}"
         )
@@ -96,6 +97,15 @@ def handle_command(cmd: str, args: list[str]) -> str:
         if action == "stop":
             return botctl.stop(sym, backend)
         return botctl.status(sym, backend)
+
+    if cmd == "/review":
+        if not args:
+            return "Usage: /review SYMBOL  (e.g. /review NEARUSDT)"
+        try:
+            from trade_review import review_symbol
+            return review_symbol(args[0])
+        except Exception as exc:
+            return f"Review failed: {exc}"
 
     return "Unknown command. Try /help"
 
