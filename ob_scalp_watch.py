@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -20,6 +21,7 @@ _SOURCES = {
     "scalp_stdout.log": "BOT",
     "scalp_autotune.log": "AUTO",
     "scalp_trades.log": "TRADE",
+    "scalp_learn.jsonl": "LEARN",
     "scalp_ema.log": "EMA",
 }
 
@@ -116,7 +118,36 @@ def _summarize_bot_line(line: str) -> str | None:
         return plain
     if " @ " in plain and "pnl " in plain and ("TP " in plain or "SL " in plain):
         return plain
+    if plain.startswith("Learn ") or plain.startswith("Learn watch"):
+        return plain
     return None
+
+
+def _format_learn_line(plain: str) -> str | None:
+    try:
+        rec = json.loads(plain)
+    except json.JSONDecodeError:
+        return plain
+    if not isinstance(rec, dict):
+        return plain
+    verdict = rec.get("verdict", "?")
+    label = rec.get("label", "?")
+    move = rec.get("best_move_pct", 0)
+    reason = rec.get("reason", "")
+    signal = rec.get("signal", "")
+    pnl = rec.get("net_usdt", 0)
+    human = {
+        "premature_sl": "SL prematuro — señal prosperó",
+        "signal_ok_sl_tight": "señal OK — SL ajustado",
+        "sl_correct": "SL correcto",
+        "tp_good": "TP acertado",
+        "tp_early": "TP temprano",
+        "tp_weak_follow": "TP OK — poco follow",
+    }.get(str(verdict), str(verdict))
+    return (
+        f"{human} · {signal.upper()} after {reason} · move={move:+.3f}% "
+        f"label={label} pnl={pnl:+.4f}"
+    )
 
 
 def merge_once(symbol: str, states: dict[str, TailState], *, console: bool) -> int:
@@ -140,6 +171,10 @@ def merge_once(symbol: str, states: dict[str, TailState], *, console: bool) -> i
                 if msg.startswith("PnL "):
                     out_tag = "PNL"
                     msg = msg[4:].strip()
+            elif tag == "LEARN":
+                msg = _format_learn_line(plain)
+                if not msg:
+                    continue
             elif tag in ("TRADE", "EMA", "AUTO"):
                 msg = re.sub(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*", "", plain)
                 if _is_noise_line(msg):
@@ -182,6 +217,8 @@ def backfill_session(symbol: str) -> int:
                 if not summary:
                     continue
                 msg = summary
+            elif tag == "LEARN":
+                msg = _format_learn_line(plain) or plain
             else:
                 msg = re.sub(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*", "", plain)
             ts = time.strftime("%Y-%m-%d %H:%M:%S")

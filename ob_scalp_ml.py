@@ -148,12 +148,31 @@ class SignalModel:
     cv_short: float
 
 
-def train_models(bars: list[BarRecord], params: TuneParams) -> SignalModel | None:
+def train_models(bars: list[BarRecord], params: TuneParams, *, symbol: str = "") -> SignalModel | None:
     if not HAS_SKLEARN or len(bars) < 15:
         return None
     xs, y_long, y_short = build_training_matrix(
         bars, tp_pct=params.tp_pct, sl_pct=params.sl_pct, fee_buffer=params.fee_buffer,
     )
+    if symbol:
+        try:
+            from ob_scalp_adaptive import load_trade_samples
+
+            for sample in load_trade_samples(symbol):
+                fv = sample.get("features")
+                sig = str(sample.get("signal", "")).lower()
+                if not isinstance(fv, list) or len(fv) != 9:
+                    continue
+                label = int(sample.get("label", 0))
+                xs.append(fv)
+                if sig == "long":
+                    y_long.append(label)
+                    y_short.append(0)
+                elif sig == "short":
+                    y_long.append(0)
+                    y_short.append(label)
+        except ImportError:
+            pass
     if len(xs) < 20:
         return None
     x = np.array(xs)
@@ -262,6 +281,7 @@ def random_search(
     n_iter: int = 120,
     seed: int = 42,
     base: TuneParams | None = None,
+    symbol: str = "",
 ) -> tuple[TuneParams, dict[str, float], SignalModel | None]:
     rng = random.Random(seed)
     base = base or TuneParams()
@@ -269,7 +289,7 @@ def random_search(
     best_stats = backtest(bars, base)
     best_model: SignalModel | None = None
 
-    model = train_models(bars, base)
+    model = train_models(bars, base, symbol=symbol)
 
     for _ in range(n_iter):
         cand = TuneParams(

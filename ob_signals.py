@@ -14,10 +14,29 @@ class SignalConfig:
     min_wall_qty: float = 0.0
     require_momentum: bool = True
     momentum_min_pct: float = 0.01
+    use_imbalance: bool = True
 
 
 def entry_signal(bar: OBBar, cfg: SignalConfig) -> str | None:
     """Return 'long', 'short', or None at bar close."""
+    if not cfg.use_imbalance:
+        ch = bar.mid_change_pct()
+        if cfg.require_momentum:
+            if ch >= cfg.momentum_min_pct:
+                if cfg.min_wall_qty > 0 and bar.bid_wall_qty < cfg.min_wall_qty:
+                    return None
+                return "long"
+            if ch <= -cfg.momentum_min_pct:
+                if cfg.min_wall_qty > 0 and bar.ask_wall_qty < cfg.min_wall_qty:
+                    return None
+                return "short"
+            return None
+        if ch > 0:
+            return "long"
+        if ch < 0:
+            return "short"
+        return None
+
     if bar.imbalance >= cfg.imb_long:
         if cfg.min_wall_qty > 0 and bar.bid_wall_qty < cfg.min_wall_qty:
             return None
@@ -37,6 +56,8 @@ def entry_signal(bar: OBBar, cfg: SignalConfig) -> str | None:
 
 def exit_on_flip(is_long: bool, bar: OBBar, cfg: SignalConfig) -> bool:
     """Exit when book imbalance flips against the open side."""
+    if not cfg.use_imbalance:
+        return False
     if is_long:
         return bar.imbalance <= cfg.imb_short
     return bar.imbalance >= cfg.imb_long

@@ -182,6 +182,9 @@ def start_bot(
         cmd.extend(["--recover", "--recover-max-level", str(recover_max_level)])
     cmd.extend(["--bar-sec", str(bar_sec), "--recv-window", "15000"])
     cmd.extend(tuned.to_cli())
+    cmd.append("--adaptive")
+    if os.getenv("OB_IMB_FILTER", "").strip().lower() in ("1", "true", "yes", "on"):
+        cmd.append("--imb-filter")
     if bars_n < 40:
         cmd.append("--no-ml-filter")
         log(symbol, f"ML filter OFF ({bars_n}/40 bars for reliable model)")
@@ -260,7 +263,7 @@ def run_tune_cycle(
         raise RuntimeError(f"Need {min_bars} bars, have {len(bars)}")
 
     log(symbol, f"ML tune on {len(bars)} bars (sklearn={'yes' if HAS_SKLEARN else 'no'})")
-    best, stats, model = random_search(bars, n_iter=n_iter, base=base)
+    best, stats, model = random_search(bars, n_iter=n_iter, base=base, symbol=symbol)
     if model:
         log(symbol, f"  RF cv long={model.cv_long:.2f} short={model.cv_short:.2f}")
     log(

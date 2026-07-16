@@ -28,7 +28,15 @@ from ob_ema import (
     fetch_ema_snapshot,
     format_ema_console,
 )
-from ob_scalp_ml import load_models, predict_prob
+from ob_scalp_ml import feature_vector, load_models, predict_prob
+from ob_scalp_adaptive import (
+    effective_filters,
+    format_adaptive_line,
+    load_adaptive,
+    maybe_relax_inactivity,
+    on_trade_open,
+)
+from ob_scalp_learn import effective_sl_pct, register_close_watch, tick_outcome_watches
 from ob_scalp_dataset import BarRecord, append_bar
 from ob_scalp_pnl import format_pnl_line, load_pnl_stats, refresh_pnl_stats
 from ob_scalp_recovery import (
@@ -355,6 +363,8 @@ class PositionState:
     bars_held: int = 0
     extreme_mark: float = 0.0
     trail_armed: bool = False
+    entry_features: list[float] | None = None
+    entry_signal: str = ""
 
     def __post_init__(self) -> None:
         if self.extreme_mark <= 0:
@@ -385,6 +395,8 @@ def _handle_close(
     filt: dict[str, Decimal],
     api: str,
     sec: str,
+    *,
+    adaptive_state=None,
 ) -> float:
     """Close position; return monotonic close timestamp for entry cooldown."""
     direction = "LONG" if pos.is_long else "SHORT"
@@ -430,6 +442,25 @@ def _handle_close(
             play_sound("sl")
         else:
             play_close_sound(net_usdt)
+    if args.adaptive and adaptive_state is not None and pos.entry_features:
+        signal = pos.entry_signal or ("long" if pos.is_long else "short")
+        watch_sec = max(args.bar_sec * 3, 120.0)
+        eff_sl = effective_sl_pct(adaptive_state, args.sl_pct)
+        msg = register_close_watch(
+            sym,
+            signal=signal,
+            features=pos.entry_features,
+            entry=pos.entry,
+            exit_price=exit_price,
+            is_long=pos.is_long,
+            reason=reason,
+            net_usdt=net_usdt,
+            tp_pct=args.tp_pct,
+            sl_pct=eff_sl,
+            fee_buffer=args.fee_buffer,
+            watch_sec=watch_sec,
+        )
+        print(f"{DIM}{msg}{RESET}")
     return time.time()
 
 
@@ -494,6 +525,7 @@ def run_loop(args: argparse.Namespace) -> None:
         min_wall_qty=args.min_wall_qty,
         require_momentum=not args.no_momentum,
         momentum_min_pct=args.momentum_min_pct,
+        use_imbalance=args.imb_filter,
     )
     builder = BarBuilder(bar_sec=args.bar_sec, band_pct=args.band_pct)
     recovery = reset_state(sym) if args.reset_recover else load_state(sym)
@@ -526,13 +558,20 @@ def run_loop(args: argparse.Namespace) -> None:
     if sounds_enabled() and not args.no_sounds:
         pack = sound_pack_label()
         sound_note = f"\n  sounds ON ({pack}: entry/dca/tp/sl)"
+    imb_note = ""
+    if not args.imb_filter:
+        imb_note = f"\n  entry signal: momentum≥{args.momentum_min_pct:g}% (imbalance filter OFF by default)"
     print(
         f"\n{BOLD}{CYAN}OB scalp · {sym}{RESET}  {mode}\n"
         f"  bar {args.bar_sec:g}s  sample {args.sample_sec:g}s  band ±{args.band_pct:g}%\n"
-        f"  entry imb long≥{args.imb_long:.2f} short≤{args.imb_short:.2f}  "
-        f"TP +{args.tp_pct:g}%  SL -{args.sl_pct:g}%  max {args.max_bars} bars\n"
+        + (
+            f"  entry imb long≥{args.imb_long:.2f} short≤{args.imb_short:.2f}  "
+            if not args.imb_filter
+            else ""
+        )
+        + f"TP +{args.tp_pct:g}%  SL -{args.sl_pct:g}%  max {args.max_bars} bars\n"
         f"  fee buffer {args.fee_buffer:g}% (no TP/flip close if net ≤ 0)  "
-        f"size {size_note}{recover_note}{ema_note}{trail_note}{sound_note}  Ctrl+C to stop\n",
+        f"size {size_note}{imb_note}{recover_note}{ema_note}{trail_note}{sound_note}  Ctrl+C to stop\n",
     )
     refresh_pnl_stats(sym)
     _print_pnl_summary(sym, None, _preview_mid if _preview_mid > 0 else 0.0)
@@ -542,11 +581,46 @@ def run_loop(args: argparse.Namespace) -> None:
     ml_model = load_models(sym) if args.ml_filter else None
     if ml_model:
         print(f"  {DIM}ML filter ON  min prob {args.ml_min_prob:.2f}{RESET}")
+    bot_started_at = time.time()
+    adaptive = load_adaptive(sym) if args.adaptive else None
+    if args.adaptive and adaptive:
+        eff0 = effective_filters(
+            adaptive,
+            base_ml=args.ml_min_prob,
+            base_ema=args.ema_slope_min,
+            base_imb_long=args.imb_long,
+            base_imb_short=args.imb_short,
+            base_momentum=args.momentum_min_pct,
+        )
+        print(f"  {DIM}Adaptive ON — {format_adaptive_line(adaptive, eff0, base_sl=args.sl_pct)}{RESET}")
     builder.start_bar(time.time())
 
     try:
         while True:
             now = time.time()
+            ml_threshold = args.ml_min_prob
+            ema_slope = args.ema_slope_min
+            sl_threshold = args.sl_pct
+            if args.adaptive:
+                adaptive = load_adaptive(sym)
+                relax_msg = maybe_relax_inactivity(sym, adaptive, bot_started_at=bot_started_at)
+                if relax_msg:
+                    print(f"{YELLOW}{relax_msg}{RESET}")
+                eff = effective_filters(
+                    adaptive,
+                    base_ml=args.ml_min_prob,
+                    base_ema=args.ema_slope_min,
+                    base_imb_long=args.imb_long,
+                    base_imb_short=args.imb_short,
+                    base_momentum=args.momentum_min_pct,
+                )
+                ml_threshold = eff["ml_min_prob"]
+                ema_slope = eff["ema_slope_min"]
+                sl_threshold = effective_sl_pct(adaptive, args.sl_pct)
+                if args.imb_filter:
+                    sig_cfg.imb_long = eff["imb_long"]
+                    sig_cfg.imb_short = eff["imb_short"]
+                sig_cfg.momentum_min_pct = eff["momentum_min_pct"]
             try:
                 depth = _fetch_depth_retry(sym, args.limit)
                 bids, asks = depth_to_levels(depth)
@@ -560,6 +634,10 @@ def run_loop(args: argparse.Namespace) -> None:
                 continue
 
             mark = (bids[0][0] + asks[0][0]) / 2
+
+            if args.adaptive:
+                for learn_msg in tick_outcome_watches(sym, mark):
+                    print(f"{CYAN}{learn_msg}{RESET}")
 
             side, live_qty, live_entry = _detect_open_side(sym, hedge, api, sec, args.recv_window)
             if side is not None and live_qty > 0:
@@ -585,6 +663,7 @@ def run_loop(args: argparse.Namespace) -> None:
                     _print_close_event("TP", pos, pnl, mark, fee_buffer=args.fee_buffer)
                     last_close_at = _handle_close(
                         sym, pos, mark, pnl, "TP", args, recovery, hedge, filt, api, sec,
+                        adaptive_state=adaptive,
                     )
                     pos = None
                 elif _trail_triggered(pos, mark, args.trail_pct) and should_discretionary_close(
@@ -593,6 +672,7 @@ def run_loop(args: argparse.Namespace) -> None:
                     _print_close_event("TRAIL", pos, pnl, mark, fee_buffer=args.fee_buffer)
                     last_close_at = _handle_close(
                         sym, pos, mark, pnl, "TRAIL", args, recovery, hedge, filt, api, sec,
+                        adaptive_state=adaptive,
                     )
                     pos = None
                 elif pnl >= args.tp_pct and not should_tp_close(pnl, args.tp_pct, args.fee_buffer):
@@ -601,10 +681,11 @@ def run_loop(args: argparse.Namespace) -> None:
                         f"{pnl - args.fee_buffer:+.3f}% ≤ 0 — holding "
                         f"{_side_label(pos.is_long)}{RESET}",
                     )
-                elif pnl <= -args.sl_pct:
+                elif pnl <= -sl_threshold:
                     _print_close_event("SL", pos, pnl, mark, fee_buffer=args.fee_buffer)
                     last_close_at = _handle_close(
                         sym, pos, mark, pnl, "SL", args, recovery, hedge, filt, api, sec,
+                        adaptive_state=adaptive,
                     )
                     pos = None
 
@@ -623,7 +704,7 @@ def run_loop(args: argparse.Namespace) -> None:
                         fast=args.ema_fast,
                         slow=args.ema_slow,
                         slope_bars=args.ema_slope_bars,
-                        slope_min_pct=args.ema_slope_min,
+                        slope_min_pct=ema_slope,
                     )
                 except Exception as exc:
                     print(f"{YELLOW}EMA fetch failed: {exc}{RESET}")
@@ -647,10 +728,10 @@ def run_loop(args: argparse.Namespace) -> None:
 
             if signal and ml_model and args.ml_filter:
                 prob = predict_prob(ml_model, bar_rec, signal)
-                if prob < args.ml_min_prob:
+                if prob < ml_threshold:
                     print(
                         f"{YELLOW}ML filter block {signal.upper()} "
-                        f"(prob={prob:.2f} < {args.ml_min_prob:.2f}){RESET}",
+                        f"(prob={prob:.2f} < {ml_threshold:.2f}){RESET}",
                     )
                     signal = None
 
@@ -667,6 +748,7 @@ def run_loop(args: argparse.Namespace) -> None:
                         _print_close_event("FLIP", pos, pnl, bar.mid_c, fee_buffer=args.fee_buffer)
                         last_close_at = _handle_close(
                             sym, pos, bar.mid_c, pnl, "FLIP", args, recovery, hedge, filt, api, sec,
+                            adaptive_state=adaptive,
                         )
                         pos = None
                     else:
@@ -679,6 +761,7 @@ def run_loop(args: argparse.Namespace) -> None:
                         _print_close_event("MAXBARS", pos, pnl, bar.mid_c, fee_buffer=args.fee_buffer)
                         last_close_at = _handle_close(
                             sym, pos, bar.mid_c, pnl, "MAXBARS", args, recovery, hedge, filt, api, sec,
+                            adaptive_state=adaptive,
                         )
                         pos = None
                     else:
@@ -753,7 +836,11 @@ def run_loop(args: argparse.Namespace) -> None:
                         qty=qty_f,
                         opened_at=now,
                         recovery_level=recovery.level if args.recover else 0,
+                        entry_features=feature_vector(bar_rec),
+                        entry_signal=signal,
                     )
+                    if args.adaptive and adaptive is not None:
+                        on_trade_open(sym, adaptive)
                     if args.recover:
                         append_journal(
                             sym,
@@ -808,6 +895,9 @@ def parse_args() -> argparse.Namespace:
                    help="Enter long when imbalance >= this (default: 0.55)")
     p.add_argument("--imb-short", type=float, default=_env_float("OB_IMB_SHORT", 0.45),
                    help="Enter short when imbalance <= this (default: 0.45)")
+    p.add_argument("--imb-filter", action=argparse.BooleanOptionalAction,
+                   default=_env_bool("OB_IMB_FILTER", False),
+                   help="Use book imbalance for entry/flip (default off — scalp uses momentum+EMA+SL)")
     p.add_argument("--min-wall-qty", type=float, default=_env_float("OB_MIN_WALL_QTY", 0.0),
                    help="Min resting size on signal-side wall (0=off)")
     p.add_argument("--no-momentum", action="store_true",
@@ -860,6 +950,9 @@ def parse_args() -> argparse.Namespace:
                    help="Use RandomForest model from autotune if present (default on)")
     p.add_argument("--ml-min-prob", type=float, default=_env_float("OB_ML_MIN_PROB", 0.48),
                    help="Min ML win probability to enter (default 0.48)")
+    p.add_argument("--adaptive", action=argparse.BooleanOptionalAction,
+                   default=_env_bool("OB_ADAPTIVE", True),
+                   help="Permissive adaptive filters + learn from trade outcomes (default on)")
     p.add_argument("--reset-recover", action="store_true",
                    help="Reset recovery state to level 0 before starting")
     p.add_argument("--dry-run", action="store_true", help="Log signals only, no orders")

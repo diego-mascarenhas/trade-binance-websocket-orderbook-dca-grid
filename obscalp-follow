@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Unified follow log: pick → active symbol session until next pick
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+exec python3 -u "$ROOT/ob_scalp_follow.py" "$@"

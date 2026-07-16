@@ -13,6 +13,8 @@ _DEFAULT = {
     "dca": "/System/Library/Sounds/Pop.aiff",
     "tp": "/System/Library/Sounds/Ping.aiff",
     "sl": "/System/Library/Sounds/Sosumi.aiff",
+    "pick": "/System/Library/Sounds/Hero.aiff",
+    "cycle_end": "/System/Library/Sounds/Submarine.aiff",
 }
 
 _ENV = {
@@ -20,6 +22,8 @@ _ENV = {
     "dca": "OB_SOUND_DCA",
     "tp": "OB_SOUND_TP",
     "sl": "OB_SOUND_SL",
+    "pick": "OB_SOUND_PICK",
+    "cycle_end": "OB_SOUND_CYCLE_END",
 }
 
 _ROOT = Path(__file__).resolve().parent
@@ -33,8 +37,10 @@ _PACMAN_DIR_ICLOUD = Path(
 _PACMAN_FILES = {
     "entry": "01. Credit Sound.mp3",
     "dca": "03. PAC-MAN - Eating The Pac-dots.mp3",
-    "tp": "11. PAC-MAN - Eating The Fruit.mp3",
+    "tp": "05. Extend Sound.mp3",
     "sl": "15. Fail.mp3",
+    "pick": "02. Start Music.mp3",
+    "cycle_end": "14. Ghost - Return to Home.mp3",
 }
 
 
@@ -97,7 +103,7 @@ def _afplay(path: str) -> None:
 
 
 def play_sound(event: str, *, block: bool = False) -> str | None:
-    """Play sound for: entry, dca, tp, sl. Use block=True for python -c one-liners."""
+    """Play sound for: entry, dca, tp, sl, pick, cycle_end."""
     if not sounds_enabled():
         return None
     path = _resolve_path(event.lower())
@@ -137,12 +143,13 @@ if __name__ == "__main__":
     import sys
     import time
 
-    parser = argparse.ArgumentParser(description="Play trade sounds (entry, dca, tp, sl)")
+    parser = argparse.ArgumentParser(description="Play trade sounds")
+    _EVENTS = ("entry", "dca", "tp", "sl", "pick", "cycle_end", "all")
     parser.add_argument(
         "event",
         nargs="?",
         default="entry",
-        choices=["entry", "dca", "tp", "sl", "all"],
+        choices=_EVENTS,
         help="Sound to play (default: entry)",
     )
     parser.add_argument("-l", "--list", action="store_true", help="Show resolved paths")
@@ -150,12 +157,12 @@ if __name__ == "__main__":
 
     if args.list:
         print(f"pack: {sound_pack_label()}")
-        for name in ("entry", "dca", "tp", "sl"):
+        for name in ("entry", "dca", "tp", "sl", "pick", "cycle_end"):
             print(f"  {name}: {_resolve_path(name)}")
         raise SystemExit(0)
 
     if args.event == "all":
-        for name in ("entry", "dca", "tp", "sl"):
+        for name in ("entry", "dca", "tp", "sl", "pick", "cycle_end"):
             path = _play_sync(name)
             print(f"{name}: {path or 'MISSING'}")
             time.sleep(0.4)

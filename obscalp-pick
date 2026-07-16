@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# fscan-based symbol picker → launches full OB scalp stack (autotune/watch/bot)
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+exec python3 -u "$ROOT/ob_scalp_pick.py" "$@"

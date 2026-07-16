@@ -606,8 +606,7 @@ def print_pick_scalp(pick: dict[str, Any], *, source: str) -> None:
     print(f"  {BOLD}Confidence{RESET} {conf}")
     print(f"  {BOLD}Reason{RESET}     {reason}")
     print(f"\n  {DIM}Observe:{RESET}  obscalp {sym} --dry-run --bar-sec 60")
-    print(f"  {DIM}Run:{RESET}       {BOLD}{cmd}{RESET}")
-    print(f"  {DIM}Auto-run:{RESET}  pick --scalp -y")
+    print(f"  {DIM}Run stack:{RESET}  {BOLD}obscalp-pick -y{RESET}  or  pick --scalp -y")
 
 
 def run_grid_dry_run(pick: dict[str, Any]) -> int:
@@ -658,19 +657,19 @@ def run_execute(pick: dict[str, Any], *, background: bool) -> int:
 
 
 def run_scalp_execute(pick: dict[str, Any]) -> int:
+    from ob_scalp_stack import switch_stack
+
     sym = pick.get("symbol", "").upper()
-    root = os.path.dirname(os.path.abspath(__file__))
-    script = os.path.join(root, "obscalp")
-    cmd = [
-        script, sym,
-        "--execute", "--bar-sec", "60", "--sample-sec", "2",
-        "--imb-long", "0.58", "--imb-short", "0.42",
-        "--tp-pct", "0.35", "--sl-pct", "0.25", "--fee-buffer", "0.08",
-        "--momentum-min-pct", "0.05",
-    ]
-    print(f"\n{BOLD}{GREEN}▶ Executing OB scalp:{RESET} {' '.join(cmd[1:])}\n")
+    print(f"\n{BOLD}{GREEN}▶ Executing OB scalp stack on {sym}{RESET}\n")
     try:
-        return subprocess.call(cmd, cwd=root)
+        pids = switch_stack(
+            sym,
+            execute=True,
+            meta={"pick_reason": pick.get("reason", ""), "source": "trade_pick"},
+        )
+        print(f"{GREEN}Started{RESET} autotune={pids.get('autotune_pid')} watch={pids.get('watch_pid')}")
+        print(f"{DIM}tail -f .run/logs/{sym}/scalp_session.log{RESET}")
+        return 0
     except KeyboardInterrupt:
         print(f"\n{DIM}OB scalp stopped (Ctrl+C).{RESET}")
         return 130
