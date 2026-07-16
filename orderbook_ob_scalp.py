@@ -18,9 +18,22 @@ import sys
 import time
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
+from pathlib import Path
 from typing import Any
 
 from ob_bars import BarBuilder, depth_to_levels
+from ob_scalp_recovery import (
+    RecoveryState,
+    append_journal,
+    ensure_base_notional,
+    format_status,
+    load_state,
+    pnl_usdt,
+    record_close,
+    reset_state,
+    save_state,
+    target_notional,
+)
 from ob_signals import (
     SignalConfig,
     entry_signal,
@@ -44,6 +57,7 @@ from orderbook_dca_grid import (
     _round_to,
     _signed_request,
     fetch_depth,
+    get_position,
     get_wallet_balance,
     load_env_file,
     load_keys,
@@ -125,7 +139,36 @@ def qty_for_notional(
     return qty_str, float(qty_d)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "")
+    if not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def resolve_entry_qty(
+    args: argparse.Namespace,
+    price: float,
+    filt: dict[str, Decimal],
+    api: str,
+    sec: str,
+    *,
+    recovery: RecoveryState | None = None,
+) -> tuple[str, float, float]:
+    """Return (qty_str, qty_float, notional_usdt)."""
+    base_qty_str, base_qty_f = _base_entry_qty(args, price, filt, api, sec)
+    base_notional = price * base_qty_f
+    if not args.recover or recovery is None:
+        return base_qty_str, base_qty_f, base_notional
+
+    ensure_base_notional(recovery, base_notional)
+    level = min(recovery.level, args.recover_max_level)
+    notional = recovery.base_notional_usdt * (2 ** level)
+    qty_str, qty_f = qty_for_notional(notional, price, filt)
+    return qty_str, qty_f, notional
+
+
+def _base_entry_qty(
     args: argparse.Namespace,
     price: float,
     filt: dict[str, Decimal],
@@ -163,8 +206,67 @@ def _dca_supervisor_running(symbol: str) -> bool:
         return False
 
 
+def _side_color(signal: str) -> str:
+    return GREEN if signal.lower() == "long" else RED
+
+
+def _side_label(is_long: bool) -> str:
+    direction = "LONG" if is_long else "SHORT"
+    return f"{_side_color('long' if is_long else 'short')}{direction}{RESET}"
+
+
+def _tp_sl_prices(entry: float, is_long: bool, tp_pct: float, sl_pct: float) -> tuple[float, float]:
+    if is_long:
+        return entry * (1 + tp_pct / 100), entry * (1 - sl_pct / 100)
+    return entry * (1 - tp_pct / 100), entry * (1 + sl_pct / 100)
+
+
+def _print_open_position(pos: PositionState, mark: float, args: argparse.Namespace) -> None:
+    pnl = profit_pct(pos.entry, mark, pos.is_long)
+    tp_px, sl_px = _tp_sl_prices(pos.entry, pos.is_long, args.tp_pct, args.sl_pct)
+    print(
+        f"  {_side_label(pos.is_long)} @ {price_fmt(pos.entry)}  "
+        f"pnl {pnl:+.3f}%  TP {price_fmt(tp_px)}  SL {price_fmt(sl_px)}",
+    )
+
+
+def _print_close_event(
+    reason: str,
+    pos: PositionState,
+    gross_pct: float,
+    exit_price: float,
+    *,
+    fee_buffer: float,
+) -> None:
+    net = gross_pct - fee_buffer
+    side = _side_label(pos.is_long)
+    if reason == "TP":
+        print(
+            f"{GREEN}TP hit{RESET} {side} {gross_pct:+.3f}% "
+            f"(est. net {net:+.3f}%) @ {price_fmt(exit_price)}",
+        )
+    elif reason == "SL":
+        print(
+            f"{RED}SL hit{RESET} {side} {gross_pct:+.3f}% @ {price_fmt(exit_price)}",
+        )
+    elif reason == "FLIP":
+        print(
+            f"{YELLOW}Imbalance flip → exit{RESET} {side} {gross_pct:+.3f}% "
+            f"(est. net {net:+.3f}%) @ {price_fmt(exit_price)}",
+        )
+    else:
+        print(
+            f"{YELLOW}{reason} → exit{RESET} {side} {gross_pct:+.3f}% "
+            f"@ {price_fmt(exit_price)}",
+        )
+
+
 def print_bar(bar: Any, signal: str | None) -> None:
-    sig = f"  {GREEN}→ {signal.upper()}{RESET}" if signal else ""
+    if signal:
+        color = _side_color(signal)
+        sig = f"  {color}→ {signal.upper()}{RESET}"
+    else:
+        sig = ""
     print(
         f"{DIM}bar {time.strftime('%H:%M:%S', time.localtime(bar.t_close))}{RESET}  "
         f"mid {price_fmt(bar.mid_c)} ({bar.mid_change_pct():+.3f}%)  "
@@ -189,7 +291,86 @@ class PositionState:
     entry: float
     qty: float
     opened_at: float
+    recovery_level: int = 0
     bars_held: int = 0
+
+
+def _estimated_net_usdt(
+    entry: float,
+    exit_price: float,
+    qty: float,
+    is_long: bool,
+    fee_buffer_pct: float,
+) -> float:
+    gross = pnl_usdt(entry, exit_price, qty, is_long)
+    notional = entry * qty
+    return gross - notional * fee_buffer_pct / 100.0
+
+
+def _handle_close(
+    sym: str,
+    pos: PositionState,
+    exit_price: float,
+    gross_pct: float,
+    reason: str,
+    args: argparse.Namespace,
+    recovery: RecoveryState,
+    hedge: bool,
+    filt: dict[str, Decimal],
+    api: str,
+    sec: str,
+) -> float:
+    """Close position; return monotonic close timestamp for entry cooldown."""
+    direction = "LONG" if pos.is_long else "SHORT"
+    net_usdt = _estimated_net_usdt(
+        pos.entry, exit_price, pos.qty, pos.is_long, args.fee_buffer,
+    )
+    if args.recover:
+        record_close(
+            sym,
+            recovery,
+            reason=reason,
+            direction=direction,
+            entry=pos.entry,
+            exit_price=exit_price,
+            qty=pos.qty,
+            gross_pct=gross_pct,
+            net_usdt=net_usdt,
+            dry_run=args.dry_run,
+        )
+        if net_usdt > 0:
+            print(f"{GREEN}Recovery reset — back to base size.{RESET}")
+        else:
+            lock = f" · retry {recovery.locked_side.upper()} only" if recovery.locked_side else ""
+            print(
+                f"{YELLOW}Recovery level {recovery.level} ({recovery.multiplier:g}x){lock} · "
+                f"cumulative loss {recovery.cumulative_loss_usdt:.4f} USDT{RESET}",
+            )
+    elif not args.dry_run:
+        append_journal(
+            sym,
+            f"{reason} {direction} qty={pos.qty:g} gross={gross_pct:+.3f}% "
+            f"pnl={net_usdt:+.4f} USDT",
+        )
+
+    if not args.dry_run:
+        market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
+    return time.time()
+
+
+def _opposite_position_open(
+    sym: str,
+    is_long: bool,
+    hedge: bool,
+    api: str,
+    sec: str,
+    recv: int,
+) -> tuple[bool, float]:
+    """True if the opposite hedge leg has size (one-way always false)."""
+    if not hedge:
+        return False, 0.0
+    opp_qty, _ = get_position(sym, not is_long, hedge, api, sec, recv)
+    return opp_qty > 0, opp_qty
 
 
 def run_loop(args: argparse.Namespace) -> None:
@@ -214,6 +395,11 @@ def run_loop(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     hedge = _resolve_hedge(args, api, sec)
+    if hedge:
+        print(
+            f"{YELLOW}⚠ Hedge mode ON — scalp expects one-way. "
+            f"Use one-way account or --position-mode oneway to avoid LONG+SHORT stacks.{RESET}",
+        )
     sig_cfg = SignalConfig(
         imb_long=args.imb_long,
         imb_short=args.imb_short,
@@ -222,6 +408,9 @@ def run_loop(args: argparse.Namespace) -> None:
         momentum_min_pct=args.momentum_min_pct,
     )
     builder = BarBuilder(bar_sec=args.bar_sec, band_pct=args.band_pct)
+    recovery = reset_state(sym) if args.reset_recover else load_state(sym)
+    if args.recover and not args.reset_recover:
+        append_journal(sym, f"START recover={recovery.level} cumulative={recovery.cumulative_loss_usdt:.4f}")
 
     try:
         _preview_bids, _preview_asks = depth_to_levels(fetch_depth(sym, args.limit))
@@ -231,16 +420,21 @@ def run_loop(args: argparse.Namespace) -> None:
     size_note = size_mode_summary(args, filt, _preview_mid) if _preview_mid > 0 else args.size_mode
 
     mode = f"{YELLOW}DRY-RUN{RESET}" if args.dry_run else f"{GREEN}LIVE{RESET}"
+    recover_note = ""
+    if args.recover:
+        recover_note = f"\n  recover {format_status(recovery)}  max level {args.recover_max_level}"
+        recover_note += f"\n  logs {Path('.run/logs') / sym}/scalp_trades.log"
     print(
         f"\n{BOLD}{CYAN}OB scalp · {sym}{RESET}  {mode}\n"
         f"  bar {args.bar_sec:g}s  sample {args.sample_sec:g}s  band ±{args.band_pct:g}%\n"
         f"  entry imb long≥{args.imb_long:.2f} short≤{args.imb_short:.2f}  "
         f"TP +{args.tp_pct:g}%  SL -{args.sl_pct:g}%  max {args.max_bars} bars\n"
         f"  fee buffer {args.fee_buffer:g}% (no TP/flip close if net ≤ 0)  "
-        f"size {size_note}  Ctrl+C to stop\n",
+        f"size {size_note}{recover_note}  Ctrl+C to stop\n",
     )
 
     pos: PositionState | None = None
+    last_close_at: float = 0.0
     builder.start_bar(time.time())
 
     try:
@@ -280,20 +474,22 @@ def run_loop(args: argparse.Namespace) -> None:
             if pos is not None:
                 pnl = profit_pct(pos.entry, mark, pos.is_long)
                 if should_tp_close(pnl, args.tp_pct, args.fee_buffer):
-                    net = pnl - args.fee_buffer
-                    print(f"{GREEN}TP hit {pnl:+.3f}% (est. net {net:+.3f}%) @ {price_fmt(mark)}{RESET}")
-                    if not args.dry_run:
-                        market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
+                    _print_close_event("TP", pos, pnl, mark, fee_buffer=args.fee_buffer)
+                    last_close_at = _handle_close(
+                        sym, pos, mark, pnl, "TP", args, recovery, hedge, filt, api, sec,
+                    )
                     pos = None
                 elif pnl >= args.tp_pct and not should_tp_close(pnl, args.tp_pct, args.fee_buffer):
                     print(
                         f"{DIM}TP gross {pnl:+.3f}% but est. net "
-                        f"{pnl - args.fee_buffer:+.3f}% ≤ 0 — holding{RESET}",
+                        f"{pnl - args.fee_buffer:+.3f}% ≤ 0 — holding "
+                        f"{_side_label(pos.is_long)}{RESET}",
                     )
                 elif pnl <= -args.sl_pct:
-                    print(f"{RED}SL hit {pnl:+.3f}% @ {price_fmt(mark)}{RESET}")
-                    if not args.dry_run:
-                        market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
+                    _print_close_event("SL", pos, pnl, mark, fee_buffer=args.fee_buffer)
+                    last_close_at = _handle_close(
+                        sym, pos, mark, pnl, "SL", args, recovery, hedge, filt, api, sec,
+                    )
                     pos = None
 
             bar = builder.add_sample(bids, asks, now)
@@ -303,15 +499,18 @@ def run_loop(args: argparse.Namespace) -> None:
 
             signal = entry_signal(bar, sig_cfg)
             print_bar(bar, signal)
+            if pos is not None:
+                _print_open_position(pos, bar.mid_c, args)
 
             if pos is not None:
                 pos.bars_held += 1
                 if exit_on_flip(pos.is_long, bar, sig_cfg):
                     pnl = profit_pct(pos.entry, bar.mid_c, pos.is_long)
                     if should_discretionary_close(pnl, args.fee_buffer):
-                        print(f"{YELLOW}Imbalance flip → exit {pnl:+.3f}% (est. net {pnl - args.fee_buffer:+.3f}%){RESET}")
-                        if not args.dry_run:
-                            market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
+                        _print_close_event("FLIP", pos, pnl, bar.mid_c, fee_buffer=args.fee_buffer)
+                        last_close_at = _handle_close(
+                            sym, pos, bar.mid_c, pnl, "FLIP", args, recovery, hedge, filt, api, sec,
+                        )
                         pos = None
                     else:
                         print(
@@ -320,9 +519,10 @@ def run_loop(args: argparse.Namespace) -> None:
                 elif pos.bars_held >= args.max_bars:
                     pnl = profit_pct(pos.entry, bar.mid_c, pos.is_long)
                     if should_discretionary_close(pnl, args.fee_buffer):
-                        print(f"{YELLOW}Max bars ({args.max_bars}) → exit {pnl:+.3f}%{RESET}")
-                        if not args.dry_run:
-                            market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
+                        _print_close_event("MAXBARS", pos, pnl, bar.mid_c, fee_buffer=args.fee_buffer)
+                        last_close_at = _handle_close(
+                            sym, pos, bar.mid_c, pnl, "MAXBARS", args, recovery, hedge, filt, api, sec,
+                        )
                         pos = None
                     else:
                         print(
@@ -331,29 +531,101 @@ def run_loop(args: argparse.Namespace) -> None:
 
             elif signal and not args.dry_run:
                 is_long = signal == "long"
+                if last_close_at and (now - last_close_at) < args.entry_cooldown_sec:
+                    wait = args.entry_cooldown_sec - (now - last_close_at)
+                    print(
+                        f"{DIM}Entry cooldown {wait:.0f}s — skip {signal.upper()} "
+                        f"(wait after last close){RESET}",
+                    )
+                    builder.reset_after_bar(now)
+                    time.sleep(args.sample_sec)
+                    continue
+                if args.recover and recovery.locked_side and signal != recovery.locked_side:
+                    print(
+                        f"{YELLOW}Recovery locked {recovery.locked_side.upper()} — "
+                        f"skip {signal.upper()} (same side until TP){RESET}",
+                    )
+                    builder.reset_after_bar(now)
+                    time.sleep(args.sample_sec)
+                    continue
+                opp_open, opp_qty = _opposite_position_open(
+                    sym, is_long, hedge, api, sec, args.recv_window,
+                )
+                if opp_open:
+                    print(
+                        f"{RED}Opposite hedge leg open ({opp_qty:g}) — "
+                        f"skip {signal.upper()} until flat.{RESET}",
+                    )
+                    builder.reset_after_bar(now)
+                    time.sleep(args.sample_sec)
+                    continue
+                if args.recover and recovery.level > args.recover_max_level:
+                    print(
+                        f"{RED}Recovery max level {args.recover_max_level} exceeded — "
+                        f"skipping entry (reset with --reset-recover).{RESET}",
+                    )
+                    builder.reset_after_bar(now)
+                    time.sleep(args.sample_sec)
+                    continue
                 try:
-                    qty_str, qty_f = resolve_entry_qty(args, bar.mid_c, filt, api, sec)
+                    qty_str, qty_f, notional = resolve_entry_qty(
+                        args, bar.mid_c, filt, api, sec, recovery=recovery if args.recover else None,
+                    )
                 except ValueError as exc:
                     print(f"{RED}Sizing failed: {exc}{RESET}")
                     builder.reset_after_bar(now)
                     time.sleep(args.sample_sec)
                     continue
 
+                if args.recover:
+                    save_state(sym, recovery)
+
                 cid = client_id(sym, "E")
                 direction = "LONG" if is_long else "SHORT"
+                side_color = _side_color("long" if is_long else "short")
+                mult_note = f" · {recovery.multiplier:g}x recover" if args.recover and recovery.level > 0 else ""
                 print(
-                    f"{BOLD}{GREEN}▶ MARKET {direction} {qty_str} @ ~{price_fmt(bar.mid_c)} "
-                    f"(imb {bar.imbalance * 100:.1f}%){RESET}",
+                    f"{BOLD}{side_color}▶ MARKET {direction} {qty_str} @ ~{price_fmt(bar.mid_c)} "
+                    f"(imb {bar.imbalance * 100:.1f}%{mult_note}){RESET}",
                 )
                 try:
                     market_open(sym, is_long, qty_str, hedge, api, sec, args.recv_window, cid=cid)
-                    pos = PositionState(is_long=is_long, entry=bar.mid_c, qty=qty_f, opened_at=now)
+                    pos = PositionState(
+                        is_long=is_long,
+                        entry=bar.mid_c,
+                        qty=qty_f,
+                        opened_at=now,
+                        recovery_level=recovery.level if args.recover else 0,
+                    )
+                    if args.recover:
+                        append_journal(
+                            sym,
+                            f"OPEN {direction} qty={qty_f:g} notional={notional:.4f} "
+                            f"level={recovery.level} ({recovery.multiplier:g}x)",
+                        )
                 except RuntimeError as exc:
                     print(f"{RED}Market entry failed: {exc}{RESET}")
 
             elif signal and args.dry_run:
                 direction = signal.upper()
-                print(f"{CYAN}  [dry-run] would MARKET {direction} @ ~{price_fmt(bar.mid_c)}{RESET}")
+                side_color = _side_color(signal)
+                mult_note = ""
+                if args.recover:
+                    try:
+                        _, _, base_notional = resolve_entry_qty(
+                            args, bar.mid_c, filt, api, sec, recovery=None,
+                        )
+                        next_notional, next_level = target_notional(
+                            recovery, base_notional, max_level=args.recover_max_level,
+                        )
+                        mult = 2 ** next_level
+                        mult_note = f" · would {mult:g}x ({next_notional:.2f} USDT)"
+                    except ValueError:
+                        pass
+                print(
+                    f"{side_color}  [dry-run] would MARKET {direction} "
+                    f"@ ~{price_fmt(bar.mid_c)}{mult_note}{RESET}",
+                )
 
             builder.reset_after_bar(now)
             time.sleep(max(0.0, args.sample_sec))
@@ -402,6 +674,14 @@ def parse_args() -> argparse.Namespace:
                    help="With --size-mode wallet: entry notional as %% of wallet")
     p.add_argument("--base-size", type=float, default=_env_float("SCALP_BASE_SIZE", 0.0),
                    help="With --size-mode fixed: USDT notional per trade")
+    p.add_argument("--recover", action="store_true", default=_env_bool("OB_RECOVER", False),
+                   help="After a losing close, double size on SAME side until TP (state in .run/logs/SYMBOL/)")
+    p.add_argument("--recover-max-level", type=int, default=int(_env_float("OB_RECOVER_MAX_LEVEL", 4)),
+                   help="Max martingale level (2^level multiplier cap, default 4 = 16x)")
+    p.add_argument("--entry-cooldown-sec", type=float, default=_env_float("OB_ENTRY_COOLDOWN_SEC", 45.0),
+                   help="Seconds to wait after a close before a new entry (default 45)")
+    p.add_argument("--reset-recover", action="store_true",
+                   help="Reset recovery state to level 0 before starting")
     p.add_argument("--dry-run", action="store_true", help="Log signals only, no orders")
     p.add_argument("--execute", action="store_true", help="Send market orders (required for live)")
     p.add_argument("--force", action="store_true", help="Run even if DCA supervisor is active on symbol")
