@@ -9,6 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from ob_scalp_pnl import format_pnl_plain, load_pnl_stats
 from ob_scalp_recovery import format_status, load_state, journal_path
 from orderbook_dca_grid import (
     _resolve_hedge,
@@ -46,6 +47,9 @@ def snapshot(symbol: str, api: str, sec: str, recv: int, hedge: bool) -> str:
         lines.append(f"  SHORT qty={qs:g} entry={price_fmt(es)}  pnl {pnl:+.3f}%")
     if ql <= 0 and qs <= 0:
         lines.append("  flat")
+
+    stats = load_pnl_stats(sym)
+    lines.append(f"  {format_pnl_plain(stats)}")
 
     recovery = load_state(sym)
     if recovery.level > 0 or recovery.cumulative_loss_usdt > 0:

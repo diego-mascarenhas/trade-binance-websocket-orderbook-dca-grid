@@ -22,6 +22,15 @@ from pathlib import Path
 from typing import Any
 
 from ob_bars import BarBuilder, depth_to_levels
+from ob_ema import (
+    append_ema_log,
+    ema_allows,
+    fetch_ema_snapshot,
+    format_ema_console,
+)
+from ob_scalp_ml import load_models, predict_prob
+from ob_scalp_dataset import BarRecord, append_bar
+from ob_scalp_pnl import format_pnl_line, format_pnl_plain, load_pnl_stats, refresh_pnl_stats
 from ob_scalp_recovery import (
     RecoveryState,
     append_journal,
@@ -221,12 +230,57 @@ def _tp_sl_prices(entry: float, is_long: bool, tp_pct: float, sl_pct: float) -> 
     return entry * (1 - tp_pct / 100), entry * (1 + sl_pct / 100)
 
 
+def _trail_stop_price(pos: PositionState, trail_pct: float) -> float:
+    if pos.is_long:
+        return pos.extreme_mark * (1 - trail_pct / 100)
+    return pos.extreme_mark * (1 + trail_pct / 100)
+
+
+def _update_trail(pos: PositionState, mark: float, args: argparse.Namespace) -> None:
+    if args.trail_pct <= 0:
+        return
+    if pos.is_long:
+        pos.extreme_mark = max(pos.extreme_mark, mark)
+    else:
+        pos.extreme_mark = min(pos.extreme_mark, mark) if pos.extreme_mark > 0 else mark
+    pnl = profit_pct(pos.entry, mark, pos.is_long)
+    if not pos.trail_armed and pnl >= args.trail_arm_pct:
+        pos.trail_armed = True
+
+
+def _trail_triggered(pos: PositionState, mark: float, trail_pct: float) -> bool:
+    if not pos.trail_armed or trail_pct <= 0:
+        return False
+    stop = _trail_stop_price(pos, trail_pct)
+    if pos.is_long:
+        return mark <= stop
+    return mark >= stop
+
+
+def _print_pnl_summary(
+    sym: str,
+    pos: PositionState | None,
+    mark: float,
+) -> None:
+    stats = load_pnl_stats(sym)
+    unrealized = None
+    if pos is not None:
+        unrealized = _estimated_net_usdt(pos.entry, mark, pos.qty, pos.is_long, 0.08)
+    print(format_pnl_line(stats, unrealized_usdt=unrealized, compact=False))
+
+
 def _print_open_position(pos: PositionState, mark: float, args: argparse.Namespace) -> None:
     pnl = profit_pct(pos.entry, mark, pos.is_long)
     tp_px, sl_px = _tp_sl_prices(pos.entry, pos.is_long, args.tp_pct, args.sl_pct)
+    trail_note = ""
+    if args.trail_pct > 0:
+        if pos.trail_armed:
+            trail_note = f"  {GREEN}trail{RESET} stop {price_fmt(_trail_stop_price(pos, args.trail_pct))}"
+        else:
+            trail_note = f"  {DIM}trail arms @ +{args.trail_arm_pct:g}%{RESET}"
     print(
         f"  {_side_label(pos.is_long)} @ {price_fmt(pos.entry)}  "
-        f"pnl {pnl:+.3f}%  TP {price_fmt(tp_px)}  SL {price_fmt(sl_px)}",
+        f"pnl {pnl:+.3f}%  TP {price_fmt(tp_px)}  SL {price_fmt(sl_px)}{trail_note}",
     )
 
 
@@ -248,6 +302,11 @@ def _print_close_event(
     elif reason == "SL":
         print(
             f"{RED}SL hit{RESET} {side} {gross_pct:+.3f}% @ {price_fmt(exit_price)}",
+        )
+    elif reason == "TRAIL":
+        print(
+            f"{GREEN}Trail stop{RESET} {side} {gross_pct:+.3f}% "
+            f"(est. net {net:+.3f}%) @ {price_fmt(exit_price)}",
         )
     elif reason == "FLIP":
         print(
@@ -293,6 +352,12 @@ class PositionState:
     opened_at: float
     recovery_level: int = 0
     bars_held: int = 0
+    extreme_mark: float = 0.0
+    trail_armed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.extreme_mark <= 0:
+            self.extreme_mark = self.entry
 
 
 def _estimated_net_usdt(
@@ -355,6 +420,8 @@ def _handle_close(
 
     if not args.dry_run:
         market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
+    refresh_pnl_stats(sym)
+    _print_pnl_summary(sym, None, exit_price)
     return time.time()
 
 
@@ -371,6 +438,19 @@ def _opposite_position_open(
         return False, 0.0
     opp_qty, _ = get_position(sym, not is_long, hedge, api, sec, recv)
     return opp_qty > 0, opp_qty
+
+
+def _fetch_depth_retry(symbol: str, limit: int, *, tries: int = 3, pause: float = 2.0) -> dict:
+    last: Exception | None = None
+    for attempt in range(tries):
+        try:
+            return fetch_depth(symbol, limit)
+        except Exception as exc:
+            last = exc
+            if attempt + 1 < tries:
+                print(f"{YELLOW}Depth timeout/error (retry {attempt + 2}/{tries}): {exc}{RESET}")
+                time.sleep(pause)
+    raise last  # type: ignore[misc]
 
 
 def run_loop(args: argparse.Namespace) -> None:
@@ -424,24 +504,39 @@ def run_loop(args: argparse.Namespace) -> None:
     if args.recover:
         recover_note = f"\n  recover {format_status(recovery)}  max level {args.recover_max_level}"
         recover_note += f"\n  logs {Path('.run/logs') / sym}/scalp_trades.log"
+    ema_note = ""
+    if args.ema_filter:
+        ema_note = (
+            f"\n  EMA filter ON  {args.ema_fast}/{args.ema_slow} {args.ema_interval}  "
+            f"slope≥{args.ema_slope_min:g}% over {args.ema_slope_bars} bars"
+            f"\n  ema log {Path('.run/logs') / sym}/scalp_ema.log"
+        )
+    trail_note = ""
+    if args.trail_pct > 0:
+        trail_note = f"\n  trail stop {args.trail_pct:g}% after +{args.trail_arm_pct:g}% profit"
     print(
         f"\n{BOLD}{CYAN}OB scalp · {sym}{RESET}  {mode}\n"
         f"  bar {args.bar_sec:g}s  sample {args.sample_sec:g}s  band ±{args.band_pct:g}%\n"
         f"  entry imb long≥{args.imb_long:.2f} short≤{args.imb_short:.2f}  "
         f"TP +{args.tp_pct:g}%  SL -{args.sl_pct:g}%  max {args.max_bars} bars\n"
         f"  fee buffer {args.fee_buffer:g}% (no TP/flip close if net ≤ 0)  "
-        f"size {size_note}{recover_note}  Ctrl+C to stop\n",
+        f"size {size_note}{recover_note}{ema_note}{trail_note}  Ctrl+C to stop\n",
     )
+    refresh_pnl_stats(sym)
+    _print_pnl_summary(sym, None, _preview_mid if _preview_mid > 0 else 0.0)
 
     pos: PositionState | None = None
     last_close_at: float = 0.0
+    ml_model = load_models(sym) if args.ml_filter else None
+    if ml_model:
+        print(f"  {DIM}ML filter ON  min prob {args.ml_min_prob:.2f}{RESET}")
     builder.start_bar(time.time())
 
     try:
         while True:
             now = time.time()
             try:
-                depth = fetch_depth(sym, args.limit)
+                depth = _fetch_depth_retry(sym, args.limit)
                 bids, asks = depth_to_levels(depth)
             except Exception as exc:
                 print(f"{RED}Depth fetch failed: {exc}{RESET}")
@@ -473,10 +568,19 @@ def run_loop(args: argparse.Namespace) -> None:
 
             if pos is not None:
                 pnl = profit_pct(pos.entry, mark, pos.is_long)
+                _update_trail(pos, mark, args)
                 if should_tp_close(pnl, args.tp_pct, args.fee_buffer):
                     _print_close_event("TP", pos, pnl, mark, fee_buffer=args.fee_buffer)
                     last_close_at = _handle_close(
                         sym, pos, mark, pnl, "TP", args, recovery, hedge, filt, api, sec,
+                    )
+                    pos = None
+                elif _trail_triggered(pos, mark, args.trail_pct) and should_discretionary_close(
+                    pnl, args.fee_buffer,
+                ):
+                    _print_close_event("TRAIL", pos, pnl, mark, fee_buffer=args.fee_buffer)
+                    last_close_at = _handle_close(
+                        sym, pos, mark, pnl, "TRAIL", args, recovery, hedge, filt, api, sec,
                     )
                     pos = None
                 elif pnl >= args.tp_pct and not should_tp_close(pnl, args.tp_pct, args.fee_buffer):
@@ -497,10 +601,51 @@ def run_loop(args: argparse.Namespace) -> None:
                 time.sleep(args.sample_sec)
                 continue
 
-            signal = entry_signal(bar, sig_cfg)
-            print_bar(bar, signal)
+            ob_signal = entry_signal(bar, sig_cfg)
+            ema_snap = None
+            if args.ema_filter:
+                try:
+                    ema_snap = fetch_ema_snapshot(
+                        sym,
+                        interval=args.ema_interval,
+                        fast=args.ema_fast,
+                        slow=args.ema_slow,
+                        slope_bars=args.ema_slope_bars,
+                        slope_min_pct=args.ema_slope_min,
+                    )
+                except Exception as exc:
+                    print(f"{YELLOW}EMA fetch failed: {exc}{RESET}")
+
+            bar_rec = BarRecord.from_bar(bar, ob_signal=ob_signal, ema=ema_snap)
+            print_bar(bar, ob_signal)
+            append_bar(sym, bar_rec)
+            if ema_snap:
+                print(format_ema_console(ema_snap))
+                extra = f" ob={ob_signal or 'none'}" if ob_signal else ""
+                append_ema_log(sym, ema_snap.log_line() + extra)
+
+            signal = ob_signal
+            if signal and ema_snap and not ema_allows(signal, ema_snap):
+                print(
+                    f"{YELLOW}EMA filter block {signal.upper()} "
+                    f"(trend={ema_snap.trend}, slope={ema_snap.slope_pct:+.3f}%){RESET}",
+                )
+                append_ema_log(sym, f"BLOCK {signal.upper()} trend={ema_snap.trend}")
+                signal = None
+
+            if signal and ml_model and args.ml_filter:
+                prob = predict_prob(ml_model, bar_rec, signal)
+                if prob < args.ml_min_prob:
+                    print(
+                        f"{YELLOW}ML filter block {signal.upper()} "
+                        f"(prob={prob:.2f} < {args.ml_min_prob:.2f}){RESET}",
+                    )
+                    signal = None
+
             if pos is not None:
                 _print_open_position(pos, bar.mid_c, args)
+
+            _print_pnl_summary(sym, pos, bar.mid_c if pos else mark)
 
             if pos is not None:
                 pos.bars_held += 1
@@ -660,6 +805,10 @@ def parse_args() -> argparse.Namespace:
                    help="Take profit %% (default: 0.25)")
     p.add_argument("--sl-pct", type=float, default=_env_float("OB_SL_PCT", 0.15),
                    help="Stop loss %% (default: 0.15)")
+    p.add_argument("--trail-pct", type=float, default=_env_float("OB_TRAIL_PCT", 0.08),
+                   help="Trailing stop distance %% from peak/trough once armed (0=off, default 0.08)")
+    p.add_argument("--trail-arm-pct", type=float, default=_env_float("OB_TRAIL_ARM_PCT", 0.0),
+                   help="Arm trailing after this gross profit %% (default: half of --tp-pct)")
     p.add_argument("--fee-buffer", type=float, default=_env_float("OB_FEE_BUFFER", 0.08),
                    help="Round-trip fee estimate %%; TP/flip/max-bars skip close if gross-fee ≤ 0")
     p.add_argument("--max-bars", type=int, default=int(_env_float("OB_MAX_BARS", 5)),
@@ -680,6 +829,24 @@ def parse_args() -> argparse.Namespace:
                    help="Max martingale level (2^level multiplier cap, default 4 = 16x)")
     p.add_argument("--entry-cooldown-sec", type=float, default=_env_float("OB_ENTRY_COOLDOWN_SEC", 45.0),
                    help="Seconds to wait after a close before a new entry (default 45)")
+    p.add_argument("--ema-filter", action=argparse.BooleanOptionalAction,
+                   default=_env_bool("OB_EMA_FILTER", True),
+                   help="Require 1m EMA trend alignment for entries (default on)")
+    p.add_argument("--ema-interval", default=os.getenv("OB_EMA_INTERVAL", "1m").strip() or "1m",
+                   help="Kline interval for EMA filter (default 1m)")
+    p.add_argument("--ema-fast", type=int, default=int(_env_float("OB_EMA_FAST", 7)),
+                   help="Fast EMA period (default 7)")
+    p.add_argument("--ema-slow", type=int, default=int(_env_float("OB_EMA_SLOW", 25)),
+                   help="Slow EMA period (default 25)")
+    p.add_argument("--ema-slope-bars", type=int, default=int(_env_float("OB_EMA_SLOPE_BARS", 5)),
+                   help="Bars to measure fast EMA slope (default 5)")
+    p.add_argument("--ema-slope-min", type=float, default=_env_float("OB_EMA_SLOPE_MIN", 0.05),
+                   help="Min fast EMA slope %% for trend (default 0.05)")
+    p.add_argument("--ml-filter", action=argparse.BooleanOptionalAction,
+                   default=_env_bool("OB_ML_FILTER", True),
+                   help="Use RandomForest model from autotune if present (default on)")
+    p.add_argument("--ml-min-prob", type=float, default=_env_float("OB_ML_MIN_PROB", 0.48),
+                   help="Min ML win probability to enter (default 0.48)")
     p.add_argument("--reset-recover", action="store_true",
                    help="Reset recovery state to level 0 before starting")
     p.add_argument("--dry-run", action="store_true", help="Log signals only, no orders")
@@ -695,6 +862,8 @@ def main() -> None:
     load_env_file(None)
     args = parse_args()
     args.symbol = args.symbol.upper()
+    if args.trail_arm_pct <= 0 and args.trail_pct > 0:
+        args.trail_arm_pct = max(args.tp_pct * 0.5, args.fee_buffer + 0.02)
 
     if not args.dry_run and not args.execute:
         print(
