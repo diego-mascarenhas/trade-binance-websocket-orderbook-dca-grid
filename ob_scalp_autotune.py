@@ -28,6 +28,7 @@ from ob_scalp_ml import (
 )
 from ob_signals import SignalConfig, entry_signal
 from orderbook_dca_grid import fetch_depth, load_env_file
+from trade_sounds import pacman_available
 
 ROOT = Path(__file__).resolve().parent
 
@@ -186,12 +187,16 @@ def start_bot(
         log(symbol, f"ML filter OFF ({bars_n}/40 bars for reliable model)")
 
     out = open(stdout_path(symbol), "a", encoding="utf-8")
+    env = os.environ.copy()
+    if not env.get("OB_SOUND_PACK", "").strip() and pacman_available():
+        env.setdefault("OB_SOUND_PACK", "pacman")
     proc = subprocess.Popen(
         cmd,
         cwd=ROOT,
         stdout=out,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        env=env,
     )
     pid_path(symbol).write_text(str(proc.pid), encoding="utf-8")
     return proc.pid

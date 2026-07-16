@@ -30,7 +30,7 @@ from ob_ema import (
 )
 from ob_scalp_ml import load_models, predict_prob
 from ob_scalp_dataset import BarRecord, append_bar
-from ob_scalp_pnl import format_pnl_line, format_pnl_plain, load_pnl_stats, refresh_pnl_stats
+from ob_scalp_pnl import format_pnl_line, load_pnl_stats, refresh_pnl_stats
 from ob_scalp_recovery import (
     RecoveryState,
     append_journal,
@@ -51,6 +51,7 @@ from ob_signals import (
     should_discretionary_close,
     should_tp_close,
 )
+from trade_sounds import play_close_sound, play_sound, sound_pack_label, sounds_enabled
 
 from orderbook_dca_grid import (
     BOLD,
@@ -422,6 +423,13 @@ def _handle_close(
         market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
     refresh_pnl_stats(sym)
     _print_pnl_summary(sym, None, exit_price)
+    if not args.dry_run:
+        if reason in ("TP", "TRAIL"):
+            play_sound("tp")
+        elif reason == "SL":
+            play_sound("sl")
+        else:
+            play_close_sound(net_usdt)
     return time.time()
 
 
@@ -514,13 +522,17 @@ def run_loop(args: argparse.Namespace) -> None:
     trail_note = ""
     if args.trail_pct > 0:
         trail_note = f"\n  trail stop {args.trail_pct:g}% after +{args.trail_arm_pct:g}% profit"
+    sound_note = ""
+    if sounds_enabled() and not args.no_sounds:
+        pack = sound_pack_label()
+        sound_note = f"\n  sounds ON ({pack}: entry/dca/tp/sl)"
     print(
         f"\n{BOLD}{CYAN}OB scalp · {sym}{RESET}  {mode}\n"
         f"  bar {args.bar_sec:g}s  sample {args.sample_sec:g}s  band ±{args.band_pct:g}%\n"
         f"  entry imb long≥{args.imb_long:.2f} short≤{args.imb_short:.2f}  "
         f"TP +{args.tp_pct:g}%  SL -{args.sl_pct:g}%  max {args.max_bars} bars\n"
         f"  fee buffer {args.fee_buffer:g}% (no TP/flip close if net ≤ 0)  "
-        f"size {size_note}{recover_note}{ema_note}{trail_note}  Ctrl+C to stop\n",
+        f"size {size_note}{recover_note}{ema_note}{trail_note}{sound_note}  Ctrl+C to stop\n",
     )
     refresh_pnl_stats(sym)
     _print_pnl_summary(sym, None, _preview_mid if _preview_mid > 0 else 0.0)
@@ -748,6 +760,7 @@ def run_loop(args: argparse.Namespace) -> None:
                             f"OPEN {direction} qty={qty_f:g} notional={notional:.4f} "
                             f"level={recovery.level} ({recovery.multiplier:g}x)",
                         )
+                    play_sound("entry")
                 except RuntimeError as exc:
                     print(f"{RED}Market entry failed: {exc}{RESET}")
 
@@ -852,6 +865,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="Log signals only, no orders")
     p.add_argument("--execute", action="store_true", help="Send market orders (required for live)")
     p.add_argument("--force", action="store_true", help="Run even if DCA supervisor is active on symbol")
+    p.add_argument("--no-sounds", action="store_true", help="Disable local trade sounds (OB_SOUNDS=0)")
     p.add_argument("--position-mode", choices=["auto", "hedge", "oneway"], default="auto")
     p.add_argument("--recv-window", type=int, default=int(_env_float("RECV_WINDOW", 15000)))
     p.add_argument("--env-file", default=None)
@@ -864,6 +878,8 @@ def main() -> None:
     args.symbol = args.symbol.upper()
     if args.trail_arm_pct <= 0 and args.trail_pct > 0:
         args.trail_arm_pct = max(args.tp_pct * 0.5, args.fee_buffer + 0.02)
+    if args.no_sounds:
+        os.environ["OB_SOUNDS"] = "0"
 
     if not args.dry_run and not args.execute:
         print(

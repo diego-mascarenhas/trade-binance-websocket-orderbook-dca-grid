@@ -1325,6 +1325,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
           f"(auto re-arm grid + exit: {exit_mode_label(exit_mode)}, poll {args.tp_poll_sec:g}s{ttl_note}). "
           f"Ctrl+C to stop.{RESET}")
     import telegram_notify as telegram
+    import trade_sounds
     telegram.notify_supervise_started(args.symbol.upper(), exit_mode_label(exit_mode))
     armed_log_state: str | None = None
     last_position_qty: float = 0.0
@@ -1352,6 +1353,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             leverage=lev,
                             pnl_usdt=pnl,
                         )
+                        trade_sounds.play_sound("entry")
                     elif last_position_qty > 0 and qty > last_position_qty + float(filt["step_size"]) / 2:
                         dca_qty = qty - last_position_qty
                         old_notional = float(last_pos_meta.get("notional", 0) or 0)
@@ -1367,6 +1369,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             leverage=lev,
                             pnl_usdt=pnl,
                         )
+                        trade_sounds.play_sound("dca")
                     last_position_qty = qty
                     last_direction = direction
                     last_pos_meta = pos_meta
@@ -1418,6 +1421,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             leverage=lev,
                             pnl_usdt=float(last_pos_meta.get("unrealized_pnl", 0) or 0),
                         )
+                        trade_sounds.play_close_sound(float(last_pos_meta.get("unrealized_pnl", 0) or 0))
                     last_position_qty = 0.0
                     last_direction = None
                     last_pos_meta = {}
