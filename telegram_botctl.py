@@ -79,6 +79,7 @@ def handle_command(cmd: str, args: list[str]) -> str:
             "/start SYMBOL — start bot (position unchanged)\n"
             "/stop SYMBOL — stop bot (orders & position stay on Binance)\n"
             "/status SYMBOL — process + trading state\n"
+            "/cleanup SYMBOL — cancel obstage* Stop/TP algos (position unchanged)\n"
             "/review SYMBOL — DeepSeek situational review (position + market)\n"
             "/list — all running supervisors\n"
             f"Backend: {backend}"
@@ -106,6 +107,11 @@ def handle_command(cmd: str, args: list[str]) -> str:
             return review_symbol(args[0])
         except Exception as exc:
             return f"Review failed: {exc}"
+
+    if cmd == "/cleanup":
+        if not args:
+            return "Usage: /cleanup SYMBOL  (e.g. /cleanup HEIUSDT)"
+        return botctl.cleanup(args[0])
 
     return "Unknown command. Try /help"
 

@@ -325,6 +325,53 @@ def stop(symbol: str, backend: str | None = None) -> str:
     return f"ℹ️ {sym} was not running."
 
 
+def cleanup(symbol: str) -> str:
+    """Cancel open obstage* staged-exit algos on Binance (position unchanged)."""
+    sym = symbol.upper()
+    try:
+        from orderbook_dca_grid import load_keys
+        from orderbook_staged_exit import (
+            _algo_client_id,
+            cancel_all_staged_algos,
+            list_open_algo_orders,
+        )
+    except ImportError as exc:
+        return f"❌ Could not load bot modules: {exc}"
+
+    api, sec = load_keys(None)
+    if not api or not sec:
+        return "❌ No API keys in .env."
+
+    recv = int(_env("RECV_WINDOW", "15000") or "15000")
+    try:
+        before = [
+            o for o in list_open_algo_orders(sym, api, sec, recv)
+            if _algo_client_id(o).startswith("obstage")
+        ]
+        killed = cancel_all_staged_algos(sym, api, sec, recv)
+    except Exception as exc:
+        return f"❌ Cleanup failed for {sym}: {exc}"
+
+    after = [
+        o for o in list_open_algo_orders(sym, api, sec, recv)
+        if _algo_client_id(o).startswith("obstage")
+    ]
+    if killed:
+        msg = f"🧹 {sym} cleanup: cancelled {killed} obstage* algo(s)."
+    elif before:
+        msg = f"ℹ️ {sym} cleanup: algos already gone ({len(before)} were stale)."
+    else:
+        msg = f"ℹ️ {sym} cleanup: no open obstage* algos found."
+
+    if after:
+        msg += f"\n⚠️ {len(after)} obstage* algo(s) still open — retry or cancel in Binance UI."
+    elif before or killed:
+        msg += "\nRefresh Binance if Stop/TP lines still show (UI ghosts)."
+
+    body = trading_status(sym)
+    return f"{msg}\n\n{body}"
+
+
 def trading_status(symbol: str) -> str:
     """Short trading summary for Telegram (no ANSI)."""
     sym = symbol.upper()
@@ -437,7 +484,7 @@ def list_status(backend: str | None = None) -> str:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Control DCA supervisors per symbol (no position close on stop)")
-    p.add_argument("command", choices=["start", "stop", "status", "list", "running"])
+    p.add_argument("command", choices=["start", "stop", "status", "cleanup", "list", "running"])
     p.add_argument("symbol", nargs="?", help="Symbol e.g. SXTUSDT")
     p.add_argument("--backend", choices=["auto", "systemd", "pidfile"], default="auto")
     return p.parse_args()
@@ -450,7 +497,7 @@ def main() -> None:
     args = parse_args()
     backend = detect_backend() if args.backend == "auto" else args.backend
 
-    if args.command in ("start", "stop", "status") and not args.symbol:
+    if args.command in ("start", "stop", "status", "cleanup") and not args.symbol:
         print("Symbol required.", file=sys.stderr)
         sys.exit(1)
 
@@ -460,6 +507,8 @@ def main() -> None:
         print(stop(args.symbol, backend))
     elif args.command == "status":
         print(status(args.symbol, backend))
+    elif args.command == "cleanup":
+        print(cleanup(args.symbol))
     elif args.command in ("list", "running"):
         print(list_status(backend))
 
