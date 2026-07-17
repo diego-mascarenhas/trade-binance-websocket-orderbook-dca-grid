@@ -203,6 +203,29 @@ def _pad_trunc(text: str, width: int) -> str:
     return f"{s:<{width}}"
 
 
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _visible_len(s: str) -> int:
+    return len(_ANSI_RE.sub("", s))
+
+
+def _pad_visible(s: str, width: int) -> str:
+    pad = width - _visible_len(s)
+    return s + (" " * pad if pad > 0 else "")
+
+
+def _zip_columns(left: list[str], right: list[str], *, left_w: int, gap: str = "  │ ") -> list[str]:
+    """Place two text columns side by side (ANSI-aware left padding)."""
+    n = max(len(left), len(right))
+    out: list[str] = []
+    for i in range(n):
+        L = left[i] if i < len(left) else ""
+        R = right[i] if i < len(right) else ""
+        out.append(_pad_visible(L, left_w) + gap + R)
+    return out
+
+
 def _format_report(
     symbols: str | list[str],
     *,
@@ -314,7 +337,7 @@ def _format_report(
         f"{DIM}{wins}W/{losses}L · {len(closes)} trades{RESET}"
     )
 
-    # Per-trigger breakdown (attribute full tag; also expand components)
+    # Per-trigger breakdown (left) + combo block / auto-disable (right)
     by_tag: dict[str, list[float]] = defaultdict(list)
     by_part: dict[str, list[float]] = defaultdict(list)
     for r in closes:
@@ -324,30 +347,92 @@ def _format_report(
             part = part.strip() or "unknown"
             by_part[part].append(r.pnl or 0.0)
 
+    left_col: list[str] = []
     if any(t != "unknown" for t in by_tag):
-        tag_w = min(56, max(28, max((len(t) for t in by_tag), default=28)))
-        part_w = min(32, max(20, max((len(t) for t in by_part), default=20)))
-        wl_w = 12  # e.g. "13W/4L"
-        lines.append(f"\n{BOLD}By trigger tag{RESET}")
+        tag_w = min(48, max(28, max((len(t) for t in by_tag), default=28)))
+        part_w = min(28, max(18, max((len(t) for t in by_part), default=18)))
+        wl_w = 10
+        left_col.append(f"{BOLD}By trigger tag{RESET}")
         for tag, pnls in sorted(by_tag.items(), key=lambda x: sum(x[1]), reverse=True):
             s = sum(pnls)
             w = sum(1 for p in pnls if p > 0)
             l = len(pnls) - w
             c = GREEN if s > 0 else RED if s < 0 else DIM
             wl = f"{w}W/{l}L"
-            lines.append(
-                f"  {_pad_trunc(tag, tag_w)} {c}{s:+10.4f}{RESET}  {DIM}{wl:<{wl_w}} · {len(pnls)}{RESET}"
+            left_col.append(
+                f"  {_pad_trunc(tag, tag_w)} {c}{s:+8.4f}{RESET}  {DIM}{wl:<{wl_w}} · {len(pnls)}{RESET}"
             )
-        lines.append(f"\n{BOLD}By trigger component{RESET}  {DIM}(credit each part of a combo){RESET}")
+        left_col.append("")
+        left_col.append(f"{BOLD}By trigger component{RESET}  {DIM}(each part){RESET}")
         for part, pnls in sorted(by_part.items(), key=lambda x: sum(x[1]), reverse=True):
             s = sum(pnls)
             w = sum(1 for p in pnls if p > 0)
             l = len(pnls) - w
             c = GREEN if s > 0 else RED if s < 0 else DIM
             wl = f"{w}W/{l}L"
-            lines.append(
-                f"  {_pad_trunc(part, part_w)} {c}{s:+10.4f}{RESET}  {DIM}{wl:<{wl_w}} · {len(pnls)}{RESET}"
+            left_col.append(
+                f"  {_pad_trunc(part, part_w)} {c}{s:+8.4f}{RESET}  {DIM}{wl:<{wl_w}} · {len(pnls)}{RESET}"
             )
+
+    right_col: list[str] = []
+    try:
+        from ob_trig_learn import blocked_tag_map, tag_max_losses
+
+        max_l = tag_max_losses()
+        blocked = blocked_tag_map(force=True)
+        right_col.append(f"{BOLD}Trig combo block{RESET}  {DIM}(≥{max_l}L){RESET}")
+        if blocked:
+            btag_w = 36
+            for tag, info in sorted(
+                blocked.items(),
+                key=lambda x: (int(x[1].get("losses", 0)), float(x[1].get("pnl", 0))),
+                reverse=True,
+            )[:18]:
+                pnl = float(info.get("pnl", 0))
+                c = GREEN if pnl > 0 else RED if pnl < 0 else DIM
+                wl = f"{info.get('wins', 0)}W/{info.get('losses', 0)}L"
+                right_col.append(
+                    f"  {_pad_trunc(tag, btag_w)} {c}{pnl:+8.4f}{RESET}  "
+                    f"{DIM}{wl:<8}BLOCK{RESET}"
+                )
+            if len(blocked) > 18:
+                right_col.append(f"  {DIM}… +{len(blocked) - 18} more{RESET}")
+        else:
+            right_col.append(f"  {DIM}none{RESET}")
+    except Exception as exc:
+        right_col.append(f"{DIM}Trig combo block unavailable: {exc}{RESET}")
+
+    try:
+        from ob_trig_learn import format_disabled_summary, load_disabled, refresh_trig_disabled
+
+        refresh_trig_disabled()
+        disabled = load_disabled()
+        if right_col:
+            right_col.append("")
+        right_col.append(f"{BOLD}Trig auto-disable{RESET}  {DIM}(n≥15){RESET}")
+        if disabled:
+            for name, info in sorted(disabled.items(), key=lambda x: float(x[1].get("pnl", 0))):
+                right_col.append(
+                    f"  {_pad_trunc(str(name), 22)} {RED}{float(info.get('pnl', 0)):+.4f}{RESET}  "
+                    f"{DIM}{info.get('wins', 0)}W/{info.get('losses', 0)}L OFF{RESET}"
+                )
+        else:
+            right_col.append(f"  {DIM}{format_disabled_summary(disabled)}{RESET}")
+    except Exception as exc:
+        if right_col:
+            right_col.append("")
+        right_col.append(f"{DIM}Trig auto-disable unavailable: {exc}{RESET}")
+
+    if left_col or right_col:
+        lines.append("")
+        left_w = max((_visible_len(x) for x in left_col), default=40)
+        left_w = max(40, min(left_w, 78))
+        if left_col and right_col:
+            lines.extend(_zip_columns(left_col, right_col, left_w=left_w))
+        elif left_col:
+            lines.extend(left_col)
+        else:
+            lines.extend(right_col)
 
     # ML / learning snapshot (per symbol)
     lines.append(f"\n{BOLD}ML learning{RESET}")
@@ -383,55 +468,6 @@ def _format_report(
             f"  {s:<14} {bars_n:>5} {samp_n:>5} {cv_l_s:>6} {cv_s_s:>6} "
             f"{ml_s:>5} {bt_wr_s:>6} {bt_n_s:>5}  {DIM}{ada_note}{RESET}"
         )
-
-    try:
-        from ob_trig_learn import format_disabled_summary, load_disabled, refresh_trig_disabled
-
-        refresh_trig_disabled()
-        disabled = load_disabled()
-        lines.append(
-            f"\n{BOLD}Trig auto-disable{RESET}  {DIM}(n≥15 · pnl<0 · wr≤45%){RESET}"
-        )
-        if disabled:
-            for name, info in sorted(disabled.items(), key=lambda x: float(x[1].get("pnl", 0))):
-                lines.append(
-                    f"  {name:<28} {RED}{float(info.get('pnl', 0)):+.4f}{RESET}  "
-                    f"{DIM}{info.get('wins', 0)}W/{info.get('losses', 0)}L · "
-                    f"n={info.get('n', 0)} · OFF{RESET}"
-                )
-        else:
-            lines.append(f"  {DIM}{format_disabled_summary(disabled)}{RESET}")
-    except Exception as exc:
-        lines.append(f"\n{DIM}Trig auto-disable unavailable: {exc}{RESET}")
-
-    try:
-        from ob_trig_learn import blocked_tag_map, tag_max_losses
-
-        max_l = tag_max_losses()
-        blocked = blocked_tag_map(force=True)
-        lines.append(
-            f"\n{BOLD}Trig combo block{RESET}  {DIM}(exact tag · ≥{max_l}L){RESET}"
-        )
-        if blocked:
-            tag_w = 48
-            for tag, info in sorted(
-                blocked.items(),
-                key=lambda x: (int(x[1].get("losses", 0)), float(x[1].get("pnl", 0))),
-                reverse=True,
-            )[:20]:
-                pnl = float(info.get("pnl", 0))
-                c = GREEN if pnl > 0 else RED if pnl < 0 else DIM
-                wl = f"{info.get('wins', 0)}W/{info.get('losses', 0)}L"
-                lines.append(
-                    f"  {_pad_trunc(tag, tag_w)} {c}{pnl:+10.4f}{RESET}  "
-                    f"{DIM}{wl:<12} · BLOCK{RESET}"
-                )
-            if len(blocked) > 20:
-                lines.append(f"  {DIM}… +{len(blocked) - 20} more{RESET}")
-        else:
-            lines.append(f"  {DIM}none{RESET}")
-    except Exception as exc:
-        lines.append(f"\n{DIM}Trig combo block unavailable: {exc}{RESET}")
 
     for s in syms:
         recovery = load_state(s)
