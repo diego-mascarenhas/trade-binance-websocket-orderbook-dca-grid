@@ -21,6 +21,9 @@ from pathlib import Path
 
 from ob_scalp_recovery import format_status, journal_path, load_state
 from ob_scalp_stack import active_symbol, load_active, running_symbols
+from ob_scalp_adaptive import load_adaptive, load_trade_samples
+from ob_scalp_dataset import load_bars
+from ob_scalp_ml import load_tuned
 
 ROOT = Path(__file__).resolve().parent
 LOG_ROOT = ROOT / ".run" / "logs"
@@ -299,6 +302,41 @@ def _format_report(
             lines.append(
                 f"  {part:<{part_w}} {c}{s:+10.4f}{RESET}  {DIM}{wl:<{wl_w}} · {len(pnls)}{RESET}"
             )
+
+    # ML / learning snapshot (per symbol)
+    lines.append(f"\n{BOLD}ML learning{RESET}")
+    lines.append(
+        f"{DIM}  {'Symbol':<14} {'Bars':>5} {'Samp':>5} {'CV L':>6} {'CV S':>6} "
+        f"{'ml≥':>5} {'BT WR':>6} {'BT n':>5}  Adaptive{RESET}"
+    )
+    for s in syms:
+        bars_n = len(load_bars(s))
+        samp_n = len(load_trade_samples(s, limit=5000))
+        tuned, meta = load_tuned(s)
+        ml = meta.get("ml") or {}
+        stats = meta.get("stats") or {}
+        cv_l = ml.get("cv_long")
+        cv_s = ml.get("cv_short")
+        cv_l_s = f"{float(cv_l):.2f}" if cv_l is not None else "—"
+        cv_s_s = f"{float(cv_s):.2f}" if cv_s is not None else "—"
+        ml_floor = tuned.ml_min_prob if tuned else None
+        ml_s = f"{ml_floor:.2f}" if ml_floor is not None else "—"
+        bt_wr = stats.get("win_rate")
+        bt_n = stats.get("trades")
+        bt_wr_s = f"{float(bt_wr)*100:.0f}%" if bt_wr is not None else "—"
+        bt_n_s = f"{int(float(bt_n))}" if bt_n is not None else "—"
+        try:
+            ada = load_adaptive(s)
+            ada_note = (
+                f"ml≥{ada.ml_min_prob:.2f} {ada.wins}W/{ada.losses}L "
+                f"({ada.trades} live)"
+            )
+        except Exception:
+            ada_note = "—"
+        lines.append(
+            f"  {s:<14} {bars_n:>5} {samp_n:>5} {cv_l_s:>6} {cv_s_s:>6} "
+            f"{ml_s:>5} {bt_wr_s:>6} {bt_n_s:>5}  {DIM}{ada_note}{RESET}"
+        )
 
     for s in syms:
         recovery = load_state(s)
