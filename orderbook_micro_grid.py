@@ -4,22 +4,26 @@
 Default grid mode is **Fibonacci** (5m swing impulse → retrace levels).
 Geometric ``--grid-mode step`` remains available as fallback.
 
-On each entry cycle (when flat):
-  1. MARKET base size
-  2. LIMIT adds (Fib retraces or geometric steps) — complete grid
-  3. TAKE_PROFIT_MARKET + STOP_MARKET (exchange algos)
+Fib entry (default):
+  1. Detect swing + FVG on 5m
+  2. Place LIMIT grid on Fib retraces (no MARKET chase)
+  3. On first fill → arm TP at swing high/low + SL beyond origin
+  4. If no fill before timeout / SL blown → disarm and wait for next setup
 
 Optional ``--sweep``: when a grid level fills, re-place it one step further
 (barrido). Launch wiring comes later — run this file directly for now.
 
 Usage:
-  python3 orderbook_micro_grid.py LDOUSDT --dry-run
-  python3 orderbook_micro_grid.py LDOUSDT --execute --direction long
-  python3 orderbook_micro_grid.py LDOUSDT --grid-mode step --step-pct 0.08
+  ./obmicro-grid LDOUSDT                 # execute · fib 1m · direction auto
+  ./obmicro-grid LDOUSDT --dry-run
+  ./obmicro-grid LDOUSDT --direction long --fib-interval 5m
 
 Env (optional):
-  OB_MG_GRID_MODE=fib  OB_MG_FIB_INTERVAL=5m  OB_MG_FIB_MIN_RANGE=0.40
+  OB_MG_GRID_MODE=fib  OB_MG_FIB_INTERVAL=1m  OB_MG_FIB_MIN_RANGE=0.40
   OB_MG_FVG_MIN_PCT=0.25  OB_MG_REQUIRE_FVG=1
+  OB_MG_WAIT_PULLBACK=1  OB_MG_ARM_TIMEOUT_SEC=900
+  OB_MG_RAISE_TOP=1  OB_MG_RAISE_MIN_PCT=0.05
+  OB_MG_TP_MODE=avg  OB_MG_TP_PCT=0.35
   OB_MG_BASE_SIZE=10  OB_MG_LEVEL_SIZE=8  OB_MG_BAR_SEC=15
 """
 
@@ -195,9 +199,55 @@ class GridPlan:
 
 # Default Fib retracement set (closest → deepest). Truncated by --levels.
 FIB_RETRACES = (0.236, 0.382, 0.5, 0.618, 0.786)
-FIB_TP_EXT = 1.272  # extension beyond impulse end
+FIB_TP_EXT = 1.272  # extension beyond impulse end (legacy / swing-mode helper)
 FIB_SL_BUF = 0.15   # % beyond swing origin
 FVG_MIN_PCT = 0.25  # min FVG height as % of mid price
+# TP after fills: avg = from live average (+ tp_pct); swing = fixed at impulse extreme
+TP_MODE_DEFAULT = "avg"
+
+
+def resolve_tp_price(
+    is_long: bool,
+    entry_avg: float,
+    plan: GridPlan | None,
+    *,
+    tp_mode: str,
+    tp_pct: float,
+    first_fill: bool = False,
+) -> float:
+    """Compute live TP.
+
+    - ``swing``: always impulse extreme.
+    - ``avg`` (default): first fill stays at swing max; later compensations use
+      average ± tp_pct (capped by swing extreme so TP does not stay too far).
+    """
+    mode = (tp_mode or TP_MODE_DEFAULT).strip().lower()
+    swing_tp = 0.0
+    if plan is not None:
+        swing_tp = float(plan.tp_price)
+        if plan.swing is not None:
+            swing_tp = plan.swing.high if is_long else plan.swing.low
+
+    if mode in ("swing", "high", "max"):
+        return swing_tp if swing_tp > 0 else (
+            entry_avg * (1 + tp_pct / 100) if is_long else entry_avg * (1 - tp_pct / 100)
+        )
+
+    # avg mode: first fill = punto máximo; compensations pull TP toward avg
+    if first_fill and swing_tp > 0:
+        return swing_tp
+
+    if entry_avg <= 0:
+        return swing_tp
+    if is_long:
+        tp = entry_avg * (1 + max(tp_pct, 0.05) / 100)
+        if swing_tp > 0:
+            tp = min(tp, swing_tp)
+        return tp
+    tp = entry_avg * (1 - max(tp_pct, 0.05) / 100)
+    if swing_tp > 0:
+        tp = max(tp, swing_tp)
+    return tp
 
 
 def detect_swing_impulse(
@@ -355,7 +405,6 @@ def build_fib_grid(
     """Retrace grid on swing; only levels on the adverse side of ``entry``."""
     if entry <= 0 or swing.span <= 0:
         raise ValueError("invalid entry/swing for fib grid")
-    _, base_qty = qty_for_notional(base_usdt, entry, filt)
     n_take = max(1, min(int(levels), len(FIB_RETRACES)))
     ratios = list(FIB_RETRACES[:n_take])
 
@@ -363,14 +412,16 @@ def build_fib_grid(
     for i, r in enumerate(ratios, start=1):
         if is_long:
             px = swing.high - swing.span * r
-            # Must be below entry (pullback buys)
+            # Must be below mark (pullback buys) — wait for retrace, no chase
             if px >= entry * 0.9995:
                 continue
         else:
             px = swing.low + swing.span * r
             if px <= entry * 1.0005:
                 continue
-        _, qty = qty_for_notional(level_usdt, px, filt)
+        # Shallowest fill gets base size; deeper rungs use level_usdt
+        size = base_usdt if not rows else level_usdt
+        _, qty = qty_for_notional(size, px, filt)
         dist = (px / entry - 1.0) * 100
         rows.append(
             GridLevel(
@@ -387,39 +438,55 @@ def build_fib_grid(
     for i, lv in enumerate(rows, start=1):
         lv.idx = i
 
-    cum_q = base_qty
-    cum_n = float(base_qty) * entry
+    if not rows:
+        # No levels under mark yet — still return empty for caller to skip
+        _, base_qty = qty_for_notional(base_usdt, entry, filt)
+        return GridPlan(
+            is_long=is_long,
+            entry=entry,
+            base_usdt=float(base_qty) * entry,
+            base_qty=base_qty,
+            levels=[],
+            tp_price=swing.high if is_long else swing.low,
+            sl_price=swing.low if is_long else swing.high,
+            planned_qty=0.0,
+            planned_avg=entry,
+            mode="fib",
+            note="no fib levels below/above mark yet",
+            swing=swing,
+            fvg=fvg,
+        )
+
+    cum_q = 0.0
+    cum_n = 0.0
     for lv in rows:
         cum_q += lv.qty
         cum_n += lv.size_usdt
     planned_avg = cum_n / cum_q if cum_q > 0 else entry
+    base_qty = rows[0].qty
+    base_usdt_eff = rows[0].size_usdt
 
-    # TP: max(extension, pct from entry); SL: beyond swing origin
+    # TP at swing extreme (punto máximo / mínimo). SL beyond origin.
     if is_long:
-        tp_ext_px = swing.high + swing.span * max(0.0, tp_ext - 1.0)
-        tp_pct_px = entry * (1 + tp_pct / 100)
-        tp = max(tp_ext_px, tp_pct_px)
+        tp = swing.high
         sl_swing = swing.low * (1 - sl_buf_pct / 100)
         sl_pct_px = entry * (1 - sl_pct / 100)
         sl = min(sl_swing, sl_pct_px)
-        if rows:
-            deepest = min(lv.price for lv in rows)
-            sl = min(sl, deepest * (1 - sl_buf_pct / 100))
+        deepest = min(lv.price for lv in rows)
+        sl = min(sl, deepest * (1 - sl_buf_pct / 100))
     else:
-        tp_ext_px = swing.low - swing.span * max(0.0, tp_ext - 1.0)
-        tp_pct_px = entry * (1 - tp_pct / 100)
-        tp = min(tp_ext_px, tp_pct_px)
+        tp = swing.low
         sl_swing = swing.high * (1 + sl_buf_pct / 100)
         sl_pct_px = entry * (1 + sl_pct / 100)
         sl = max(sl_swing, sl_pct_px)
-        if rows:
-            deepest = max(lv.price for lv in rows)
-            sl = max(sl, deepest * (1 + sl_buf_pct / 100))
+        deepest = max(lv.price for lv in rows)
+        sl = max(sl, deepest * (1 + sl_buf_pct / 100))
 
     note = (
         f"fib {swing.interval} swing "
         f"{price_fmt(swing.low)}→{price_fmt(swing.high)} "
-        f"({swing.range_pct:.2f}%) · TP ext {tp_ext:g}"
+        f"({swing.range_pct:.2f}%) · TP ref @ swing {'high' if is_long else 'low'} "
+        f"· wait pullback"
     )
     if fvg is not None:
         note += (
@@ -429,7 +496,7 @@ def build_fib_grid(
     return GridPlan(
         is_long=is_long,
         entry=entry,
-        base_usdt=float(base_qty) * entry,
+        base_usdt=base_usdt_eff,
         base_qty=base_qty,
         levels=rows,
         tp_price=tp,
@@ -622,25 +689,114 @@ def render_plan(symbol: str, plan: GridPlan) -> str:
     mode = plan.mode.upper()
     lines = [
         f"{BOLD}{CYAN}Micro-grid · {symbol.upper()} · {color}{side}{RESET}  {DIM}[{mode}]{RESET}",
-        f"{DIM}entry {price_fmt(plan.entry)}  ·  "
-        f"base {plan.base_usdt:.2f} USDT  ·  "
-        f"{len(plan.levels)} levels  ·  "
-        f"TP {price_fmt(plan.tp_price)}  SL {price_fmt(plan.sl_price)}  ·  "
-        f"planned avg {price_fmt(plan.planned_avg)} ({plan.planned_qty:g} qty){RESET}",
+        f"{DIM}mark {price_fmt(plan.entry)}  ·  "
+        f"{len(plan.levels)} LIMIT levels  ·  "
+        f"TP ref {price_fmt(plan.tp_price)} (swing)  SL {price_fmt(plan.sl_price)}  ·  "
+        f"planned {plan.planned_qty:g} qty · avg {price_fmt(plan.planned_avg)}{RESET}",
     ]
     if plan.note:
         lines.append(f"{DIM}{plan.note}{RESET}")
+    # Preview live TP if avg-mode (from planned avg)
+    # actual mode comes from CLI at runtime — show both hints
+    lines.append(
+        f"{DIM}TP: 1st fill @ swing max · later fills avg+tp% (or --tp-mode swing = always max){RESET}"
+    )
+
+    if plan.mode == "fib" and plan.swing is not None:
+        swing = plan.swing
+        mark = plan.entry
+        limit_by_r = {
+            round(lv.fib_ratio, 3): lv
+            for lv in plan.levels
+            if lv.fib_ratio is not None
+        }
+        # Full ladder: 0 (TP/impulse high) → retraces → 1 (origin) → SL
+        ladder_ratios = (0.0, *FIB_RETRACES, 1.0)
+        lines += [
+            "",
+            f"{'LEVEL':<14} {'ROLE':<10} {'PRICE':>14} {'Δ mark':>9} {'LIMIT':>18}",
+            f"{DIM}{'-' * 70}{RESET}",
+        ]
+        rows_out: list[tuple[float, str, str, float, str]] = []
+        for r in ladder_ratios:
+            if plan.is_long:
+                px = swing.high - swing.span * r
+            else:
+                px = swing.low + swing.span * r
+            if r <= 0.0:
+                role = "TP"
+                label = "Fib 0.000"
+            elif r >= 1.0:
+                role = "ORIGIN"
+                label = "Fib 1.000"
+            else:
+                role = "GRID"
+                label = f"Fib {r:.3f}"
+            lv = limit_by_r.get(round(r, 3))
+            if lv is not None:
+                lim = f"{lv.qty:g} / {lv.size_usdt:.2f}U"
+                role = "LIMIT"
+            elif role == "GRID":
+                lim = "—"
+            else:
+                lim = "—"
+            rows_out.append((px, label, role, r, lim))
+
+        # SL row (beyond origin)
+        rows_out.append((plan.sl_price, "SL", "SL", -1.0, "algo"))
+
+        # Sort: long = high→low; short = low→high (toward adverse)
+        rows_out.sort(key=lambda x: x[0], reverse=plan.is_long)
+
+        mark_drawn = False
+        for px, label, role, r, lim in rows_out:
+            dist = (px / mark - 1.0) * 100 if mark > 0 else 0.0
+            # Insert mark marker once when we cross it
+            if not mark_drawn:
+                if plan.is_long and px <= mark:
+                    lines.append(
+                        f"{CYAN}{'▶ MARK':<14} {'live':<10} {price_fmt(mark):>14} "
+                        f"{'0.00%':>9} {'':>18}{RESET}"
+                    )
+                    mark_drawn = True
+                elif not plan.is_long and px >= mark:
+                    lines.append(
+                        f"{CYAN}{'▶ MARK':<14} {'live':<10} {price_fmt(mark):>14} "
+                        f"{'0.00%':>9} {'':>18}{RESET}"
+                    )
+                    mark_drawn = True
+            role_c = GREEN if role == "TP" else RED if role == "SL" else (
+                YELLOW if role == "LIMIT" else DIM
+            )
+            lines.append(
+                f"{label:<14} {role_c}{role:<10}{RESET} {price_fmt(px):>14} "
+                f"{dist:>+8.2f}% {lim:>18}"
+            )
+        if not mark_drawn:
+            lines.append(
+                f"{CYAN}{'▶ MARK':<14} {'live':<10} {price_fmt(mark):>14} "
+                f"{'0.00%':>9} {'':>18}{RESET}"
+            )
+        if plan.fvg is not None:
+            lines.append(
+                f"{DIM}FVG zone {price_fmt(plan.fvg.low)}–{price_fmt(plan.fvg.high)} "
+                f"({plan.fvg.size_pct:.2f}%){RESET}"
+            )
+        lines.append(f"{DIM}(LIMIT only on GRID rows · TP/SL armed after first fill){RESET}")
+        return "\n".join(lines)
+
+    # step mode — simple list
     lines += [
         "",
         f"{'ORDER':<12} {'QTY':>12} {'PRICE':>14} {'Δ%':>8} {'USDT':>10}",
         f"{DIM}{'-' * 60}{RESET}",
-        f"{'Base':<12} {plan.base_qty:>12g} {price_fmt(plan.entry):>14} {'0.00':>8} {plan.base_usdt:>10.2f}",
     ]
     for lv in plan.levels:
         lines.append(
             f"{lv.name:<12} {lv.qty:>12g} {price_fmt(lv.price):>14} "
             f"{lv.dist_pct:>+7.2f}% {lv.size_usdt:>10.2f}"
         )
+    lines.append(f"{DIM}(no MARKET — wait for pullback fills; disarm if timeout){RESET}")
     return "\n".join(lines)
 
 
@@ -864,7 +1020,9 @@ def place_exchange_exits(
 
 @dataclass
 class CycleState:
-    active: bool = False
+    active: bool = False       # position open
+    pending: bool = False      # grid LIMITs armed, waiting for pullback fill
+    exits_armed: bool = False
     is_long: bool = True
     entry: float = 0.0
     plan: GridPlan | None = None
@@ -873,9 +1031,12 @@ class CycleState:
     last_qty: float = 0.0
     filled_levels: set[int] = field(default_factory=set)
     opened_at: float = 0.0
+    armed_at: float = 0.0
+    last_swing_check_at: float = 0.0
+    swing_high_anchor: float = 0.0  # last raised top (long) / bottom (short)
 
 
-def open_cycle(
+def arm_cycle(
     symbol: str,
     plan: GridPlan,
     mark: float,
@@ -886,28 +1047,62 @@ def open_cycle(
     recv: int,
     *,
     dry_run: bool,
+    wait_pullback: bool,
+    args: argparse.Namespace | None = None,
 ) -> CycleState:
-    """Place base MARKET + full LIMIT grid + TP/SL in one shot."""
+    """Arm full LIMIT grid (+ optional market base). TP/SL only after first fill when waiting."""
     print(render_plan(symbol, plan))
     append_journal(
         symbol,
-        f"PLAN {plan.mode} {'LONG' if plan.is_long else 'SHORT'} entry={plan.entry:.8g} "
+        f"PLAN {plan.mode} {'LONG' if plan.is_long else 'SHORT'} mark={plan.entry:.8g} "
         f"levels={len(plan.levels)} tp={plan.tp_price:.8g} sl={plan.sl_price:.8g} "
-        f"{plan.note}",
+        f"wait={int(wait_pullback)} {plan.note}",
     )
 
     if dry_run:
         print(f"{YELLOW}Dry-run — no orders sent{RESET}")
-        return CycleState(active=False)
+        return CycleState(active=False, pending=False)
 
+    if not plan.levels and wait_pullback:
+        print(f"{YELLOW}No LIMIT levels to arm{RESET}")
+        return CycleState(active=False, pending=False)
+
+    # Cancel any prior leftover
+    cancel_our_grid(symbol, api, sec, recv)
+    cancel_our_exits(symbol, api, sec, recv)
+
+    if wait_pullback:
+        print(f"{BOLD}Arming pullback grid ({len(plan.levels)} LIMITs) — no MARKET…{RESET}")
+        n = place_grid_limits(symbol, plan, filt, hedge, api, sec, recv)
+        append_journal(symbol, f"ARM grid={n}/{len(plan.levels)} wait_pullback")
+        print(
+            f"{CYAN}Waiting for fill · 1st TP @ swing max {price_fmt(plan.tp_price)} "
+            f"· then avg±tp% · SL {price_fmt(plan.sl_price)}{RESET}"
+        )
+        return CycleState(
+            active=False,
+            pending=True,
+            exits_armed=False,
+            is_long=plan.is_long,
+            entry=0.0,
+            plan=plan,
+            tp=plan.tp_price,
+            sl=plan.sl_price,
+            last_qty=0.0,
+            armed_at=time.time(),
+            last_swing_check_at=time.time(),
+            swing_high_anchor=plan.swing.high if plan.swing and plan.is_long else (
+                plan.swing.low if plan.swing else 0.0
+            ),
+        )
+
+    # Legacy chase path: MARKET base then grid + exits
     qty_str, _ = qty_for_notional(plan.base_usdt, plan.entry, filt)
     print(f"\n{BOLD}Opening MARKET base {qty_str}…{RESET}")
     market_open(symbol, plan.is_long, qty_str, hedge, api, sec, recv)
     time.sleep(0.35)
-
     qty, entry = get_position(symbol, plan.is_long, hedge, api, sec, recv)
     if qty <= 0 or entry <= 0:
-        # fallback to plan
         entry = plan.entry
         qty = plan.base_qty
     print(f"{GREEN}✓ Base filled ~{qty:g} @ {price_fmt(entry)}{RESET}")
@@ -917,23 +1112,19 @@ def open_cycle(
     n = place_grid_limits(symbol, plan, filt, hedge, api, sec, recv)
     append_journal(symbol, f"GRID placed={n}/{len(plan.levels)}")
 
-    # Arm exits for current qty (refresh later if adds fill)
     print(f"{BOLD}Arming exchange TP/SL…{RESET}")
-    if plan.entry > 0 and entry > 0:
-        scale = entry / plan.entry
-        tp_p = plan.tp_price * scale
-        sl_p = plan.sl_price * scale
-    else:
-        tp_p, sl_p = plan.tp_price, plan.sl_price
-
+    tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT)) if args else TP_MODE_DEFAULT
+    tp_pct = float(getattr(args, "tp_pct", 0.35)) if args else 0.35
+    tp_target = resolve_tp_price(plan.is_long, entry, plan, tp_mode=tp_mode, tp_pct=tp_pct, first_fill=True)
     tp, sl = place_exchange_exits(
         symbol, plan.is_long, qty, entry, mark or entry,
-        tp_p, sl_p, filt, hedge, api, sec, recv,
+        tp_target, plan.sl_price, filt, hedge, api, sec, recv,
     )
-    append_journal(symbol, f"EXITS tp={tp:.8g} sl={sl:.8g} qty={qty:g}")
-
+    append_journal(symbol, f"EXITS tp={tp:.8g} sl={sl:.8g} qty={qty:g} tp_mode={tp_mode}")
     return CycleState(
         active=True,
+        pending=False,
+        exits_armed=True,
         is_long=plan.is_long,
         entry=entry,
         plan=plan,
@@ -941,7 +1132,268 @@ def open_cycle(
         sl=sl,
         last_qty=qty,
         opened_at=time.time(),
+        armed_at=time.time(),
     )
+
+
+def disarm_pending(
+    symbol: str,
+    state: CycleState,
+    api: str,
+    sec: str,
+    recv: int,
+    *,
+    reason: str,
+) -> None:
+    """Cancel unfilled grid (and exits if any) and clear pending state."""
+    n_g = cancel_our_grid(symbol, api, sec, recv)
+    n_e = cancel_our_exits(symbol, api, sec, recv)
+    print(f"{YELLOW}Disarm ({reason}) · cancelled grid={n_g} exits={n_e}{RESET}")
+    append_journal(symbol, f"DISARM reason={reason} grid={n_g} exits={n_e}")
+    state.pending = False
+    state.active = False
+    state.exits_armed = False
+    state.plan = None
+    state.last_qty = 0.0
+    state.filled_levels.clear()
+
+
+def _raise_check_period_sec(interval: str) -> float:
+    """How often to re-check swing top while pending (scales with fib TF)."""
+    raw = (interval or "5m").strip().lower()
+    try:
+        if raw.endswith("m"):
+            return max(15.0, float(raw[:-1]) * 15.0)  # 1m→15s, 5m→75s
+        if raw.endswith("s"):
+            return max(10.0, float(raw[:-1]))
+    except ValueError:
+        pass
+    return 30.0
+
+
+def try_raise_pending_top(
+    symbol: str,
+    state: CycleState,
+    mark: float,
+    filt: dict[str, Decimal],
+    hedge: bool,
+    api: str,
+    sec: str,
+    recv: int,
+    args: argparse.Namespace,
+) -> bool:
+    """If impulse extends while pending, rebuild Fib + TP at the new extreme.
+
+    Returns True if grid was re-armed.
+    """
+    if not state.pending or state.plan is None or state.plan.mode != "fib":
+        return False
+    if not bool(getattr(args, "raise_top", True)):
+        return False
+    old = state.plan.swing
+    if old is None:
+        return False
+
+    now = time.time()
+    period = _raise_check_period_sec(args.fib_interval)
+    if now - state.last_swing_check_at < period:
+        return False
+    state.last_swing_check_at = now
+
+    min_raise = max(0.02, float(getattr(args, "raise_min_pct", 0.05))) / 100.0
+    prefer = True if state.is_long else False
+    try:
+        fresh = detect_swing_impulse(
+            symbol,
+            prefer_long=prefer,
+            interval=args.fib_interval,
+            lookback=args.fib_lookback,
+            min_range_pct=args.fib_min_range,
+            max_span_bars=args.fib_max_span,
+        )
+    except Exception:
+        fresh = None
+
+    if state.is_long:
+        cand_high = old.high
+        if fresh is not None and fresh.is_long:
+            cand_high = max(cand_high, fresh.high)
+        cand_high = max(cand_high, mark)
+        if cand_high <= old.high * (1.0 + min_raise):
+            return False
+        # Keep original trough when possible (deeper pullback origin)
+        new_low = old.low
+        if fresh is not None and fresh.is_long and fresh.low < old.low:
+            new_low = fresh.low
+        new_swing = SwingImpulse(
+            is_long=True,
+            low=new_low,
+            high=cand_high,
+            range_pct=(cand_high - new_low) / new_low * 100 if new_low > 0 else 0.0,
+            start_i=old.start_i,
+            end_i=fresh.end_i if fresh and fresh.is_long else old.end_i,
+            interval=old.interval,
+        )
+    else:
+        # Short: impulse extends lower → new trough, TP @ new low
+        cand_low = old.low
+        if fresh is not None and not fresh.is_long:
+            cand_low = min(cand_low, fresh.low)
+        cand_low = min(cand_low, mark)
+        if cand_low >= old.low * (1.0 - min_raise):
+            return False
+        new_high = old.high
+        if fresh is not None and not fresh.is_long and fresh.high > old.high:
+            new_high = fresh.high
+        new_swing = SwingImpulse(
+            is_long=False,
+            low=cand_low,
+            high=new_high,
+            range_pct=(new_high - cand_low) / cand_low * 100 if cand_low > 0 else 0.0,
+            start_i=old.start_i,
+            end_i=fresh.end_i if fresh and not fresh.is_long else old.end_i,
+            interval=old.interval,
+        )
+
+    new_plan = build_fib_grid(
+        mark,
+        state.is_long,
+        new_swing,
+        levels=args.levels,
+        base_usdt=args.base_size,
+        level_usdt=args.level_size,
+        tp_pct=args.tp_pct,
+        sl_pct=args.sl_pct,
+        filt=filt,
+        tp_ext=args.fib_tp_ext,
+        sl_buf_pct=args.fib_sl_buf,
+        fvg=state.plan.fvg,
+    )
+    if not new_plan.levels:
+        return False
+
+    print(
+        f"{CYAN}↗ Raise top · swing "
+        f"{price_fmt(old.low)}→{price_fmt(old.high)}  ⇒  "
+        f"{price_fmt(new_swing.low)}→{price_fmt(new_swing.high)} "
+        f"· TP {price_fmt(new_plan.tp_price)} · re-arm grid{RESET}"
+    )
+    append_journal(
+        symbol,
+        f"RAISE swing {old.low:.8g}->{old.high:.8g} => "
+        f"{new_swing.low:.8g}->{new_swing.high:.8g} tp={new_plan.tp_price:.8g}",
+    )
+    cancel_our_grid(symbol, api, sec, recv)
+    n = place_grid_limits(symbol, new_plan, filt, hedge, api, sec, recv)
+    append_journal(symbol, f"REARM grid={n}/{len(new_plan.levels)}")
+    state.plan = new_plan
+    state.tp = new_plan.tp_price
+    state.sl = new_plan.sl_price
+    state.armed_at = now  # refresh timeout window
+    state.swing_high_anchor = new_swing.high if state.is_long else new_swing.low
+    state.filled_levels.clear()
+    return True
+
+
+def tick_pending(
+    symbol: str,
+    state: CycleState,
+    mark: float,
+    filt: dict[str, Decimal],
+    hedge: bool,
+    api: str,
+    sec: str,
+    recv: int,
+    args: argparse.Namespace,
+) -> None:
+    """While waiting for pullback: raise top if impulse extends, arm exits on fill, or disarm."""
+    if not state.pending or state.plan is None:
+        return
+
+    timeout = float(getattr(args, "arm_timeout_sec", 900.0))
+    age = time.time() - state.armed_at
+    qty, entry = get_position(symbol, state.is_long, hedge, api, sec, recv)
+
+    # Invalidation: price ran through SL before we got filled
+    if qty <= 0 and state.sl > 0:
+        if state.is_long and mark <= state.sl:
+            disarm_pending(symbol, state, api, sec, recv, reason="sl_before_fill")
+            return
+        if not state.is_long and mark >= state.sl:
+            disarm_pending(symbol, state, api, sec, recv, reason="sl_before_fill")
+            return
+
+    # Timeout with no fill
+    if qty <= 0 and age >= timeout:
+        disarm_pending(symbol, state, api, sec, recv, reason=f"timeout_{timeout:g}s")
+        return
+
+    if qty <= 0:
+        try_raise_pending_top(symbol, state, mark, filt, hedge, api, sec, recv, args)
+        open_n = sum(
+            1 for o in list_open_orders(symbol, api, sec, recv)
+            if _order_cid(o).startswith(GRID_PREFIX)
+        )
+        print(
+            f"{DIM}{time.strftime('%H:%M:%S')}  PENDING "
+            f"{'LONG' if state.is_long else 'SHORT'} mid={price_fmt(mark)} "
+            f"limits={open_n} age={age:.0f}s/{timeout:g}s "
+            f"TP@{price_fmt(state.tp)} SL@{price_fmt(state.sl)}{RESET}"
+        )
+        return
+
+    # First fill — promote to active and arm TP (avg by default)
+    if not state.exits_armed:
+        tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT))
+        tp_target = resolve_tp_price(
+            state.is_long, entry, state.plan,
+            tp_mode=tp_mode, tp_pct=float(getattr(args, "tp_pct", 0.35)),
+            first_fill=True,
+        )
+        sl_target = state.plan.sl_price
+        print(
+            f"{GREEN}✓ Pullback fill qty={qty:g} @ {price_fmt(entry)} — "
+            f"arming TP {price_fmt(tp_target)} (1st=swing max) / SL {price_fmt(sl_target)}{RESET}"
+        )
+        try:
+            tp, sl = place_exchange_exits(
+                symbol, state.is_long, qty, entry, mark or entry,
+                tp_target, sl_target, filt, hedge, api, sec, recv,
+            )
+            state.tp, state.sl = tp, sl
+            state.exits_armed = True
+            append_journal(
+                symbol,
+                f"OPEN {'LONG' if state.is_long else 'SHORT'} qty={qty:g} "
+                f"entry={entry:.8g} tp={tp:.8g} sl={sl:.8g} tp_mode={tp_mode}",
+            )
+        except Exception as exc:
+            print(f"{RED}Exit arm failed after fill: {exc}{RESET}")
+            append_journal(symbol, f"ERROR exits_after_fill {exc}")
+
+    state.active = True
+    state.pending = False
+    state.entry = entry
+    state.last_qty = qty
+    state.opened_at = time.time()
+
+
+def close_cycle_cleanup(symbol: str, state: CycleState, api: str, sec: str, recv: int) -> None:
+    n_g = cancel_our_grid(symbol, api, sec, recv)
+    n_e = cancel_our_exits(symbol, api, sec, recv)
+    if n_g or n_e:
+        print(f"{DIM}Cleanup cancelled grid={n_g} exits={n_e}{RESET}")
+    append_journal(symbol, f"FLAT cleanup grid={n_g} exits={n_e}")
+    state.active = False
+    state.pending = False
+    state.exits_armed = False
+    state.plan = None
+    state.last_qty = 0.0
+    state.filled_levels.clear()
+
+
+# keep name used elsewhere
+open_cycle = arm_cycle
 
 
 def refresh_exits_if_grown(
@@ -965,17 +1417,16 @@ def refresh_exits_if_grown(
     grown = qty > state.last_qty * 1.02
     if grown:
         print(f"{CYAN}Position grew {state.last_qty:g} → {qty:g} — refreshing TP/SL{RESET}")
-        # TP from live avg entry; keep SL from plan relative to original entry band
-        if state.is_long:
-            tp = entry * (1 + args.tp_pct / 100)
-            sl = state.sl if state.sl > 0 else entry * (1 - args.sl_pct / 100)
-            if sl >= entry:
-                sl = entry * (1 - args.sl_pct / 100)
-        else:
-            tp = entry * (1 - args.tp_pct / 100)
-            sl = state.sl if state.sl > 0 else entry * (1 + args.sl_pct / 100)
-            if sl <= entry:
-                sl = entry * (1 + args.sl_pct / 100)
+        tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT))
+        tp = resolve_tp_price(
+            state.is_long, entry, state.plan,
+            tp_mode=tp_mode, tp_pct=float(getattr(args, "tp_pct", 0.35)),
+            first_fill=False,
+        )
+        sl = state.plan.sl_price if state.plan else state.sl
+        print(
+            f"{DIM}TP → {price_fmt(tp)} (compensation · {tp_mode} from avg {price_fmt(entry)}){RESET}"
+        )
         try:
             tp, sl = place_exchange_exits(
                 symbol, state.is_long, qty, entry, mark or entry,
@@ -983,7 +1434,10 @@ def refresh_exits_if_grown(
             )
             state.tp, state.sl = tp, sl
             state.entry = entry
-            append_journal(symbol, f"EXITS refresh tp={tp:.8g} sl={sl:.8g} qty={qty:g}")
+            append_journal(
+                symbol,
+                f"EXITS refresh tp={tp:.8g} sl={sl:.8g} qty={qty:g} tp_mode={tp_mode}",
+            )
         except Exception as exc:
             print(f"{RED}Exit refresh failed: {exc}{RESET}")
         state.last_qty = qty
@@ -1053,18 +1507,6 @@ def _sweep_missing_levels(
             print(f"{YELLOW}Sweep {lv.name} skip: {exc}{RESET}")
 
 
-def close_cycle_cleanup(symbol: str, state: CycleState, api: str, sec: str, recv: int) -> None:
-    n_g = cancel_our_grid(symbol, api, sec, recv)
-    n_e = cancel_our_exits(symbol, api, sec, recv)
-    if n_g or n_e:
-        print(f"{DIM}Cleanup cancelled grid={n_g} exits={n_e}{RESET}")
-    append_journal(symbol, f"FLAT cleanup grid={n_g} exits={n_e}")
-    state.active = False
-    state.plan = None
-    state.last_qty = 0.0
-    state.filled_levels.clear()
-
-
 # ── main loop ────────────────────────────────────────────────────────────────
 
 def mid_from_depth(depth: dict) -> float:
@@ -1104,9 +1546,12 @@ def run(args: argparse.Namespace) -> int:
         f"{BOLD}{CYAN}Micro-grid{RESET} {sym}  {mode}\n"
         f"{DIM}grid={args.grid_mode} · fib {args.fib_interval} minΔ{args.fib_min_range:g}% · "
         f"FVG≥{args.fvg_min_pct:g}%{' req' if args.require_fvg else ''} · "
+        f"wait_pullback={'ON' if args.wait_pullback else 'OFF'} "
+        f"raise_top={'ON' if args.raise_top else 'OFF'} "
+        f"arm≤{args.arm_timeout_sec:g}s · "
         f"bar {args.bar_sec:g}s · levels {args.levels} · "
         f"base {args.base_size:g} · level {args.level_size:g} USDT · "
-        f"TP {args.tp_pct:g}% · SL {args.sl_pct:g}% · "
+        f"TP={args.tp_mode}+{args.tp_pct:g}% · SL {args.sl_pct:g}% · "
         f"sweep={'ON' if args.sweep else 'OFF'} · "
         f"dir={args.direction}{RESET}\n"
         f"{DIM}log {journal_path(sym)}{RESET}"
@@ -1128,6 +1573,15 @@ def run(args: argparse.Namespace) -> int:
 
             bar = builder.add_sample(bids, asks, time.time())
 
+            # Pending pullback grid (armed, no position yet)
+            if args.execute and state.pending and not state.active:
+                tick_pending(
+                    sym, state, mark, filt, hedge, api, sec, args.recv_window, args,
+                )
+                if state.pending:
+                    time.sleep(max(0.2, args.sample_sec))
+                    continue
+
             # Live position sync
             if args.execute and state.active:
                 qty, entry = get_position(sym, state.is_long, hedge, api, sec, args.recv_window)
@@ -1148,8 +1602,13 @@ def run(args: argparse.Namespace) -> int:
                         f"uPnL={upnl:+.4f}  TP={price_fmt(state.tp)} SL={price_fmt(state.sl)}{RESET}"
                     )
 
-            # New cycle on bar close when flat
-            if bar is not None and not state.active and time.time() >= cooldown_until:
+            # New cycle on bar close when flat and not pending
+            if (
+                bar is not None
+                and not state.active
+                and not state.pending
+                and time.time() >= cooldown_until
+            ):
                 direction: str | None
                 if args.direction in ("long", "short"):
                     direction = args.direction
@@ -1177,35 +1636,32 @@ def run(args: argparse.Namespace) -> int:
                         builder.reset_after_bar(time.time())
                         time.sleep(args.sample_sec)
                         continue
+                    wait = bool(args.wait_pullback) and plan.mode == "fib"
                     try:
-                        state = open_cycle(
+                        state = arm_cycle(
                             sym, plan, mark, filt, hedge, api, sec, args.recv_window,
                             dry_run=not args.execute,
+                            wait_pullback=wait,
+                            args=args,
                         )
                         if not args.execute:
-                            # dry-run: one cycle then idle until next signal
                             cooldown_until = time.time() + args.cooldown_sec
                     except Exception as exc:
-                        print(f"{RED}Open cycle failed: {exc}{RESET}")
-                        append_journal(sym, f"ERROR open {exc}")
+                        print(f"{RED}Arm cycle failed: {exc}{RESET}")
+                        append_journal(sym, f"ERROR arm {exc}")
                         if args.execute:
                             cancel_our_grid(sym, api, sec, args.recv_window)
                             cancel_our_exits(sym, api, sec, args.recv_window)
                         cooldown_until = time.time() + args.cooldown_sec
 
                     builder.reset_after_bar(time.time())
-                    if args.once:
+                    if args.once and (state.active or state.pending or not args.execute):
                         return 0
                     continue
 
                 builder.reset_after_bar(time.time())
-                if args.once and direction:
-                    return 0
             elif bar is not None:
                 builder.reset_after_bar(time.time())
-                if args.once and not state.active:
-                    # no signal on first bar in --once mode: keep going until one fires
-                    pass
 
             time.sleep(max(0.2, args.sample_sec))
     except KeyboardInterrupt:
@@ -1218,19 +1674,23 @@ def run(args: argparse.Namespace) -> int:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="15s micro-grid: full grid + TP/SL at open")
     p.add_argument("symbol", help="Futures symbol, e.g. UBUSDT")
-    p.add_argument("--execute", action="store_true", help="Send live orders")
-    p.add_argument("--dry-run", action="store_true", help="Plan only (default if no --execute)")
+    p.add_argument("--execute", action=argparse.BooleanOptionalAction, default=True,
+                   help="Send live orders (default on; use --dry-run or --no-execute to plan only)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Plan only — no orders (overrides default --execute)")
     p.add_argument("--env-file", default="", help="Path to .env")
     p.add_argument("--recv-window", type=int, default=15000)
     p.add_argument("--position-mode", choices=("auto", "hedge", "oneway"), default="auto")
-    p.add_argument("--direction", choices=("auto", "long", "short"), default="auto")
+    p.add_argument("--direction", choices=("auto", "long", "short"), default="auto",
+                   help="Trade side (default: auto from 15s order-book signal)")
     p.add_argument(
         "--grid-mode",
         choices=("fib", "step"),
         default=(os.getenv("OB_MG_GRID_MODE", "fib").strip().lower() or "fib"),
         help="Grid construction (default: fib)",
     )
-    p.add_argument("--fib-interval", default=os.getenv("OB_MG_FIB_INTERVAL", "5m").strip() or "5m")
+    p.add_argument("--fib-interval", default=os.getenv("OB_MG_FIB_INTERVAL", "1m").strip() or "1m",
+                   help="Kline TF for Fib swing (default 1m; use 5m for slower swings)")
     p.add_argument("--fib-lookback", type=int, default=_env_int("OB_MG_FIB_LOOKBACK", 40))
     p.add_argument("--fib-min-range", type=float, default=_env_float("OB_MG_FIB_MIN_RANGE", 0.40),
                    help="Min swing range %% on fib interval")
@@ -1243,12 +1703,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--require-fvg", action=argparse.BooleanOptionalAction,
                    default=_env_bool("OB_MG_REQUIRE_FVG", True),
                    help="Fib mode: require FVG ≥ min (default on)")
+    p.add_argument("--wait-pullback", action=argparse.BooleanOptionalAction,
+                   default=_env_bool("OB_MG_WAIT_PULLBACK", True),
+                   help="Fib: LIMIT grid only, no MARKET; TP after fill @ swing max (default on)")
+    p.add_argument("--raise-top", action=argparse.BooleanOptionalAction,
+                   default=_env_bool("OB_MG_RAISE_TOP", True),
+                   help="While pending, raise Fib/TP if impulse makes new high/low (default on)")
+    p.add_argument("--raise-min-pct", type=float, default=_env_float("OB_MG_RAISE_MIN_PCT", 0.05),
+                   help="Min %% extension to trigger a raise (default 0.05)")
+    p.add_argument("--arm-timeout-sec", type=float,
+                   default=_env_float("OB_MG_ARM_TIMEOUT_SEC", 900.0),
+                   help="Disarm unfilled pullback grid after N seconds (default 900)")
     p.add_argument("--levels", type=int, default=_env_int("OB_MG_LEVELS", 4))
     p.add_argument("--step-pct", type=float, default=_env_float("OB_MG_STEP_PCT", 0.08),
                    help="Only for --grid-mode step")
     p.add_argument("--base-size", type=float, default=_env_float("OB_MG_BASE_SIZE", 10.0))
     p.add_argument("--level-size", type=float, default=_env_float("OB_MG_LEVEL_SIZE", 8.0))
-    p.add_argument("--tp-pct", type=float, default=_env_float("OB_MG_TP_PCT", 0.35))
+    p.add_argument("--tp-mode", choices=("avg", "swing"),
+                   default=(os.getenv("OB_MG_TP_MODE", TP_MODE_DEFAULT).strip().lower() or TP_MODE_DEFAULT),
+                   help="TP: avg=1st fill @ swing max then avg+tp%% (default); swing=always impulse extreme")
+    p.add_argument("--tp-pct", type=float, default=_env_float("OB_MG_TP_PCT", 0.35),
+                   help="With --tp-mode avg: %% above/below live average (default 0.35)")
     p.add_argument("--sl-pct", type=float, default=_env_float("OB_MG_SL_PCT", 0.50))
     p.add_argument("--bar-sec", type=float, default=_env_float("OB_MG_BAR_SEC", 15.0))
     p.add_argument("--sample-sec", type=float, default=_env_float("OB_MG_SAMPLE_SEC", 1.0))
@@ -1293,8 +1768,8 @@ def main() -> int:
     args = build_arg_parser().parse_args()
     if args.no_sweep:
         args.sweep = False
-    if not args.execute and not args.dry_run:
-        args.dry_run = True
+    if args.dry_run:
+        args.execute = False
     if args.flatten:
         return flatten_and_exit(args)
     return run(args)
