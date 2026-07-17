@@ -20,7 +20,7 @@ Usage:
 
 Env (optional):
   OB_MG_GRID_MODE=fib  OB_MG_FIB_INTERVAL=1m  OB_MG_FIB_MIN_RANGE=0.40
-  OB_MG_FVG_MIN_PCT=0.25  OB_MG_REQUIRE_FVG=1
+  OB_MG_FVG_MIN_PCT=0.08  OB_MG_REQUIRE_FVG=0
   OB_MG_WAIT_PULLBACK=1  OB_MG_ARM_TIMEOUT_SEC=900
   OB_MG_RAISE_TOP=1  OB_MG_RAISE_MIN_PCT=0.05
   OB_MG_TP_MODE=avg  OB_MG_TP_PCT=0.35
@@ -197,13 +197,43 @@ class GridPlan:
     fvg: FvgZone | None = None
 
 
-# Default Fib retracement set (closest → deepest). Truncated by --levels.
+# Default Fib retracement set (closest → deepest). Grid fills from this list
+# until --levels valid rungs sit on the adverse side of mark; then extensions.
 FIB_RETRACES = (0.236, 0.382, 0.5, 0.618, 0.786)
+FIB_EXTEND = (0.886, 1.0, 1.272, 1.618)  # when mark already through classic zone
 FIB_TP_EXT = 1.272  # extension beyond impulse end (legacy / swing-mode helper)
 FIB_SL_BUF = 0.15   # % beyond swing origin
-FVG_MIN_PCT = 0.25  # min FVG height as % of mid price
+FVG_MIN_PCT = 0.08  # min FVG height % (1m majors rarely clear 0.25%)
 # TP after fills: avg = from live average (+ tp_pct); swing = fixed at impulse extreme
 TP_MODE_DEFAULT = "avg"
+
+
+def _fib_px(swing: SwingImpulse, ratio: float, *, is_long: bool) -> float:
+    if is_long:
+        return swing.high - swing.span * ratio
+    return swing.low + swing.span * ratio
+
+
+def fib_levels_with_room(
+    swing: SwingImpulse,
+    mark: float,
+    *,
+    is_long: bool,
+    need: int = 1,
+) -> int:
+    """How many Fib/ext levels sit on the pullback side of ``mark``."""
+    if mark <= 0 or swing.span <= 0:
+        return 0
+    n = 0
+    for r in (*FIB_RETRACES, *FIB_EXTEND):
+        px = _fib_px(swing, r, is_long=is_long)
+        if is_long and px < mark * 0.9995:
+            n += 1
+        elif (not is_long) and px > mark * 1.0005:
+            n += 1
+        if n >= need:
+            return n
+    return n
 
 
 def resolve_tp_price(
@@ -258,9 +288,15 @@ def detect_swing_impulse(
     lookback: int = 40,
     min_range_pct: float = 0.40,
     max_span_bars: int = 12,
+    mark: float | None = None,
+    min_fib_room: int = 1,
     base: str = FAPI_BASE,
 ) -> SwingImpulse | None:
-    """Find the strongest recent impulse on ``interval`` klines (drop forming bar)."""
+    """Find the strongest recent impulse on ``interval`` klines (drop forming bar).
+
+    When ``mark`` is set, prefer swings that still leave ≥ ``min_fib_room``
+    Fib/extension levels on the pullback side of price (avoids dead ladders).
+    """
     raw = fetch_klines(base, symbol.upper(), interval, max(lookback, 20))
     if len(raw) < 8:
         return None
@@ -272,6 +308,9 @@ def detect_swing_impulse(
 
     best_bull: tuple[float, SwingImpulse] | None = None
     best_bear: tuple[float, SwingImpulse] | None = None
+    # Fallback without room filter (last resort)
+    best_bull_any: tuple[float, SwingImpulse] | None = None
+    best_bear_any: tuple[float, SwingImpulse] | None = None
 
     for i in range(start, n):
         for j in range(i + 1, min(n, i + max_span_bars + 1)):
@@ -293,27 +332,48 @@ def detect_swing_impulse(
                     is_long=True, low=lo, high=hi, range_pct=rng,
                     start_i=lo_i, end_i=hi_i, interval=interval,
                 )
-                if best_bull is None or score > best_bull[0]:
+                if best_bull_any is None or score > best_bull_any[0]:
+                    best_bull_any = (score, cand)
+                room_ok = True
+                if mark is not None and mark > 0:
+                    room = fib_levels_with_room(
+                        cand, mark, is_long=True, need=min_fib_room
+                    )
+                    room_ok = room >= min_fib_room
+                    # Prefer price still near the impulse high (not fully dumped)
+                    if mark <= hi:
+                        score *= 1.0 + max(0.0, (mark - lo) / (hi - lo)) * 0.25
+                if room_ok and (best_bull is None or score > best_bull[0]):
                     best_bull = (score, cand)
             if hi_i < lo_i:
                 cand = SwingImpulse(
                     is_long=False, low=lo, high=hi, range_pct=rng,
                     start_i=hi_i, end_i=lo_i, interval=interval,
                 )
-                if best_bear is None or score > best_bear[0]:
+                if best_bear_any is None or score > best_bear_any[0]:
+                    best_bear_any = (score, cand)
+                room_ok = True
+                if mark is not None and mark > 0:
+                    room = fib_levels_with_room(
+                        cand, mark, is_long=False, need=min_fib_room
+                    )
+                    room_ok = room >= min_fib_room
+                    if mark >= lo:
+                        score *= 1.0 + max(0.0, (hi - mark) / (hi - lo)) * 0.25
+                if room_ok and (best_bear is None or score > best_bear[0]):
                     best_bear = (score, cand)
 
-    bull = best_bull[1] if best_bull else None
-    bear = best_bear[1] if best_bear else None
+    bull = (best_bull or best_bull_any)
+    bear = (best_bear or best_bear_any)
+    bull_s = bull[1] if bull else None
+    bear_s = bear[1] if bear else None
     if prefer_long is True:
-        return bull or bear
+        return bull_s or bear_s
     if prefer_long is False:
-        return bear or bull
+        return bear_s or bull_s
     if bull and bear:
-        bs = best_bull[0] if best_bull else 0.0
-        rs = best_bear[0] if best_bear else 0.0
-        return bull if bs >= rs else bear
-    return bull or bear
+        return bull_s if bull[0] >= bear[0] else bear_s
+    return bull_s or bear_s
 
 
 def detect_fvg_zones(
@@ -402,31 +462,37 @@ def build_fib_grid(
     sl_buf_pct: float = FIB_SL_BUF,
     fvg: FvgZone | None = None,
 ) -> GridPlan:
-    """Retrace grid on swing; only levels on the adverse side of ``entry``."""
+    """Retrace grid on swing; only levels on the adverse side of ``entry``.
+
+    Walks classic retraces then extensions until ``levels`` valid rungs exist
+    (so a mark already through 0.786 can still arm on 1.0 / 1.272 / …).
+    """
     if entry <= 0 or swing.span <= 0:
         raise ValueError("invalid entry/swing for fib grid")
-    n_take = max(1, min(int(levels), len(FIB_RETRACES)))
-    ratios = list(FIB_RETRACES[:n_take])
+    n_take = max(1, int(levels))
+    ratios = (*FIB_RETRACES, *FIB_EXTEND)
 
     rows: list[GridLevel] = []
-    for i, r in enumerate(ratios, start=1):
+    for r in ratios:
+        if len(rows) >= n_take:
+            break
+        px = _fib_px(swing, r, is_long=is_long)
         if is_long:
-            px = swing.high - swing.span * r
             # Must be below mark (pullback buys) — wait for retrace, no chase
             if px >= entry * 0.9995:
                 continue
         else:
-            px = swing.low + swing.span * r
             if px <= entry * 1.0005:
                 continue
         # Shallowest fill gets base size; deeper rungs use level_usdt
         size = base_usdt if not rows else level_usdt
         _, qty = qty_for_notional(size, px, filt)
         dist = (px / entry - 1.0) * 100
+        tag = "ext" if r > FIB_RETRACES[-1] + 1e-9 else "Fib"
         rows.append(
             GridLevel(
-                idx=i,
-                name=f"Fib {r:.3f}",
+                idx=len(rows) + 1,
+                name=f"{tag} {r:.3f}",
                 price=px,
                 size_usdt=float(qty) * px,
                 qty=qty,
@@ -488,6 +554,8 @@ def build_fib_grid(
         f"({swing.range_pct:.2f}%) · TP ref @ swing {'high' if is_long else 'low'} "
         f"· wait pullback"
     )
+    if any((lv.fib_ratio or 0) > FIB_RETRACES[-1] + 1e-9 for lv in rows):
+        note += " · ext beyond origin"
     if fvg is not None:
         note += (
             f" · FVG {price_fmt(fvg.low)}–{price_fmt(fvg.high)} "
@@ -592,7 +660,8 @@ def build_grid_plan(
 ) -> GridPlan | None:
     """Build Fib (default) or step grid.
 
-    Fib mode requires a swing and (by default) an FVG ≥ ``fvg_min_pct``.
+    Fib mode requires a swing. FVG ≥ ``fvg_min_pct`` is preferred; with
+    ``--require-fvg`` a missing aligned FVG skips the cycle.
     Returns ``None`` to skip the entry cycle when Fib quality filters fail.
     """
     mode = (getattr(args, "grid_mode", "fib") or "fib").strip().lower()
@@ -606,6 +675,8 @@ def build_grid_plan(
                 lookback=args.fib_lookback,
                 min_range_pct=args.fib_min_range,
                 max_span_bars=args.fib_max_span,
+                mark=entry,
+                min_fib_room=max(1, min(2, int(args.levels))),
             )
         except Exception as exc:
             print(f"{YELLOW}Fib swing fetch failed ({exc}) — skip{RESET}")
@@ -624,7 +695,7 @@ def build_grid_plan(
             )
 
         fvg: FvgZone | None = None
-        require_fvg = bool(getattr(args, "require_fvg", True))
+        require_fvg = bool(getattr(args, "require_fvg", False))
         min_fvg = float(getattr(args, "fvg_min_pct", FVG_MIN_PCT))
         try:
             zones = detect_fvg_zones(
@@ -650,6 +721,8 @@ def build_grid_plan(
                 f"{DIM}FVG {'bull' if fvg.is_long else 'bear'} "
                 f"{price_fmt(fvg.low)}–{price_fmt(fvg.high)} ({fvg.size_pct:.2f}%){RESET}"
             )
+        else:
+            print(f"{DIM}No aligned FVG ≥{min_fvg:g}% — Fib-only{RESET}")
 
         plan = build_fib_grid(
             entry,
@@ -666,7 +739,10 @@ def build_grid_plan(
             fvg=fvg,
         )
         if not plan.levels:
-            print(f"{YELLOW}Fib levels all on wrong side of mark — skip{RESET}")
+            print(
+                f"{YELLOW}Fib/ext levels all on wrong side of mark "
+                f"(price already through swing) — skip{RESET}"
+            )
             return None
         return plan
 
@@ -1210,6 +1286,8 @@ def try_raise_pending_top(
             lookback=args.fib_lookback,
             min_range_pct=args.fib_min_range,
             max_span_bars=args.fib_max_span,
+            mark=mark,
+            min_fib_room=1,
         )
     except Exception:
         fresh = None
@@ -1699,10 +1777,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--fib-sl-buf", type=float, default=_env_float("OB_MG_FIB_SL_BUF", FIB_SL_BUF),
                    help="%% buffer beyond swing origin for SL")
     p.add_argument("--fvg-min-pct", type=float, default=_env_float("OB_MG_FVG_MIN_PCT", FVG_MIN_PCT),
-                   help="Min FVG height %% of mid (default 0.25)")
+                   help="Min FVG height %% of mid (default 0.08; suited to 1m)")
     p.add_argument("--require-fvg", action=argparse.BooleanOptionalAction,
-                   default=_env_bool("OB_MG_REQUIRE_FVG", True),
-                   help="Fib mode: require FVG ≥ min (default on)")
+                   default=_env_bool("OB_MG_REQUIRE_FVG", False),
+                   help="Fib mode: hard-skip without aligned FVG (default off; FVG still preferred)")
     p.add_argument("--wait-pullback", action=argparse.BooleanOptionalAction,
                    default=_env_bool("OB_MG_WAIT_PULLBACK", True),
                    help="Fib: LIMIT grid only, no MARKET; TP after fill @ swing max (default on)")
