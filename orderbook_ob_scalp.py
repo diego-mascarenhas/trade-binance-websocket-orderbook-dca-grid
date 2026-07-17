@@ -268,6 +268,25 @@ def _side_label(is_long: bool) -> str:
     return f"{_side_color('long' if is_long else 'short')}{direction}{RESET}"
 
 
+# Debounce journal BLOCK lines (same tag can fire every bar)
+_TAG_BLOCK_LOG_AT: dict[tuple[str, str, str], float] = {}
+_TAG_BLOCK_LOG_COOLDOWN_S = 60.0
+
+
+def _log_tag_block(symbol: str, side: str, tag: str, max_losses: int) -> None:
+    """Write a BLOCK row to scalp_trades.log for obscalp-trades (rate-limited)."""
+    key = (symbol.upper(), side.lower(), tag)
+    now = time.time()
+    last = _TAG_BLOCK_LOG_AT.get(key, 0.0)
+    if now - last < _TAG_BLOCK_LOG_COOLDOWN_S:
+        return
+    _TAG_BLOCK_LOG_AT[key] = now
+    append_journal(
+        symbol,
+        f"BLOCK {side.upper()} trigger={tag} reason=tag≥{max_losses}L",
+    )
+
+
 def _tp_sl_prices(entry: float, is_long: bool, tp_pct: float, sl_pct: float) -> tuple[float, float]:
     if is_long:
         return entry * (1 + tp_pct / 100), entry * (1 - sl_pct / 100)
@@ -1047,7 +1066,22 @@ def run_loop(args: argparse.Namespace) -> None:
                 signal = decision.side
                 trigger_tag = decision.tag
                 if signal and trigger_tag:
-                    print(f"{CYAN}Triggers {signal.upper()}: {trigger_tag}{RESET}")
+                    try:
+                        from ob_trig_learn import is_tag_blocked, tag_max_losses
+
+                        if is_tag_blocked(trigger_tag):
+                            max_l = tag_max_losses()
+                            print(
+                                f"{YELLOW}Tag block {signal.upper()} "
+                                f"{trigger_tag} (≥{max_l}L){RESET}",
+                            )
+                            # Journal for obscalp-trades feed (debounced per tag)
+                            _log_tag_block(sym, signal, trigger_tag, max_l)
+                            signal = None
+                        else:
+                            print(f"{CYAN}Triggers {signal.upper()}: {trigger_tag}{RESET}")
+                    except Exception:
+                        print(f"{CYAN}Triggers {signal.upper()}: {trigger_tag}{RESET}")
                 elif not signal and getattr(args, "trig_min_hits", 2) > 1:
                     # Quiet unless we almost had a signal (avoid spam)
                     pass

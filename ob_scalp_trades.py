@@ -42,6 +42,11 @@ _OPEN_RE = re.compile(
     r"OPEN (LONG|SHORT) qty=([0-9.]+) notional=([0-9.]+) level=(\d+) \((\d+)x\)"
     r"(?: trigger=(\S+))?"
 )
+_BLOCK_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) "
+    r"BLOCK (LONG|SHORT) trigger=(\S+)"
+    r"(?: reason=(\S+))?"
+)
 _CLOSE_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) "
     r"(TP|SL|TRAIL|FLIP|MAXBARS) (LONG|SHORT) qty=([0-9.]+) "
@@ -56,7 +61,7 @@ _CLOSE_RE = re.compile(
 @dataclass
 class TradeRow:
     ts: str
-    kind: str  # OPEN | close reason
+    kind: str  # OPEN | BLOCK | close reason
     side: str
     qty: float
     notional: float | None
@@ -121,6 +126,27 @@ def parse_journal(symbol: str) -> list[TradeRow]:
                 )
             )
             continue
+        m = _BLOCK_RE.match(line)
+        if m:
+            rows.append(
+                TradeRow(
+                    ts=m.group(1),
+                    kind="BLOCK",
+                    side=m.group(2),
+                    qty=0.0,
+                    notional=None,
+                    entry=None,
+                    exit=None,
+                    gross_pct=None,
+                    pnl=None,
+                    level=0,
+                    mult="",
+                    outcome=(m.group(4) or "tag-block").strip(),
+                    trigger=(m.group(3) or "").strip(),
+                    symbol=sym,
+                )
+            )
+            continue
         m = _CLOSE_RE.match(line)
         if m:
             outcome = (m.group(13) or "").strip()
@@ -162,9 +188,19 @@ def _reason_color(kind: str) -> str:
         return GREEN
     if kind == "SL":
         return RED
-    if kind in ("FLIP", "MAXBARS"):
+    if kind in ("FLIP", "MAXBARS", "BLOCK"):
         return YELLOW
     return CYAN
+
+
+def _pad_trunc(text: str, width: int) -> str:
+    """Fixed-width cell: truncate with ellipsis if longer than width."""
+    s = text or ""
+    if width <= 0:
+        return ""
+    if len(s) > width:
+        s = s[: max(0, width - 1)] + "…"
+    return f"{s:<{width}}"
 
 
 def _format_report(
@@ -188,8 +224,11 @@ def _format_report(
         all_rows.extend(parse_journal(s))
     all_rows.sort(key=lambda r: (r.ts, r.symbol, r.kind))
 
-    closes = [r for r in all_rows if r.kind != "OPEN"]
-    rows = all_rows if show_opens else closes
+    closes = [r for r in all_rows if r.kind not in ("OPEN", "BLOCK")]
+    if show_opens:
+        rows = all_rows
+    else:
+        rows = [r for r in all_rows if r.kind not in ("OPEN",)]
     if limit is not None and limit > 0:
         rows = rows[-limit:]
 
@@ -253,6 +292,13 @@ def _format_report(
                 f"{vol_s:>9} {'':>8} {'':>10}  {CYAN}{trig:<{TRIG_W}}{RESET} {DIM}{note}{RESET}"
             )
             continue
+        if r.kind == "BLOCK":
+            note = r.outcome or "combo blocked"
+            lines.append(
+                f"{r.ts} {sym_cell}{_reason_color('BLOCK')}{'BLOCK':<7}{RESET} {r.side:<5} "
+                f"{'':>9} {'':>8} {'':>10}  {YELLOW}{trig:<{TRIG_W}}{RESET} {DIM}{note}{RESET}"
+            )
+            continue
         pnl_s = f"{r.pnl:+.4f}" if r.pnl is not None else ""
         gross_s = f"{r.gross_pct:+.3f}%" if r.gross_pct is not None else ""
         note = r.outcome or f"level {r.level}"
@@ -279,8 +325,8 @@ def _format_report(
             by_part[part].append(r.pnl or 0.0)
 
     if any(t != "unknown" for t in by_tag):
-        tag_w = max(28, max((len(t) for t in by_tag), default=28))
-        part_w = max(28, max((len(t) for t in by_part), default=28))
+        tag_w = min(56, max(28, max((len(t) for t in by_tag), default=28)))
+        part_w = min(32, max(20, max((len(t) for t in by_part), default=20)))
         wl_w = 12  # e.g. "13W/4L"
         lines.append(f"\n{BOLD}By trigger tag{RESET}")
         for tag, pnls in sorted(by_tag.items(), key=lambda x: sum(x[1]), reverse=True):
@@ -290,7 +336,7 @@ def _format_report(
             c = GREEN if s > 0 else RED if s < 0 else DIM
             wl = f"{w}W/{l}L"
             lines.append(
-                f"  {tag:<{tag_w}} {c}{s:+10.4f}{RESET}  {DIM}{wl:<{wl_w}} · {len(pnls)}{RESET}"
+                f"  {_pad_trunc(tag, tag_w)} {c}{s:+10.4f}{RESET}  {DIM}{wl:<{wl_w}} · {len(pnls)}{RESET}"
             )
         lines.append(f"\n{BOLD}By trigger component{RESET}  {DIM}(credit each part of a combo){RESET}")
         for part, pnls in sorted(by_part.items(), key=lambda x: sum(x[1]), reverse=True):
@@ -300,7 +346,7 @@ def _format_report(
             c = GREEN if s > 0 else RED if s < 0 else DIM
             wl = f"{w}W/{l}L"
             lines.append(
-                f"  {part:<{part_w}} {c}{s:+10.4f}{RESET}  {DIM}{wl:<{wl_w}} · {len(pnls)}{RESET}"
+                f"  {_pad_trunc(part, part_w)} {c}{s:+10.4f}{RESET}  {DIM}{wl:<{wl_w}} · {len(pnls)}{RESET}"
             )
 
     # ML / learning snapshot (per symbol)
@@ -357,6 +403,35 @@ def _format_report(
             lines.append(f"  {DIM}{format_disabled_summary(disabled)}{RESET}")
     except Exception as exc:
         lines.append(f"\n{DIM}Trig auto-disable unavailable: {exc}{RESET}")
+
+    try:
+        from ob_trig_learn import blocked_tag_map, tag_max_losses
+
+        max_l = tag_max_losses()
+        blocked = blocked_tag_map(force=True)
+        lines.append(
+            f"\n{BOLD}Trig combo block{RESET}  {DIM}(exact tag · ≥{max_l}L){RESET}"
+        )
+        if blocked:
+            tag_w = 48
+            for tag, info in sorted(
+                blocked.items(),
+                key=lambda x: (int(x[1].get("losses", 0)), float(x[1].get("pnl", 0))),
+                reverse=True,
+            )[:20]:
+                pnl = float(info.get("pnl", 0))
+                c = GREEN if pnl > 0 else RED if pnl < 0 else DIM
+                wl = f"{info.get('wins', 0)}W/{info.get('losses', 0)}L"
+                lines.append(
+                    f"  {_pad_trunc(tag, tag_w)} {c}{pnl:+10.4f}{RESET}  "
+                    f"{DIM}{wl:<12} · BLOCK{RESET}"
+                )
+            if len(blocked) > 20:
+                lines.append(f"  {DIM}… +{len(blocked) - 20} more{RESET}")
+        else:
+            lines.append(f"  {DIM}none{RESET}")
+    except Exception as exc:
+        lines.append(f"\n{DIM}Trig combo block unavailable: {exc}{RESET}")
 
     for s in syms:
         recovery = load_state(s)
@@ -458,7 +533,7 @@ def main() -> int:
             if d.is_dir() and (d / "scalp_trades.log").exists()
         ) if LOG_ROOT.exists() else []
         for sym in found:
-            closes = [r for r in parse_journal(sym) if r.kind != "OPEN"]
+            closes = [r for r in parse_journal(sym) if r.kind not in ("OPEN", "BLOCK")]
             total = sum(r.pnl or 0.0 for r in closes)
             mark = " *" if sym in running_symbols() else ""
             color = GREEN if total > 0 else RED if total < 0 else DIM

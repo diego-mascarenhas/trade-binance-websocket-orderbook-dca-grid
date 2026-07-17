@@ -1,14 +1,19 @@
-"""Auto-disable losing multi-trigger components from journal PnL.
+"""Auto-disable losing multi-trigger components / combo tags from journal PnL.
 
 Scans ``.run/logs/*/scalp_trades.log``, aggregates PnL by trigger *component*
 (e.g. ``ml``, ``htf``, ``bearish_engulfing``), and writes a disable list that
 bots honor on the next entry decision.
+
+Also blocks *exact* trigger combinations (full ``trigger=a+b+c`` tags) once
+they accumulate enough losing closes (default: 1 loss).
 
 Env:
   OB_TRIG_AUTO_DISABLE=1     master switch (default on)
   OB_TRIG_AUTO_MIN_N=15      min closes credited to a component
   OB_TRIG_AUTO_MAX_PNL=0     disable when sum PnL < this
   OB_TRIG_AUTO_MAX_WR=0.45   also require win-rate ≤ this (0=ignore WR)
+  OB_TRIG_TAG_BLOCK=1        block exact combos after enough losses (default on)
+  OB_TRIG_TAG_MAX_LOSSES=1   block when losses ≥ this (default 1)
 """
 
 from __future__ import annotations
@@ -249,3 +254,158 @@ def format_disabled_summary(disabled: dict[str, dict[str, Any]] | None = None) -
         return "none"
     parts = [f"{k}({v.get('pnl', 0):+.2f}/{v.get('n', 0)})" for k, v in sorted(disabled.items())]
     return ", ".join(parts)
+
+
+# ── Exact combo (full tag) loss filter ──────────────────────────────────────
+
+_TAG_CACHE: dict[str, Any] = {"at": 0.0, "blocked": {}, "max_losses": 1}
+_TAG_CACHE_TTL_S = 20.0
+
+
+def tag_block_enabled() -> bool:
+    return _env_bool("OB_TRIG_TAG_BLOCK", True)
+
+
+def tag_max_losses() -> int:
+    return max(1, _env_int("OB_TRIG_TAG_MAX_LOSSES", 1))
+
+
+def normalize_trigger_tag(tag: str) -> str:
+    """Normalize journal/live tags so ``pattern`` ≡ ``htf`` and order matches EntryDecision."""
+    raw = (tag or "").strip()
+    if not raw:
+        return ""
+    parts: list[str] = []
+    for part in raw.split("+"):
+        p = part.strip()
+        if not p or p in SKIP_COMPONENTS:
+            continue
+        if p == "pattern":
+            p = "htf"
+        if p not in parts:
+            parts.append(p)
+    if not parts:
+        return ""
+    try:
+        from ob_triggers import TRIGGER_PRIORITY
+
+        parts = sorted(
+            parts,
+            key=lambda n: TRIGGER_PRIORITY.index(n) if n in TRIGGER_PRIORITY else 99,
+        )
+    except Exception:
+        parts = sorted(parts)
+    return "+".join(parts)
+
+
+@dataclass
+class TagStats:
+    tag: str
+    n: int
+    wins: int
+    losses: int
+    pnl: float
+
+
+def collect_tag_stats(*, symbols: list[str] | None = None) -> dict[str, TagStats]:
+    """Aggregate closes by full normalized trigger tag (excludes adopted)."""
+    buckets: dict[str, list[float]] = defaultdict(list)
+    if symbols:
+        paths = [LOG_ROOT / s.upper() / "scalp_trades.log" for s in symbols]
+    else:
+        paths = list(LOG_ROOT.glob("*/scalp_trades.log")) if LOG_ROOT.exists() else []
+
+    for path in paths:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = _CLOSE_RE.search(line)
+            if not m:
+                continue
+            pnl = float(m.group(3))
+            tm = _TRIG_RE.search(line)
+            raw = (tm.group(1) if tm else "unknown").strip()
+            if raw in SKIP_COMPONENTS or raw == "unknown":
+                continue
+            tag = normalize_trigger_tag(raw)
+            if not tag:
+                continue
+            buckets[tag].append(pnl)
+
+    out: dict[str, TagStats] = {}
+    for tag, pnls in buckets.items():
+        wins = sum(1 for p in pnls if p > 0)
+        out[tag] = TagStats(
+            tag=tag,
+            n=len(pnls),
+            wins=wins,
+            losses=len(pnls) - wins,
+            pnl=sum(pnls),
+        )
+    return out
+
+
+def evaluate_blocked_tags(
+    stats: dict[str, TagStats] | None = None,
+    *,
+    max_losses: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return ``{tag: {wins, losses, pnl, n}}`` blocked for having ≥ max_losses losses."""
+    stats = stats if stats is not None else collect_tag_stats()
+    max_losses = tag_max_losses() if max_losses is None else max(1, int(max_losses))
+    blocked: dict[str, dict[str, Any]] = {}
+    for tag, st in stats.items():
+        if st.losses < max_losses:
+            continue
+        blocked[tag] = {
+            "n": st.n,
+            "wins": st.wins,
+            "losses": st.losses,
+            "pnl": round(st.pnl, 4),
+            "reason": f"losses≥{max_losses}",
+        }
+    return blocked
+
+
+def _refresh_tag_cache(*, force: bool = False) -> dict[str, dict[str, Any]]:
+    now = time.time()
+    max_losses = tag_max_losses()
+    if (
+        not force
+        and _TAG_CACHE["blocked"] is not None
+        and _TAG_CACHE.get("max_losses") == max_losses
+        and (now - float(_TAG_CACHE.get("at") or 0)) < _TAG_CACHE_TTL_S
+    ):
+        return _TAG_CACHE["blocked"]  # type: ignore[return-value]
+    blocked = evaluate_blocked_tags(max_losses=max_losses) if tag_block_enabled() else {}
+    _TAG_CACHE["at"] = now
+    _TAG_CACHE["max_losses"] = max_losses
+    _TAG_CACHE["blocked"] = blocked
+    return blocked
+
+
+def blocked_tag_map(*, force: bool = False) -> dict[str, dict[str, Any]]:
+    if not tag_block_enabled():
+        return {}
+    return _refresh_tag_cache(force=force)
+
+
+def is_tag_blocked(tag: str) -> bool:
+    """True if this exact combo already has ≥ OB_TRIG_TAG_MAX_LOSSES losses."""
+    if not tag_block_enabled():
+        return False
+    norm = normalize_trigger_tag(tag)
+    if not norm:
+        return False
+    return norm in blocked_tag_map()
+
+
+def format_blocked_tags_summary(blocked: dict[str, dict[str, Any]] | None = None) -> str:
+    blocked = blocked if blocked is not None else blocked_tag_map(force=True)
+    if not blocked:
+        return "none"
+    parts = [
+        f"{k}({v.get('wins', 0)}W/{v.get('losses', 0)}L)"
+        for k, v in sorted(blocked.items(), key=lambda x: -int(x[1].get("losses", 0)))
+    ]
+    return ", ".join(parts[:12]) + ("…" if len(parts) > 12 else "")
