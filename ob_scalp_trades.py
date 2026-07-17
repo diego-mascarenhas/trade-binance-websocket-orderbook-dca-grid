@@ -219,18 +219,19 @@ def _format_report(
     )
     lines.append("")
 
+    TRIG_W = 64
     if multi:
         hdr = (
             f"{'When':<19} {'Symbol':<14} {'Evt':<7} {'Side':<5} {'Vol USDT':>9} "
-            f"{'Gross':>8} {'PnL USDT':>10}  {'Trigger':<28} Note"
+            f"{'Gross':>8} {'PnL USDT':>10}  {'Trigger':<{TRIG_W}} Note"
         )
-        sep = "-" * 112
+        sep = "-" * (112 + (TRIG_W - 28))
     else:
         hdr = (
             f"{'When':<19} {'Evt':<7} {'Side':<5} {'Vol USDT':>9} "
-            f"{'Gross':>8} {'PnL USDT':>10}  {'Trigger':<28} Note"
+            f"{'Gross':>8} {'PnL USDT':>10}  {'Trigger':<{TRIG_W}} Note"
         )
-        sep = "-" * 96
+        sep = "-" * (96 + (TRIG_W - 28))
     lines.append(f"{DIM}{hdr}{RESET}")
     lines.append(f"{DIM}{sep}{RESET}")
 
@@ -239,14 +240,14 @@ def _format_report(
         if vol is None and r.entry is not None and r.qty > 0:
             vol = r.entry * r.qty
         vol_s = f"{vol:.2f}" if vol is not None else ""
-        trig = (r.trigger or "—")[:28]
+        trig = (r.trigger or "—")[:TRIG_W]
         row_sym = r.symbol or syms[0]
         sym_cell = f"{BOLD}{row_sym:<14}{RESET} " if multi else ""
         if r.kind == "OPEN":
             note = f"qty {r.qty:g} · level {r.level} ({r.mult})"
             lines.append(
                 f"{r.ts} {sym_cell}{_reason_color('OPEN')}{'OPEN':<7}{RESET} {r.side:<5} "
-                f"{vol_s:>9} {'':>8} {'':>10}  {CYAN}{trig:<28}{RESET} {DIM}{note}{RESET}"
+                f"{vol_s:>9} {'':>8} {'':>10}  {CYAN}{trig:<{TRIG_W}}{RESET} {DIM}{note}{RESET}"
             )
             continue
         pnl_s = f"{r.pnl:+.4f}" if r.pnl is not None else ""
@@ -255,7 +256,7 @@ def _format_report(
         lines.append(
             f"{r.ts} {sym_cell}{_reason_color(r.kind)}{r.kind:<7}{RESET} {r.side:<5} "
             f"{vol_s:>9} {gross_s:>8} {_pnl_color(r.pnl)}{pnl_s:>10}{RESET}  "
-            f"{CYAN}{trig:<28}{RESET} {DIM}{note}{RESET}"
+            f"{CYAN}{trig:<{TRIG_W}}{RESET} {DIM}{note}{RESET}"
         )
 
     lines.append("")
@@ -277,20 +278,27 @@ def _format_report(
     if any(t != "unknown" for t in by_tag):
         tag_w = max(28, max((len(t) for t in by_tag), default=28))
         part_w = max(28, max((len(t) for t in by_part), default=28))
+        wl_w = 12  # e.g. "13W/4L"
         lines.append(f"\n{BOLD}By trigger tag{RESET}")
         for tag, pnls in sorted(by_tag.items(), key=lambda x: sum(x[1]), reverse=True):
             s = sum(pnls)
             w = sum(1 for p in pnls if p > 0)
             l = len(pnls) - w
             c = GREEN if s > 0 else RED if s < 0 else DIM
-            lines.append(f"  {tag:<{tag_w}} {c}{s:+.4f}{RESET}  {DIM}{w}W/{l}L · {len(pnls)}{RESET}")
+            wl = f"{w}W/{l}L"
+            lines.append(
+                f"  {tag:<{tag_w}} {c}{s:+10.4f}{RESET}  {DIM}{wl:<{wl_w}} · {len(pnls)}{RESET}"
+            )
         lines.append(f"\n{BOLD}By trigger component{RESET}  {DIM}(credit each part of a combo){RESET}")
         for part, pnls in sorted(by_part.items(), key=lambda x: sum(x[1]), reverse=True):
             s = sum(pnls)
             w = sum(1 for p in pnls if p > 0)
             l = len(pnls) - w
             c = GREEN if s > 0 else RED if s < 0 else DIM
-            lines.append(f"  {part:<{part_w}} {c}{s:+.4f}{RESET}  {DIM}{w}W/{l}L · {len(pnls)}{RESET}")
+            wl = f"{w}W/{l}L"
+            lines.append(
+                f"  {part:<{part_w}} {c}{s:+10.4f}{RESET}  {DIM}{wl:<{wl_w}} · {len(pnls)}{RESET}"
+            )
 
     for s in syms:
         recovery = load_state(s)
