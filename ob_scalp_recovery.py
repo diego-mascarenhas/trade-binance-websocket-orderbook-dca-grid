@@ -174,6 +174,7 @@ def record_close(
     gross_pct: float,
     net_usdt: float,
     dry_run: bool,
+    trigger: str = "",
 ) -> RecoveryState:
     """Update recovery after a close.
 
@@ -181,10 +182,12 @@ def record_close(
     net_usdt covers cumulative_loss_usdt (or there was no debt).
     """
     debt_before = max(0.0, state.cumulative_loss_usdt)
+    trig = f" trigger={trigger}" if trigger else ""
     line = (
         f"{reason} {direction} qty={qty:g} entry={entry:g} exit={exit_price:g} "
         f"gross={gross_pct:+.3f}% pnl={net_usdt:+.4f} USDT "
         f"level={state.level} streak={state.loss_streak} cumulative={debt_before:+.4f}"
+        f"{trig}"
     )
 
     if net_usdt > 0:

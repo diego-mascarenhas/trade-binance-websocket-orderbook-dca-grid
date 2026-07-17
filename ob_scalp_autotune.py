@@ -188,7 +188,7 @@ def start_bot(
     ]
     if recover:
         cmd.extend(["--recover", "--recover-max-level", str(recover_max_level)])
-        lock_min = os.getenv("OB_RECOVER_LOCK_MIN", "15").strip() or "15"
+        lock_min = os.getenv("OB_RECOVER_LOCK_MIN", "5").strip() or "5"
         cmd.extend(["--recover-lock-min", lock_min])
     cmd.extend(["--bar-sec", str(bar_sec), "--recv-window", "15000"])
     cmd.extend(tuned.to_cli())
@@ -223,6 +223,17 @@ def start_bot(
         log(symbol, "Pattern filter OFF")
     if os.getenv("OB_IMB_FILTER", "").strip().lower() in ("1", "true", "yes", "on"):
         cmd.append("--imb-filter")
+    # Multi-trigger + OB wall exits (default on via bot flags; allow env override)
+    mt = os.getenv("OB_MULTI_TRIGGER", "1").strip().lower()
+    if mt in ("0", "false", "no", "off"):
+        cmd.append("--no-multi-trigger")
+    else:
+        cmd.append("--multi-trigger")
+    ox = os.getenv("OB_EXITS", "1").strip().lower()
+    if ox in ("0", "false", "no", "off"):
+        cmd.append("--no-ob-exits")
+    else:
+        cmd.append("--ob-exits")
     # Keep ML on once we have a small sample; soft threshold handles low-confidence bars.
     if bars_n < 20:
         cmd.append("--no-ml-filter")

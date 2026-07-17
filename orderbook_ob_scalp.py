@@ -34,6 +34,12 @@ from ob_pattern import (
     format_pattern_console,
     pattern_allows,
 )
+from ob_triggers import (
+    collect_triggers,
+    hit_sl,
+    hit_tp,
+    resolve_ob_exits,
+)
 from ob_scalp_ml import feature_vector, load_models, predict_prob
 from ob_scalp_adaptive import (
     effective_filters,
@@ -68,6 +74,12 @@ from ob_signals import (
     should_tp_close,
 )
 from trade_sounds import play_close_sound, play_sound, sound_pack_label, sounds_enabled
+from ob_scalp_stack import clear_drain, is_draining, stop_watch
+from ob_scalp_exits import (
+    cancel_scalp_exchange_exits,
+    our_exits_present,
+    place_scalp_exchange_exits,
+)
 
 from orderbook_dca_grid import (
     BOLD,
@@ -170,6 +182,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if not raw.strip():
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_trig(name: str, default: bool = True) -> bool:
+    """Trigger enable flag (default on unless explicitly disabled)."""
+    return _env_bool(name, default)
 
 
 def resolve_entry_qty(
@@ -288,16 +305,20 @@ def _print_pnl_summary(
 
 def _print_open_position(pos: PositionState, mark: float, args: argparse.Namespace) -> None:
     pnl = profit_pct(pos.entry, mark, pos.is_long)
-    tp_px, sl_px = _tp_sl_prices(pos.entry, pos.is_long, args.tp_pct, args.sl_pct)
+    if pos.tp_price > 0 and pos.sl_price > 0:
+        tp_px, sl_px = pos.tp_price, pos.sl_price
+    else:
+        tp_px, sl_px = _tp_sl_prices(pos.entry, pos.is_long, args.tp_pct, args.sl_pct)
     trail_note = ""
     if args.trail_pct > 0:
         if pos.trail_armed:
             trail_note = f"  {GREEN}trail{RESET} stop {price_fmt(_trail_stop_price(pos, args.trail_pct))}"
         else:
             trail_note = f"  {DIM}trail arms @ +{args.trail_arm_pct:g}%{RESET}"
+    trig = f"  {DIM}via {pos.trigger}{RESET}" if pos.trigger else ""
     print(
         f"  {_side_label(pos.is_long)} @ {price_fmt(pos.entry)}  "
-        f"pnl {pnl:+.3f}%  TP {price_fmt(tp_px)}  SL {price_fmt(sl_px)}{trail_note}",
+        f"pnl {pnl:+.3f}%  TP {price_fmt(tp_px)}  SL {price_fmt(sl_px)}{trail_note}{trig}",
     )
 
 
@@ -376,6 +397,10 @@ class PositionState:
     trail_armed: bool = False
     entry_features: list[float] | None = None
     entry_signal: str = ""
+    trigger: str = ""
+    tp_price: float = 0.0
+    sl_price: float = 0.0
+    exits_note: str = ""
 
     def __post_init__(self) -> None:
         if self.extreme_mark <= 0:
@@ -417,6 +442,45 @@ def _recovery_allows_soft_exit(
     )
 
 
+def _arm_exchange_exits(
+    sym: str,
+    pos: PositionState,
+    mark: float,
+    args: argparse.Namespace,
+    hedge: bool,
+    filt: dict[str, Decimal],
+    api: str,
+    sec: str,
+    *,
+    force: bool = False,
+) -> None:
+    """Place Binance TP/SL algo orders from pos.tp_price / pos.sl_price (OB or %)."""
+    if args.dry_run or not getattr(args, "exchange_exits", True):
+        return
+    tp_px, sl_px = pos.tp_price, pos.sl_price
+    if tp_px <= 0 or sl_px <= 0:
+        tp_px, sl_px = _tp_sl_prices(pos.entry, pos.is_long, args.tp_pct, args.sl_pct)
+        pos.tp_price, pos.sl_price = tp_px, sl_px
+    if not force:
+        has_tp, has_sl = our_exits_present(sym, api, sec, args.recv_window)
+        if has_tp and has_sl:
+            return
+    try:
+        tp_used, sl_used = place_scalp_exchange_exits(
+            sym, pos.is_long, pos.qty, pos.entry, mark, tp_px, sl_px,
+            filt, hedge, api, sec, args.recv_window,
+            fee_buffer_pct=args.fee_buffer,
+            replace=True,
+        )
+        pos.tp_price, pos.sl_price = tp_used, sl_used
+        append_journal(
+            sym,
+            f"EXITS armed TP={tp_used:g} SL={sl_used:g} qty={pos.qty:g}",
+        )
+    except Exception as exc:
+        print(f"{YELLOW}Exchange exits not armed: {exc}{RESET}")
+
+
 def _handle_close(
     sym: str,
     pos: PositionState,
@@ -431,6 +495,7 @@ def _handle_close(
     sec: str,
     *,
     adaptive_state=None,
+    already_flat: bool = False,
 ) -> float:
     """Close position; return monotonic close timestamp for entry cooldown."""
     direction = "LONG" if pos.is_long else "SHORT"
@@ -450,6 +515,7 @@ def _handle_close(
             gross_pct=gross_pct,
             net_usdt=net_usdt,
             dry_run=args.dry_run,
+            trigger=pos.trigger or "",
         )
         if recovery.level <= 0 and recovery.cumulative_loss_usdt <= 0:
             print(f"{GREEN}Recovery reset — debt cleared, back to base size.{RESET}")
@@ -467,14 +533,22 @@ def _handle_close(
                 f"cumulative loss {recovery.cumulative_loss_usdt:.4f} USDT{RESET}",
             )
     elif not args.dry_run:
+        trig = f" trigger={pos.trigger}" if pos.trigger else ""
         append_journal(
             sym,
-            f"{reason} {direction} qty={pos.qty:g} gross={gross_pct:+.3f}% "
-            f"pnl={net_usdt:+.4f} USDT",
+            f"{reason} {direction} qty={pos.qty:g} entry={pos.entry:g} exit={exit_price:g} "
+            f"gross={gross_pct:+.3f}% pnl={net_usdt:+.4f} USDT{trig}",
         )
 
     if not args.dry_run:
-        market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
+        try:
+            n = cancel_scalp_exchange_exits(sym, api, sec, args.recv_window)
+            if n:
+                print(f"{DIM}Cancelled {n} exchange exit algo(s){RESET}")
+        except Exception as exc:
+            print(f"{YELLOW}Cancel exchange exits: {exc}{RESET}")
+        if not already_flat:
+            market_close_position(sym, pos.is_long, pos.qty, hedge, filt, api, sec, args.recv_window)
     refresh_pnl_stats(sym)
     _print_pnl_summary(sym, None, exit_price)
     if not args.dry_run:
@@ -614,8 +688,29 @@ def run_loop(args: argparse.Namespace) -> None:
         pack = sound_pack_label()
         sound_note = f"\n  sounds ON ({pack}: entry/dca/tp/sl)"
     imb_note = ""
-    if not args.imb_filter:
+    if getattr(args, "multi_trigger", True):
+        imb_note = (
+            "\n  multi-trigger OR: momentum · imbalance · ema_trend/cross · pattern · ml"
+            "\n  (tagged in journal for ./obscalp-trades)"
+        )
+    elif not args.imb_filter:
         imb_note = f"\n  entry signal: momentum≥{args.momentum_min_pct:g}% (imbalance filter OFF by default)"
+    exits_note = ""
+    if getattr(args, "ob_exits", True):
+        exits_note = (
+            f"\n  exits OB walls (fallback TP {args.tp_pct:g}% / SL {args.sl_pct:g}%, "
+            f"max wall {getattr(args, 'ob_exit_max_pct', 3):g}%)"
+        )
+        if getattr(args, "exchange_exits", True):
+            exits_note += "\n  exchange TP/SL ON (TAKE_PROFIT_MARKET + STOP_MARKET at open)"
+        else:
+            exits_note += "\n  exchange TP/SL OFF (software exits only)"
+    if is_draining(sym):
+        print(
+            f"\n{YELLOW}DRAIN MODE · {sym} — manage open TP/SL only, no new entries; "
+            f"exit when flat{RESET}",
+        )
+        append_journal(sym, "DRAIN mode active — exits only until flat")
     print(
         f"\n{BOLD}{CYAN}OB scalp · {sym}{RESET}  {mode}\n"
         f"  bar {args.bar_sec:g}s  sample {args.sample_sec:g}s  band ±{args.band_pct:g}%\n"
@@ -626,7 +721,7 @@ def run_loop(args: argparse.Namespace) -> None:
         )
         + f"TP +{args.tp_pct:g}%  SL -{args.sl_pct:g}%  max {args.max_bars} bars\n"
         f"  fee buffer {args.fee_buffer:g}% (no TP/flip close if net ≤ 0)  "
-        f"size {size_note}{imb_note}{recover_note}{ema_note}{pat_note}{trail_note}{sound_note}  Ctrl+C to stop\n",
+        f"size {size_note}{imb_note}{exits_note}{recover_note}{ema_note}{pat_note}{trail_note}{sound_note}  Ctrl+C to stop\n",
     )
     refresh_pnl_stats(sym)
     _print_pnl_summary(sym, None, _preview_mid if _preview_mid > 0 else 0.0)
@@ -697,24 +792,87 @@ def run_loop(args: argparse.Namespace) -> None:
             side, live_qty, live_entry = _detect_open_side(sym, hedge, api, sec, args.recv_window)
             if side is not None and live_qty > 0:
                 if pos is None:
+                    tp_px = sl_px = 0.0
+                    exits_note = ""
+                    if getattr(args, "ob_exits", True):
+                        try:
+                            ex = resolve_ob_exits(
+                                bids, asks, live_entry, side,
+                                fee_buffer=args.fee_buffer,
+                                tick=filt["tick_size"],
+                                tp_pct_fallback=args.tp_pct,
+                                sl_pct_fallback=sl_threshold,
+                                wall_min_mult=float(getattr(args, "ob_wall_min_mult", 1.0)),
+                                max_range_pct=float(getattr(args, "ob_exit_max_pct", 3.0)),
+                            )
+                            tp_px, sl_px = ex.tp_price, ex.sl_price
+                            exits_note = ex.note
+                            print(f"{DIM}Adopted open position — exits OB · {ex.note}{RESET}")
+                        except Exception as exc:
+                            print(f"{YELLOW}Adopt OB exits failed: {exc}{RESET}")
                     pos = PositionState(
                         is_long=side,
                         entry=live_entry,
                         qty=live_qty,
                         opened_at=now,
+                        tp_price=tp_px,
+                        sl_price=sl_px,
+                        exits_note=exits_note,
+                        trigger="adopted",
                     )
+                    _arm_exchange_exits(sym, pos, mark, args, hedge, filt, api, sec)
                 else:
                     pos.qty = live_qty
                     pos.entry = live_entry
                     pos.is_long = side
             elif pos is not None and live_qty <= 0:
-                print(f"{DIM}Position flat on exchange — clearing local state.{RESET}")
+                pnl = profit_pct(pos.entry, mark, pos.is_long)
+                reason = "TP" if pnl >= 0 else "SL"
+                print(
+                    f"{DIM}Position flat on exchange — recording {reason} "
+                    f"(exchange exit or external close){RESET}",
+                )
+                last_close_at = _handle_close(
+                    sym, pos, mark, pnl, reason, args, recovery, hedge, filt, api, sec,
+                    adaptive_state=adaptive,
+                    already_flat=True,
+                )
                 pos = None
+
+            if is_draining(sym) and pos is None and (side is None or live_qty <= 0):
+                print(
+                    f"{GREEN}Drain complete · {sym} flat — shutting down "
+                    f"(TP/SL handoff done){RESET}",
+                )
+                append_journal(sym, "DRAIN complete — flat, bot exit")
+                clear_drain(sym)
+                stop_watch(sym)
+                return
 
             if pos is not None:
                 pnl = profit_pct(pos.entry, mark, pos.is_long)
                 _update_trail(pos, mark, args)
-                if should_tp_close(pnl, args.tp_pct, args.fee_buffer):
+                use_ob_exits = bool(getattr(args, "ob_exits", True) and pos.tp_price > 0)
+                tp_hit = False
+                sl_hit = False
+                if use_ob_exits:
+                    tp_hit = hit_tp(mark, pos.is_long, pos.tp_price) and should_discretionary_close(
+                        pnl, args.fee_buffer,
+                    )
+                    # Allow TP via wall even if % target not reached — still require net > 0
+                    if hit_tp(mark, pos.is_long, pos.tp_price) and not should_discretionary_close(
+                        pnl, args.fee_buffer,
+                    ):
+                        print(
+                            f"{DIM}OB TP wall touched but est. net "
+                            f"{pnl - args.fee_buffer:+.3f}% ≤ 0 — holding{RESET}",
+                        )
+                    sl_hit = hit_sl(mark, pos.is_long, pos.sl_price)
+                else:
+                    tp_hit = should_tp_close(pnl, args.tp_pct, args.fee_buffer)
+                    sl_hit = pnl <= -sl_threshold
+
+                if tp_hit:
                     _print_close_event("TP", pos, pnl, mark, fee_buffer=args.fee_buffer)
                     last_close_at = _handle_close(
                         sym, pos, mark, pnl, "TP", args, recovery, hedge, filt, api, sec,
@@ -742,13 +900,15 @@ def run_loop(args: argparse.Namespace) -> None:
                             adaptive_state=adaptive,
                         )
                         pos = None
-                elif pnl >= args.tp_pct and not should_tp_close(pnl, args.tp_pct, args.fee_buffer):
+                elif not use_ob_exits and pnl >= args.tp_pct and not should_tp_close(
+                    pnl, args.tp_pct, args.fee_buffer,
+                ):
                     print(
                         f"{DIM}TP gross {pnl:+.3f}% but est. net "
                         f"{pnl - args.fee_buffer:+.3f}% ≤ 0 — holding "
                         f"{_side_label(pos.is_long)}{RESET}",
                     )
-                elif pnl <= -sl_threshold:
+                elif sl_hit:
                     _print_close_event("SL", pos, pnl, mark, fee_buffer=args.fee_buffer)
                     last_close_at = _handle_close(
                         sym, pos, mark, pnl, "SL", args, recovery, hedge, filt, api, sec,
@@ -762,19 +922,19 @@ def run_loop(args: argparse.Namespace) -> None:
                 continue
 
             ob_signal = entry_signal(bar, sig_cfg)
+            # Always gather context for multi-trigger (and optional AND filters).
             ema_snap = None
-            if args.ema_filter:
-                try:
-                    ema_snap = fetch_ema_snapshot(
-                        sym,
-                        interval=args.ema_interval,
-                        fast=args.ema_fast,
-                        slow=args.ema_slow,
-                        slope_bars=args.ema_slope_bars,
-                        slope_min_pct=ema_slope,
-                    )
-                except Exception as exc:
-                    print(f"{YELLOW}EMA fetch failed: {exc}{RESET}")
+            try:
+                ema_snap = fetch_ema_snapshot(
+                    sym,
+                    interval=args.ema_interval,
+                    fast=args.ema_fast,
+                    slow=args.ema_slow,
+                    slope_bars=args.ema_slope_bars,
+                    slope_min_pct=ema_slope,
+                )
+            except Exception as exc:
+                print(f"{YELLOW}EMA fetch failed: {exc}{RESET}")
 
             bar_rec = BarRecord.from_bar(bar, ob_signal=ob_signal, ema=ema_snap)
             print_bar(bar, ob_signal)
@@ -784,17 +944,8 @@ def run_loop(args: argparse.Namespace) -> None:
                 extra = f" ob={ob_signal or 'none'}" if ob_signal else ""
                 append_ema_log(sym, ema_snap.log_line() + extra)
 
-            signal = ob_signal
-            if signal and ema_snap and not ema_allows(signal, ema_snap):
-                print(
-                    f"{YELLOW}EMA filter block {signal.upper()} "
-                    f"(trend={ema_snap.trend}, slope={ema_snap.slope_pct:+.3f}%){RESET}",
-                )
-                append_ema_log(sym, f"BLOCK {signal.upper()} trend={ema_snap.trend}")
-                signal = None
-
             pat_snap = None
-            if args.pattern_filter:
+            if args.pattern_filter or getattr(args, "multi_trigger", True):
                 try:
                     pat_cfg = PatternConfig(
                         interval=args.pattern_interval,
@@ -808,21 +959,59 @@ def run_loop(args: argparse.Namespace) -> None:
                     print(f"{YELLOW}Pattern fetch failed: {exc}{RESET}")
                 if pat_snap:
                     print(format_pattern_console(pat_snap))
-                if signal and pat_snap and not pattern_allows(signal, pat_snap):
+
+            ml_prob_long = ml_prob_short = None
+            if ml_model and args.ml_filter:
+                ml_prob_long = predict_prob(ml_model, bar_rec, "long")
+                ml_prob_short = predict_prob(ml_model, bar_rec, "short")
+
+            trigger_tag = ""
+            if getattr(args, "multi_trigger", True):
+                enable = {
+                    "momentum": _env_trig("OB_TRIG_MOMENTUM", True),
+                    "imbalance": _env_trig("OB_TRIG_IMBALANCE", True),
+                    "ema_trend": _env_trig("OB_TRIG_EMA_TREND", True),
+                    "ema_cross": _env_trig("OB_TRIG_EMA_CROSS", True),
+                    "pattern": _env_trig("OB_TRIG_PATTERN", True) and bool(args.pattern_filter or True),
+                    "ml": _env_trig("OB_TRIG_ML", True) and bool(args.ml_filter and ml_model),
+                }
+                decision = collect_triggers(
+                    bar, sig_cfg,
+                    ema=ema_snap,
+                    pattern=pat_snap,
+                    ml_prob_long=ml_prob_long,
+                    ml_prob_short=ml_prob_short,
+                    ml_min_prob=ml_threshold,
+                    enable=enable,
+                )
+                signal = decision.side
+                trigger_tag = decision.tag
+                if signal and trigger_tag:
+                    print(f"{CYAN}Triggers {signal.upper()}: {trigger_tag}{RESET}")
+            else:
+                signal = ob_signal
+                trigger_tag = "momentum" if signal and not args.imb_filter else ("imbalance" if signal else "")
+                if signal and args.ema_filter and ema_snap and not ema_allows(signal, ema_snap):
+                    print(
+                        f"{YELLOW}EMA filter block {signal.upper()} "
+                        f"(trend={ema_snap.trend}, slope={ema_snap.slope_pct:+.3f}%){RESET}",
+                    )
+                    append_ema_log(sym, f"BLOCK {signal.upper()} trend={ema_snap.trend}")
+                    signal = None
+                if signal and args.pattern_filter and pat_snap and not pattern_allows(signal, pat_snap):
                     print(
                         f"{YELLOW}Pattern filter block {signal.upper()} "
                         f"({pat_snap.reason}){RESET}",
                     )
                     signal = None
-
-            if signal and ml_model and args.ml_filter:
-                prob = predict_prob(ml_model, bar_rec, signal)
-                if prob < ml_threshold:
-                    print(
-                        f"{YELLOW}ML filter block {signal.upper()} "
-                        f"(prob={prob:.2f} < {ml_threshold:.2f}){RESET}",
-                    )
-                    signal = None
+                if signal and ml_model and args.ml_filter:
+                    prob = predict_prob(ml_model, bar_rec, signal)
+                    if prob < ml_threshold:
+                        print(
+                            f"{YELLOW}ML filter block {signal.upper()} "
+                            f"(prob={prob:.2f} < {ml_threshold:.2f}){RESET}",
+                        )
+                        signal = None
 
             if pos is not None:
                 _print_open_position(pos, bar.mid_c, args)
@@ -883,6 +1072,14 @@ def run_loop(args: argparse.Namespace) -> None:
                         )
 
             elif signal and not args.dry_run:
+                if is_draining(sym):
+                    print(
+                        f"{DIM}Drain mode — skip {signal.upper()} entry "
+                        f"(waiting for TP/SL flat){RESET}",
+                    )
+                    builder.reset_after_bar(now)
+                    time.sleep(args.sample_sec)
+                    continue
                 is_long = signal == "long"
                 if last_close_at and (now - last_close_at) < args.entry_cooldown_sec:
                     wait = args.entry_cooldown_sec - (now - last_close_at)
@@ -945,10 +1142,29 @@ def run_loop(args: argparse.Namespace) -> None:
                 direction = "LONG" if is_long else "SHORT"
                 side_color = _side_color("long" if is_long else "short")
                 mult_note = f" · {recovery.multiplier:g}x recover" if args.recover and recovery.level > 0 else ""
+                trig_note = f" · via {trigger_tag}" if trigger_tag else ""
+
+                exits = None
+                if getattr(args, "ob_exits", True):
+                    try:
+                        exits = resolve_ob_exits(
+                            bids, asks, bar.mid_c, is_long,
+                            fee_buffer=args.fee_buffer,
+                            tick=filt["tick_size"],
+                            tp_pct_fallback=args.tp_pct,
+                            sl_pct_fallback=sl_threshold,
+                            wall_min_mult=float(getattr(args, "ob_wall_min_mult", 1.0)),
+                            max_range_pct=float(getattr(args, "ob_exit_max_pct", 3.0)),
+                        )
+                    except Exception as exc:
+                        print(f"{YELLOW}OB exits resolve failed ({exc}) — using % TP/SL{RESET}")
+
                 print(
                     f"{BOLD}{side_color}▶ MARKET {direction} {qty_str} @ ~{price_fmt(bar.mid_c)} "
-                    f"(imb {bar.imbalance * 100:.1f}%{mult_note}){RESET}",
+                    f"(imb {bar.imbalance * 100:.1f}%{mult_note}{trig_note}){RESET}",
                 )
+                if exits:
+                    print(f"  {DIM}exits OB · {exits.note}  TP {price_fmt(exits.tp_price)}  SL {price_fmt(exits.sl_price)}{RESET}")
                 try:
                     market_open(sym, is_long, qty_str, hedge, api, sec, args.recv_window, cid=cid)
                     pos = PositionState(
@@ -959,39 +1175,53 @@ def run_loop(args: argparse.Namespace) -> None:
                         recovery_level=recovery.level if args.recover else 0,
                         entry_features=feature_vector(bar_rec),
                         entry_signal=signal,
+                        trigger=trigger_tag,
+                        tp_price=exits.tp_price if exits else 0.0,
+                        sl_price=exits.sl_price if exits else 0.0,
+                        exits_note=exits.note if exits else "",
                     )
+                    if pos.tp_price <= 0 or pos.sl_price <= 0:
+                        pos.tp_price, pos.sl_price = _tp_sl_prices(
+                            pos.entry, pos.is_long, args.tp_pct, sl_threshold,
+                        )
+                    _arm_exchange_exits(sym, pos, bar.mid_c, args, hedge, filt, api, sec, force=True)
                     if args.adaptive and adaptive is not None:
                         on_trade_open(sym, adaptive)
-                    if args.recover:
-                        append_journal(
-                            sym,
-                            f"OPEN {direction} qty={qty_f:g} notional={notional:.4f} "
-                            f"level={recovery.level} ({recovery.multiplier:g}x)",
-                        )
+                    trig_j = f" trigger={trigger_tag}" if trigger_tag else ""
+                    append_journal(
+                        sym,
+                        f"OPEN {direction} qty={qty_f:g} notional={notional:.4f} "
+                        f"level={recovery.level if args.recover else 0} "
+                        f"({recovery.multiplier if args.recover else 1:g}x){trig_j}",
+                    )
                     play_sound("entry")
                 except RuntimeError as exc:
                     print(f"{RED}Market entry failed: {exc}{RESET}")
 
             elif signal and args.dry_run:
-                direction = signal.upper()
-                side_color = _side_color(signal)
-                mult_note = ""
-                if args.recover:
-                    try:
-                        _, _, base_notional = resolve_entry_qty(
-                            args, bar.mid_c, filt, api, sec, recovery=None,
-                        )
-                        next_notional, next_level = target_notional(
-                            recovery, base_notional, max_level=args.recover_max_level,
-                        )
-                        mult = 2 ** next_level
-                        mult_note = f" · would {mult:g}x ({next_notional:.2f} USDT)"
-                    except ValueError:
-                        pass
-                print(
-                    f"{side_color}  [dry-run] would MARKET {direction} "
-                    f"@ ~{price_fmt(bar.mid_c)}{mult_note}{RESET}",
-                )
+                if is_draining(sym):
+                    print(f"{DIM}Drain mode — skip dry-run {signal.upper()}{RESET}")
+                else:
+                    direction = signal.upper()
+                    side_color = _side_color(signal)
+                    mult_note = ""
+                    if args.recover:
+                        try:
+                            _, _, base_notional = resolve_entry_qty(
+                                args, bar.mid_c, filt, api, sec, recovery=None,
+                            )
+                            next_notional, next_level = target_notional(
+                                recovery, base_notional, max_level=args.recover_max_level,
+                            )
+                            mult = 2 ** next_level
+                            mult_note = f" · would {mult:g}x ({next_notional:.2f} USDT)"
+                        except ValueError:
+                            pass
+                    trig_note = f" · via {trigger_tag}" if trigger_tag else ""
+                    print(
+                        f"{side_color}  [dry-run] would MARKET {direction} "
+                        f"@ ~{price_fmt(bar.mid_c)}{mult_note}{trig_note}{RESET}",
+                    )
 
             builder.reset_after_bar(now)
             time.sleep(max(0.0, args.sample_sec))
@@ -1053,6 +1283,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pattern-min-vol-ratio", type=float,
                    default=_env_float("OB_PATTERN_MIN_VOL_RATIO", 0.90),
                    help="Min last-candle volume vs 20-bar avg (default 0.90)")
+    p.add_argument("--multi-trigger", action=argparse.BooleanOptionalAction,
+                   default=_env_bool("OB_MULTI_TRIGGER", True),
+                   help="OR entry triggers (momentum/imb/ema/pattern/ml) and tag trades (default on)")
+    p.add_argument("--ob-exits", action=argparse.BooleanOptionalAction,
+                   default=_env_bool("OB_EXITS", True),
+                   help="TP/SL from order-book walls with %% fallback (default on)")
+    p.add_argument("--exchange-exits", action=argparse.BooleanOptionalAction,
+                   default=_env_bool("OB_EXCHANGE_EXITS", True),
+                   help="Place TAKE_PROFIT_MARKET + STOP_MARKET on Binance at open (default on)")
+    p.add_argument("--ob-wall-min-mult", type=float, default=_env_float("OB_WALL_MIN_MULT", 1.0),
+                   help="Min wall size vs median book qty for OB TP (default 1.0)")
+    p.add_argument("--ob-exit-max-pct", type=float, default=_env_float("OB_EXIT_MAX_PCT", 3.0),
+                   help="Max wall distance %% before falling back to %% TP/SL (default 3)")
     p.add_argument(
         "--size-mode",
         choices=["min", "wallet", "fixed"],
@@ -1067,8 +1310,8 @@ def parse_args() -> argparse.Namespace:
                    help="After a losing close, double size on SAME side until TP (state in .run/logs/SYMBOL/)")
     p.add_argument("--recover-max-level", type=int, default=int(_env_float("OB_RECOVER_MAX_LEVEL", 4)),
                    help="Max martingale level (2^level multiplier cap, default 4 = 16x)")
-    p.add_argument("--recover-lock-min", type=float, default=_env_float("OB_RECOVER_LOCK_MIN", 15.0),
-                   help="Minutes to keep same-side lock after loss (0=until debt cleared, default 15)")
+    p.add_argument("--recover-lock-min", type=float, default=_env_float("OB_RECOVER_LOCK_MIN", 5.0),
+                   help="Minutes to keep same-side lock after loss (0=until debt cleared, default 5)")
     p.add_argument("--entry-cooldown-sec", type=float, default=_env_float("OB_ENTRY_COOLDOWN_SEC", 45.0),
                    help="Seconds to wait after a close before a new entry (default 45)")
     p.add_argument("--ema-filter", action=argparse.BooleanOptionalAction,

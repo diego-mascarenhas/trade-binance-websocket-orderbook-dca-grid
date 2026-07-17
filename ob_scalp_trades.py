@@ -15,6 +15,7 @@ import argparse
 import re
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +37,7 @@ CLEAR = "\033[H\033[2J"
 _OPEN_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) "
     r"OPEN (LONG|SHORT) qty=([0-9.]+) notional=([0-9.]+) level=(\d+) \((\d+)x\)"
+    r"(?: trigger=(\S+))?"
 )
 _CLOSE_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) "
@@ -43,6 +45,7 @@ _CLOSE_RE = re.compile(
     r"entry=([0-9.eE+-]+) exit=([0-9.eE+-]+) "
     r"gross=([+-]?[0-9.]+)% pnl=([+-]?[0-9.]+) USDT "
     r"level=(\d+) streak=(\d+) cumulative=([+-]?[0-9.]+)"
+    r"(?: trigger=(\S+))?"
     r"(?: → (.+))?$"
 )
 
@@ -61,6 +64,7 @@ class TradeRow:
     level: int
     mult: str
     outcome: str
+    trigger: str = ""
 
 
 def parse_journal(symbol: str) -> list[TradeRow]:
@@ -68,12 +72,14 @@ def parse_journal(symbol: str) -> list[TradeRow]:
     if not path.exists():
         return []
     rows: list[TradeRow] = []
+    last_open_trigger = ""
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
         m = _OPEN_RE.match(line)
         if m:
+            last_open_trigger = (m.group(7) or "").strip()
             rows.append(
                 TradeRow(
                     ts=m.group(1),
@@ -88,12 +94,14 @@ def parse_journal(symbol: str) -> list[TradeRow]:
                     level=int(m.group(5)),
                     mult=f"{m.group(6)}x",
                     outcome="",
+                    trigger=last_open_trigger,
                 )
             )
             continue
         m = _CLOSE_RE.match(line)
         if m:
-            outcome = (m.group(12) or "").strip()
+            outcome = (m.group(13) or "").strip()
+            trig = (m.group(12) or "").strip() or last_open_trigger
             rows.append(
                 TradeRow(
                     ts=m.group(1),
@@ -108,8 +116,10 @@ def parse_journal(symbol: str) -> list[TradeRow]:
                     level=int(m.group(9)),
                     mult="",
                     outcome=outcome,
+                    trigger=trig,
                 )
             )
+            last_open_trigger = ""
     return rows
 
 
@@ -133,7 +143,14 @@ def _reason_color(kind: str) -> str:
     return CYAN
 
 
-def _format_report(symbol: str, *, limit: int | None, show_opens: bool, live: bool = False) -> str:
+def _format_report(
+    symbol: str,
+    *,
+    limit: int | None,
+    show_opens: bool,
+    live: bool = False,
+    show_symbol_col: bool = False,
+) -> str:
     sym = symbol.upper()
     all_rows = parse_journal(sym)
     closes = [r for r in all_rows if r.kind != "OPEN"]
@@ -158,6 +175,8 @@ def _format_report(symbol: str, *, limit: int | None, show_opens: bool, live: bo
     head = f"{BOLD}{CYAN}{sym}{RESET}  {DIM}{len(closes)} closed trades{RESET}"
     if live:
         head += f"  {DIM}live {now}{RESET}"
+        if show_symbol_col:
+            head += f"  {DIM}(following active){RESET}"
     lines.append(head)
     lines.append(
         f"{BOLD}Total PnL  {t_color}{total_pnl:+.4f} USDT{RESET}  "
@@ -165,29 +184,42 @@ def _format_report(symbol: str, *, limit: int | None, show_opens: bool, live: bo
     )
     lines.append("")
 
-    hdr = f"{'When':<19} {'Evt':<7} {'Side':<5} {'Vol USDT':>9} {'Gross':>8} {'PnL USDT':>10}  Note"
+    if show_symbol_col:
+        hdr = (
+            f"{'When':<19} {'Symbol':<10} {'Evt':<7} {'Side':<5} {'Vol USDT':>9} "
+            f"{'Gross':>8} {'PnL USDT':>10}  {'Trigger':<28} Note"
+        )
+        sep = "-" * 108
+    else:
+        hdr = (
+            f"{'When':<19} {'Evt':<7} {'Side':<5} {'Vol USDT':>9} "
+            f"{'Gross':>8} {'PnL USDT':>10}  {'Trigger':<28} Note"
+        )
+        sep = "-" * 96
     lines.append(f"{DIM}{hdr}{RESET}")
-    lines.append(f"{DIM}{'-' * 72}{RESET}")
+    lines.append(f"{DIM}{sep}{RESET}")
 
     for r in rows:
         vol = r.notional
         if vol is None and r.entry is not None and r.qty > 0:
             vol = r.entry * r.qty
         vol_s = f"{vol:.2f}" if vol is not None else ""
+        trig = (r.trigger or "—")[:28]
+        sym_cell = f"{BOLD}{sym:<10}{RESET} " if show_symbol_col else ""
         if r.kind == "OPEN":
             note = f"qty {r.qty:g} · level {r.level} ({r.mult})"
             lines.append(
-                f"{r.ts} {_reason_color('OPEN')}{'OPEN':<7}{RESET} {r.side:<5} "
-                f"{vol_s:>9} {'':>8} {'':>10}  {DIM}{note}{RESET}"
+                f"{r.ts} {sym_cell}{_reason_color('OPEN')}{'OPEN':<7}{RESET} {r.side:<5} "
+                f"{vol_s:>9} {'':>8} {'':>10}  {CYAN}{trig:<28}{RESET} {DIM}{note}{RESET}"
             )
             continue
         pnl_s = f"{r.pnl:+.4f}" if r.pnl is not None else ""
         gross_s = f"{r.gross_pct:+.3f}%" if r.gross_pct is not None else ""
         note = r.outcome or f"level {r.level}"
         lines.append(
-            f"{r.ts} {_reason_color(r.kind)}{r.kind:<7}{RESET} {r.side:<5} "
+            f"{r.ts} {sym_cell}{_reason_color(r.kind)}{r.kind:<7}{RESET} {r.side:<5} "
             f"{vol_s:>9} {gross_s:>8} {_pnl_color(r.pnl)}{pnl_s:>10}{RESET}  "
-            f"{DIM}{note}{RESET}"
+            f"{CYAN}{trig:<28}{RESET} {DIM}{note}{RESET}"
         )
 
     lines.append("")
@@ -195,13 +227,41 @@ def _format_report(symbol: str, *, limit: int | None, show_opens: bool, live: bo
         f"{BOLD}Total PnL  {t_color}{total_pnl:+.4f} USDT{RESET}  "
         f"{DIM}{wins}W/{losses}L · {len(closes)} trades{RESET}"
     )
+
+    # Per-trigger breakdown (attribute full tag; also expand components)
+    by_tag: dict[str, list[float]] = defaultdict(list)
+    by_part: dict[str, list[float]] = defaultdict(list)
+    for r in closes:
+        tag = r.trigger or "unknown"
+        by_tag[tag].append(r.pnl or 0.0)
+        for part in tag.split("+"):
+            part = part.strip() or "unknown"
+            by_part[part].append(r.pnl or 0.0)
+
+    if any(t != "unknown" for t in by_tag):
+        lines.append(f"\n{BOLD}By trigger tag{RESET}")
+        for tag, pnls in sorted(by_tag.items(), key=lambda x: sum(x[1]), reverse=True):
+            s = sum(pnls)
+            w = sum(1 for p in pnls if p > 0)
+            l = len(pnls) - w
+            c = GREEN if s > 0 else RED if s < 0 else DIM
+            lines.append(f"  {tag:<28} {c}{s:+.4f}{RESET}  {DIM}{w}W/{l}L · {len(pnls)}{RESET}")
+        lines.append(f"\n{BOLD}By trigger component{RESET}  {DIM}(credit each part of a combo){RESET}")
+        for part, pnls in sorted(by_part.items(), key=lambda x: sum(x[1]), reverse=True):
+            s = sum(pnls)
+            w = sum(1 for p in pnls if p > 0)
+            l = len(pnls) - w
+            c = GREEN if s > 0 else RED if s < 0 else DIM
+            lines.append(f"  {part:<28} {c}{s:+.4f}{RESET}  {DIM}{w}W/{l}L · {len(pnls)}{RESET}")
+
     recovery = load_state(sym)
     if recovery.level > 0 or recovery.cumulative_loss_usdt > 0:
-        lines.append(f"{DIM}{format_status(recovery)}{RESET}")
+        prefix = f"{sym}  " if show_symbol_col else ""
+        lines.append(f"{DIM}{prefix}{format_status(recovery)}{RESET}")
         if recovery.base_notional_usdt > 0:
             nxt = recovery.base_notional_usdt * (2 ** max(0, recovery.level))
             lines.append(
-                f"{DIM}next entry ~{nxt:g} USDT "
+                f"{DIM}{prefix}next entry ~{nxt:g} USDT "
                 f"({recovery.multiplier:g}x · base {recovery.base_notional_usdt:g}){RESET}"
             )
     if live:
@@ -210,25 +270,56 @@ def _format_report(symbol: str, *, limit: int | None, show_opens: bool, live: bo
     return "\n".join(lines)
 
 
-def print_trades(symbol: str, *, limit: int | None, show_opens: bool) -> int:
-    text = _format_report(symbol, limit=limit, show_opens=show_opens, live=False)
+def print_trades(
+    symbol: str,
+    *,
+    limit: int | None,
+    show_opens: bool,
+    show_symbol_col: bool = False,
+) -> int:
+    text = _format_report(
+        symbol,
+        limit=limit,
+        show_opens=show_opens,
+        live=False,
+        show_symbol_col=show_symbol_col,
+    )
     sys.stdout.write(text)
     sys.stdout.flush()
     return 0 if "No trades" not in text else 1
 
 
 def follow_trades(
-    symbol: str,
+    symbol: str | None,
     *,
     limit: int | None,
     show_opens: bool,
     interval: float,
 ) -> int:
-    """Clear and redraw the trades report until Ctrl+C."""
+    """Clear and redraw until Ctrl+C.
+
+    If ``symbol`` is None, re-resolve ``active_symbol()`` each tick (follow pick).
+    """
     last = ""
+    last_sym = ""
+    follow_active = symbol is None
     try:
         while True:
-            text = _format_report(symbol, limit=limit, show_opens=show_opens, live=True)
+            sym = (symbol or active_symbol() or "").upper()
+            if not sym:
+                text = f"{DIM}No active symbol yet · waiting… · Ctrl+C to stop{RESET}\n"
+            else:
+                if follow_active and sym != last_sym and last_sym:
+                    # Force redraw banner when pick switches
+                    last = ""
+                text = _format_report(
+                    sym,
+                    limit=limit,
+                    show_opens=show_opens,
+                    live=True,
+                    show_symbol_col=follow_active,
+                )
+                last_sym = sym
             if text != last:
                 sys.stdout.write(CLEAR + text)
                 sys.stdout.flush()
@@ -241,11 +332,11 @@ def follow_trades(
 
 def main() -> int:
     p = argparse.ArgumentParser(description="All OB scalp trades + total PnL for a symbol")
-    p.add_argument("symbol", nargs="?", help="Symbol (default: active stack)")
+    p.add_argument("symbol", nargs="?", help="Symbol (default: follow active stack)")
     p.add_argument("-n", "--limit", type=int, default=0,
                    help="Show only last N closes (0 = all)")
     p.add_argument("-f", "--follow", action="store_true",
-                   help="Live refresh (like tail -f)")
+                   help="Live refresh; without SYMBOL, follows active pick")
     p.add_argument("--interval", type=float, default=2.0,
                    help="Follow refresh seconds (default 2)")
     p.add_argument("--opens", action="store_true", help="Also show OPEN lines")
@@ -265,17 +356,33 @@ def main() -> int:
             print(f"{sym}{mark}  {color}{total:+.4f}{RESET} USDT  ({len(closes)} trades)")
         return 0
 
-    sym = (args.symbol or active_symbol() or "").upper()
+    pinned = (args.symbol or "").upper() or None
+    limit = args.limit if args.limit and args.limit > 0 else None
+
+    if args.follow:
+        if pinned is None and not active_symbol():
+            print(
+                f"{DIM}No active symbol yet — will wait for pick…{RESET}",
+                file=sys.stderr,
+            )
+        return follow_trades(
+            pinned,
+            limit=limit,
+            show_opens=args.opens,
+            interval=args.interval,
+        )
+
+    sym = pinned or (active_symbol() or "").upper()
     if not sym:
         print(f"{RED}No active symbol — pass one: ./obscalp-trades PYTHUSDT{RESET}", file=sys.stderr)
         return 1
-
-    limit = args.limit if args.limit and args.limit > 0 else None
-    if args.follow:
-        return follow_trades(
-            sym, limit=limit, show_opens=args.opens, interval=args.interval,
-        )
-    return print_trades(sym, limit=limit, show_opens=args.opens)
+    # Explicit SYMBOL → no Symbol column; one-shot of active → show column
+    return print_trades(
+        sym,
+        limit=limit,
+        show_opens=args.opens,
+        show_symbol_col=pinned is None,
+    )
 
 
 if __name__ == "__main__":

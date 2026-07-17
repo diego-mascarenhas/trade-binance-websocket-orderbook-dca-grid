@@ -23,13 +23,20 @@ class EmaSnapshot:
     allow_short: bool
     fast_period: int = 7
     slow_period: int = 25
+    cross_up: bool = False
+    cross_down: bool = False
 
     def log_line(self) -> str:
         allow = "LONG" if self.allow_long else ("SHORT" if self.allow_short else "NONE")
+        cross = ""
+        if self.cross_up:
+            cross = " cross=UP"
+        elif self.cross_down:
+            cross = " cross=DOWN"
         return (
             f"close={self.close:.4f} ema{self.fast_period}={self.ema_fast:.4f} "
             f"ema{self.slow_period}={self.ema_slow:.4f} slope={self.slope_pct:+.3f}% "
-            f"trend={self.trend} allow={allow}"
+            f"trend={self.trend} allow={allow}{cross}"
         )
 
 
@@ -83,6 +90,12 @@ def fetch_ema_snapshot(
     prev_fast = fast_s[-1 - slope_bars]
     slope_pct = ((ema_fast - prev_fast) / prev_fast * 100) if prev_fast > 0 else 0.0
 
+    cross_up = cross_down = False
+    if len(fast_s) >= 2 and len(slow_s) >= 2:
+        prev_f, prev_s = fast_s[-2], slow_s[-2]
+        cross_up = prev_f <= prev_s and ema_fast > ema_slow
+        cross_down = prev_f >= prev_s and ema_fast < ema_slow
+
     if slope_pct >= slope_min_pct and close > ema_slow:
         trend = "bullish"
     elif slope_pct <= -slope_min_pct and close < ema_slow:
@@ -100,6 +113,8 @@ def fetch_ema_snapshot(
         allow_short=trend == "bearish",
         fast_period=fast,
         slow_period=slow,
+        cross_up=cross_up,
+        cross_down=cross_down,
     )
     return snap
 

@@ -206,6 +206,12 @@ def run_once(args: argparse.Namespace, *, idle_switch: bool = False, trigger: st
             )
             executed = True
             print(f"\n{GREEN}Stack started on {sym}{RESET}  autotune={pids.get('autotune_pid')} watch={pids.get('watch_pid')}")
+            drained = str(pids.get("drained") or "")
+            stopped = str(pids.get("stopped") or "")
+            if drained:
+                print(f"{YELLOW}Draining (exits only): {drained}{RESET}")
+            if stopped:
+                print(f"{DIM}Stopped: {stopped}{RESET}")
         else:
             print(f"\n{DIM}Already running on {sym} — no switch{RESET}")
 

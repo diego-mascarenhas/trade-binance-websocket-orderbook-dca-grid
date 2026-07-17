@@ -68,12 +68,71 @@ def stop_stack(symbol: str) -> None:
     stop_bot(sym)
     stop_autotune(sym)
     stop_watch(sym)
+    clear_drain(sym)
+
+
+def drain_path(symbol: str) -> Path:
+    return LOG_ROOT / symbol.upper() / "scalp_drain"
+
+
+def is_draining(symbol: str) -> bool:
+    return drain_path(symbol).exists()
+
+
+def arm_drain(symbol: str, *, reason: str = "") -> None:
+    """Mark symbol to manage exits only (no new entries) until flat."""
+    path = drain_path(symbol)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "armed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": reason or "symbol switch",
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def clear_drain(symbol: str) -> None:
+    drain_path(symbol).unlink(missing_ok=True)
+
+
+def bot_alive(symbol: str) -> bool:
+    pid = read_pid(symbol)
+    return bool(pid and _pid_alive(pid, "orderbook_ob_scalp.py"))
+
+
+def symbol_has_open_position(symbol: str, *, recv: int = 15000) -> bool:
+    """True if Binance futures has a non-zero position on symbol."""
+    from orderbook_dca_grid import load_env_file, load_keys, _signed_request
+
+    load_env_file(None)
+    api, sec = load_keys(None)
+    if not api or not sec:
+        return False
+    rows = _signed_request(
+        "GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()}, api, sec, recv,
+    )
+    for row in rows or []:
+        if abs(float(row.get("positionAmt") or 0)) > 0:
+            return True
+    return False
+
+
+def begin_drain(symbol: str, *, reason: str = "") -> None:
+    """Keep bot for TP/SL; stop autotune so it cannot reopen after flat."""
+    sym = symbol.upper()
+    arm_drain(sym, reason=reason)
+    stop_autotune(sym)
+    try:
+        from ob_scalp_recovery import append_journal
+        append_journal(sym, f"DRAIN armed — exits only ({reason or 'symbol switch'})")
+    except Exception:
+        pass
 
 
 def running_symbols() -> list[str]:
-    out: list[str] = []
+    """Symbols with a live autotune and/or scalp bot (includes drain handoffs)."""
+    out: set[str] = set()
     if not LOG_ROOT.exists():
-        return out
+        return []
     for sym_dir in LOG_ROOT.iterdir():
         if not sym_dir.is_dir():
             continue
@@ -83,10 +142,16 @@ def running_symbols() -> list[str]:
             try:
                 pid = int(ap.read_text().strip())
                 if _pid_alive(pid, "ob_scalp_autotune.py"):
-                    out.append(sym)
+                    out.add(sym)
             except ValueError:
-                continue
+                pass
+        if bot_alive(sym):
+            out.add(sym)
     return sorted(out)
+
+
+def draining_symbols() -> list[str]:
+    return [s for s in running_symbols() if is_draining(s)]
 
 
 def load_active() -> dict[str, Any]:
@@ -189,21 +254,45 @@ def switch_stack(
     stop_others: bool = True,
     meta: dict[str, Any] | None = None,
 ) -> dict[str, int | str]:
-    """Stop other scalp stacks and start the chosen symbol."""
+    """Start the chosen symbol. Other stacks: drain if open position, else stop."""
     sym = symbol.upper()
     prev = active_symbol()
-    to_stop: set[str] = set()
+    to_retire: set[str] = set()
     if stop_others:
-        to_stop.update(s for s in running_symbols() if s != sym)
+        to_retire.update(s for s in running_symbols() if s != sym)
         if prev and prev != sym:
-            to_stop.add(prev)
+            to_retire.add(prev)
 
-    if to_stop:
+    drained: list[str] = []
+    stopped: list[str] = []
+    if to_retire:
         play_sound("cycle_end")
-        for other in sorted(to_stop):
-            stop_stack(other)
+        for other in sorted(to_retire):
+            if is_draining(other) and bot_alive(other):
+                drained.append(other)
+                continue
+            has_pos = False
+            try:
+                has_pos = symbol_has_open_position(other)
+            except Exception as exc:
+                print(f"warn: position check {other} failed: {exc}", file=sys.stderr)
+            if has_pos and bot_alive(other):
+                begin_drain(other, reason=f"switch → {sym}")
+                drained.append(other)
+            else:
+                stop_stack(other)
+                stopped.append(other)
+                if has_pos and not bot_alive(other):
+                    print(
+                        f"warn: {other} had an open position but no live bot — "
+                        f"stopped stack; manage/close manually on Binance",
+                        file=sys.stderr,
+                    )
 
     play_sound("pick")
+    clear_drain(sym)  # new active must be allowed to enter
     pids = start_stack(sym, execute=execute)
     save_active(sym, meta)
+    pids["drained"] = ",".join(drained)
+    pids["stopped"] = ",".join(stopped)
     return pids
