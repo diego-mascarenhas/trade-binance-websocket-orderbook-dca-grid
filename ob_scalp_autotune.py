@@ -20,6 +20,7 @@ from ob_scalp_dataset import BarRecord, append_bar, bars_path, load_bars
 from ob_scalp_ml import (
     HAS_SKLEARN,
     TuneParams,
+    clamp_trade_params,
     load_tuned,
     random_search,
     save_models,
@@ -171,8 +172,15 @@ def start_bot(
     log_dir = ROOT / ".run/logs" / symbol.upper()
     log_dir.mkdir(parents=True, exist_ok=True)
     bars_n = len(load_bars(symbol))
-    tuned = TuneParams(**params.__dict__)
-    tuned.ml_min_prob = min(tuned.ml_min_prob, 0.52)
+    tuned = clamp_trade_params(TuneParams(**params.__dict__))
+    ml_cap = float(os.getenv("OB_ML_MIN_PROB", "0.25") or 0.25)
+    tuned.ml_min_prob = min(tuned.ml_min_prob, ml_cap, 0.35)
+    cooldown = os.getenv("OB_ENTRY_COOLDOWN_SEC", "").strip()
+    if cooldown:
+        try:
+            tuned.entry_cooldown_sec = float(cooldown)
+        except ValueError:
+            pass
     cmd = [
         sys.executable, "-u", str(ROOT / "orderbook_ob_scalp.py"),
         symbol.upper(),
@@ -180,14 +188,49 @@ def start_bot(
     ]
     if recover:
         cmd.extend(["--recover", "--recover-max-level", str(recover_max_level)])
+        lock_min = os.getenv("OB_RECOVER_LOCK_MIN", "15").strip() or "15"
+        cmd.extend(["--recover-lock-min", lock_min])
     cmd.extend(["--bar-sec", str(bar_sec), "--recv-window", "15000"])
     cmd.extend(tuned.to_cli())
+    # Env can force EMA off even if autotune prefers it (more entries in chop).
+    ema_env = os.getenv("OB_EMA_FILTER", "1").strip().lower()
+    if ema_env in ("0", "false", "no", "off"):
+        cmd = [c for c in cmd if c not in ("--ema-filter", "--no-ema-filter")]
+        cmd.append("--no-ema-filter")
+        log(symbol, "EMA filter OFF (OB_EMA_FILTER=0)")
     cmd.append("--adaptive")
+    # Follow moves longer; pattern filter gates weak chop entries.
+    cmd.extend(["--max-bars", os.getenv("OB_MAX_BARS", "12")])
+    size_mode = os.getenv("SCALP_SIZE_MODE", "min").strip().lower() or "min"
+    base_size = os.getenv("SCALP_BASE_SIZE", "0").strip() or "0"
+    cmd.extend(["--size-mode", size_mode])
+    if size_mode == "fixed" and float(base_size or 0) > 0:
+        cmd.extend(["--base-size", base_size])
+    if os.getenv("OB_PATTERN_FILTER", "1").strip().lower() not in ("0", "false", "no", "off"):
+        cmd.append("--pattern-filter")
+        # Softer pattern knobs when set in env
+        body = os.getenv("OB_PATTERN_MIN_BODY_RATIO", "").strip()
+        cont = os.getenv("OB_PATTERN_MIN_CONTINUITY", "").strip()
+        volx = os.getenv("OB_PATTERN_MIN_VOL_RATIO", "").strip()
+        if body:
+            cmd.extend(["--pattern-min-body-ratio", body])
+        if cont:
+            cmd.extend(["--pattern-min-continuity", cont])
+        if volx:
+            cmd.extend(["--pattern-min-vol-ratio", volx])
+    else:
+        cmd.append("--no-pattern-filter")
+        log(symbol, "Pattern filter OFF")
     if os.getenv("OB_IMB_FILTER", "").strip().lower() in ("1", "true", "yes", "on"):
         cmd.append("--imb-filter")
-    if bars_n < 40:
+    # Keep ML on once we have a small sample; soft threshold handles low-confidence bars.
+    if bars_n < 20:
         cmd.append("--no-ml-filter")
-        log(symbol, f"ML filter OFF ({bars_n}/40 bars for reliable model)")
+        log(symbol, f"ML filter OFF ({bars_n}/20 bars for reliable model)")
+    else:
+        log(symbol, f"ML filter ON min_prob={tuned.ml_min_prob:.2f} ({bars_n} bars)")
+    if size_mode == "fixed":
+        log(symbol, f"Size mode fixed base={base_size} USDT")
 
     out = open(stdout_path(symbol), "a", encoding="utf-8")
     env = os.environ.copy()
@@ -294,7 +337,8 @@ def main() -> None:
     p.add_argument("--interval-min", type=float, default=2.0,
                    help="Minutes between health check + ML tune cycles (default 2)")
     p.add_argument("--min-bars", type=int, default=25, help="Min bars before first tune")
-    p.add_argument("--bootstrap-bars", type=int, default=30, help="Live bars to collect if dataset empty")
+    p.add_argument("--bootstrap-bars", type=int, default=None,
+                   help="Live bars to collect if dataset empty (default: same as --min-bars)")
     p.add_argument("--n-iter", type=int, default=120, help="Random search iterations")
     p.add_argument("--min-delta", type=float, default=0.02, help="Min score improvement to restart bot")
     p.add_argument("--bar-sec", type=float, default=60.0)
@@ -321,11 +365,12 @@ def main() -> None:
     if backfilled:
         log(sym, f"Backfilled {backfilled} bars from stdout log")
 
+    boot_target = args.bootstrap_bars if args.bootstrap_bars is not None else args.min_bars
     if len(load_bars(sym)) < args.min_bars:
         if read_pid(sym) is None:
             bootstrap_bars(
                 sym,
-                target=max(args.bootstrap_bars, args.min_bars),
+                target=max(boot_target, args.min_bars),
                 bar_sec=args.bar_sec,
                 use_ema=params.use_ema,
                 ema_slope_min=params.ema_slope_min,

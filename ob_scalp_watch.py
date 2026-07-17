@@ -29,7 +29,10 @@ _BAR_RE = re.compile(
     r"bar (\d{2}:\d{2}:\d{2}).*mid ([\d.]+).*imb ([\d.]+)%"
 )
 _EMA_INLINE = re.compile(r"EMA\d+/\d+")
-_SIGNAL_RE = re.compile(r"→ (LONG|SHORT)|MARKET (LONG|SHORT)|EMA filter block|ML filter block|▶ MARKET|(TP|SL|FLIP|MAXBARS)")
+_SIGNAL_RE = re.compile(
+    r"→ (LONG|SHORT)|MARKET (LONG|SHORT)|EMA filter block|ML filter block|"
+    r"Pattern filter block|▶ MARKET|(TP|SL|FLIP|MAXBARS|TRAIL)"
+)
 
 
 def watch_pid_path(symbol: str) -> Path:
@@ -137,12 +140,12 @@ def _format_learn_line(plain: str) -> str | None:
     signal = rec.get("signal", "")
     pnl = rec.get("net_usdt", 0)
     human = {
-        "premature_sl": "SL prematuro — señal prosperó",
-        "signal_ok_sl_tight": "señal OK — SL ajustado",
-        "sl_correct": "SL correcto",
-        "tp_good": "TP acertado",
-        "tp_early": "TP temprano",
-        "tp_weak_follow": "TP OK — poco follow",
+        "premature_sl": "Premature SL — signal followed through",
+        "signal_ok_sl_tight": "Signal OK — SL too tight",
+        "sl_correct": "SL correct",
+        "tp_good": "TP good",
+        "tp_early": "TP early",
+        "tp_weak_follow": "TP OK — weak follow-through",
     }.get(str(verdict), str(verdict))
     return (
         f"{human} · {signal.upper()} after {reason} · move={move:+.3f}% "

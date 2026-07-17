@@ -14,6 +14,7 @@ Examples:
     ./obscalp-pick --daemon --at 08:00,14:00,20:00 -y
     ./obscalp-pick --daemon -y --idle-min 90          # also rescan if no signals 90m
     ./obscalp-pick --daemon -y --at '' --idle-min 60  # idle-only rotation
+    ./obscalp-pick --daemon -y --no-on-start          # schedule/idle only (skip boot pick)
 """
 
 from __future__ import annotations
@@ -277,11 +278,17 @@ def run_daemon(args: argparse.Namespace) -> int:
 
     sched = ", ".join(f"{h:02d}:{m:02d}" for h, m in times) if times else "off"
     idle_note = f" · idle rescan after {args.idle_min:g}m ({args.idle_mode})" if args.idle_min > 0 else ""
-    print(f"{BOLD}Scalp pick daemon{RESET} — schedule {sched}{idle_note}")
+    on_start_note = " · pick on start" if args.on_start else ""
+    print(f"{BOLD}Scalp pick daemon{RESET} — schedule {sched}{idle_note}{on_start_note}")
     print(f"{DIM}Ctrl+C to stop · log {PICK_LOG}{RESET}\n")
 
     last_run: dict[str, str] = {}
     last_idle_pick_at = 0.0
+
+    if args.on_start:
+        print(f"{CYAN}Startup pick{RESET}")
+        run_once(args, trigger="Startup pick")
+        last_idle_pick_at = time.time()
 
     try:
         while True:
@@ -321,6 +328,8 @@ def parse_args() -> argparse.Namespace:
                    help="Run scheduled picks (use with --at)")
     p.add_argument("--at", default="08:00,14:00,20:00",
                    help="Daily pick times HH:MM (empty = idle-only daemon)")
+    p.add_argument("--on-start", action=argparse.BooleanOptionalAction, default=True,
+                   help="Run one pick when daemon starts (default: true; use --no-on-start to skip)")
     p.add_argument("--idle-min", type=float, default=90.0,
                    help="Rescan when no activity for N minutes (0=off, default 90)")
     p.add_argument("--idle-mode", choices=("signal", "trade", "entry"), default="signal",

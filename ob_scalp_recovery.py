@@ -18,7 +18,8 @@ class RecoveryState:
     loss_streak: int = 0
     cumulative_loss_usdt: float = 0.0
     base_notional_usdt: float = 0.0
-    locked_side: str = ""  # "long" | "short" — same side until TP reset
+    locked_side: str = ""  # "long" | "short" — same side until TP or lock timeout
+    locked_at: float = 0.0  # unix ts when side lock was set
     wins: int = 0
     losses: int = 0
     updated_at: str = ""
@@ -61,6 +62,7 @@ def load_state(symbol: str) -> RecoveryState:
         cumulative_loss_usdt=float(raw.get("cumulative_loss_usdt", 0) or 0),
         base_notional_usdt=float(raw.get("base_notional_usdt", 0) or 0),
         locked_side=str(raw.get("locked_side", "") or "").lower(),
+        locked_at=float(raw.get("locked_at", 0) or 0),
         wins=int(raw.get("wins", 0) or 0),
         losses=int(raw.get("losses", 0) or 0),
         updated_at=str(raw.get("updated_at", "") or ""),
@@ -108,6 +110,58 @@ def target_notional(state: RecoveryState, base_notional: float, *, max_level: in
     return base * (2 ** level), level
 
 
+def _set_side_lock(state: RecoveryState, direction: str) -> None:
+    state.locked_side = direction.lower()
+    state.locked_at = time.time()
+
+
+def _clear_side_lock(state: RecoveryState) -> None:
+    state.locked_side = ""
+    state.locked_at = 0.0
+
+
+def side_lock_age_sec(state: RecoveryState) -> float:
+    """Seconds since side lock was set (0 if unlocked)."""
+    if not state.locked_side:
+        return 0.0
+    if state.locked_at > 0:
+        return max(0.0, time.time() - state.locked_at)
+    if state.updated_at:
+        try:
+            return max(
+                0.0,
+                time.time() - time.mktime(time.strptime(state.updated_at, "%Y-%m-%d %H:%M:%S")),
+            )
+        except (ValueError, OverflowError):
+            return 0.0
+    return 0.0
+
+
+def maybe_expire_side_lock(
+    symbol: str,
+    state: RecoveryState,
+    *,
+    lock_min: float,
+    dry_run: bool = False,
+) -> bool:
+    """Clear locked_side after lock_min minutes. Keeps level/debt. Returns True if unlocked."""
+    if not state.locked_side or lock_min <= 0:
+        return False
+    age = side_lock_age_sec(state)
+    if age < lock_min * 60.0:
+        return False
+    side = state.locked_side.upper()
+    _clear_side_lock(state)
+    msg = (
+        f"UNLOCK {side} after {lock_min:g}m side-lock "
+        f"(keep level {state.level} · debt {state.cumulative_loss_usdt:.4f})"
+    )
+    append_journal(symbol, msg)
+    if not dry_run:
+        save_state(symbol, state)
+    return True
+
+
 def record_close(
     symbol: str,
     state: RecoveryState,
@@ -121,26 +175,46 @@ def record_close(
     net_usdt: float,
     dry_run: bool,
 ) -> RecoveryState:
-    won = net_usdt > 0
+    """Update recovery after a close.
+
+    A tiny 'win' must not wipe the martingale debt. Full RESET only when
+    net_usdt covers cumulative_loss_usdt (or there was no debt).
+    """
+    debt_before = max(0.0, state.cumulative_loss_usdt)
     line = (
         f"{reason} {direction} qty={qty:g} entry={entry:g} exit={exit_price:g} "
         f"gross={gross_pct:+.3f}% pnl={net_usdt:+.4f} USDT "
-        f"level={state.level} streak={state.loss_streak} cumulative={state.cumulative_loss_usdt:+.4f}"
+        f"level={state.level} streak={state.loss_streak} cumulative={debt_before:+.4f}"
     )
 
-    if won:
+    if net_usdt > 0:
         state.wins += 1
-        state.level = 0
-        state.loss_streak = 0
-        state.cumulative_loss_usdt = 0.0
-        state.locked_side = ""
-        line += " → RESET"
+        if debt_before <= 0 or net_usdt >= debt_before:
+            # True recovery — hole filled (or no hole)
+            state.level = 0
+            state.loss_streak = 0
+            state.cumulative_loss_usdt = 0.0
+            _clear_side_lock(state)
+            line += " → RESET"
+        else:
+            # Partial — reduce debt, step level down one, keep side lock
+            state.cumulative_loss_usdt = debt_before - net_usdt
+            state.level = max(0, state.level - 1)
+            state.loss_streak = max(0, state.loss_streak - 1)
+            if state.level <= 0 and state.cumulative_loss_usdt > 0:
+                state.level = 1  # still owe — stay at least 2x until cleared
+            _set_side_lock(state, direction)
+            line += (
+                f" → PARTIAL recover -{net_usdt:.4f} "
+                f"left={state.cumulative_loss_usdt:.4f} "
+                f"level {state.level} ({state.multiplier:g}x) locked {state.locked_side.upper()}"
+            )
     else:
         state.losses += 1
         state.loss_streak += 1
         state.level += 1
-        state.cumulative_loss_usdt += abs(net_usdt)
-        state.locked_side = direction.lower()
+        state.cumulative_loss_usdt = debt_before + abs(net_usdt)
+        _set_side_lock(state, direction)
         line += (
             f" → level {state.level} ({state.multiplier:g}x) "
             f"locked {state.locked_side.upper()} cumulative={state.cumulative_loss_usdt:.4f}"
@@ -153,10 +227,21 @@ def record_close(
     return state
 
 
-def format_status(state: RecoveryState) -> str:
+def recovery_covers_debt(net_usdt: float, state: RecoveryState) -> bool:
+    """True if this close would clear (or there is no) martingale debt."""
+    debt = max(0.0, state.cumulative_loss_usdt)
+    return debt <= 0 or net_usdt >= debt
+
+
+def format_status(state: RecoveryState, *, lock_min: float = 0.0) -> str:
     if state.level <= 0 and state.cumulative_loss_usdt <= 0:
         return "recovery off (level 0)"
-    lock = f" · locked {state.locked_side.upper()}" if state.locked_side else ""
+    lock = ""
+    if state.locked_side:
+        lock = f" · locked {state.locked_side.upper()}"
+        if lock_min > 0:
+            left = max(0.0, lock_min * 60.0 - side_lock_age_sec(state))
+            lock += f" {left / 60.0:.0f}m left" if left > 0 else " (expired)"
     return (
         f"recovery level {state.level} ({state.multiplier:g}x){lock} · "
         f"loss streak {state.loss_streak} · cumulative {state.cumulative_loss_usdt:.4f} USDT"

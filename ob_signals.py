@@ -82,5 +82,5 @@ def should_tp_close(gross_pct: float, tp_pct: float, fee_buffer_pct: float) -> b
 
 
 def should_discretionary_close(gross_pct: float, fee_buffer_pct: float) -> bool:
-    """Flip / time exit — skip if estimated net would be zero or negative."""
+    """Flip / trail / max-bars — skip if estimated net would be zero or negative."""
     return estimated_net_pct(gross_pct, fee_buffer_pct) > 0

@@ -1,4 +1,12 @@
-"""Local trade sounds via macOS afplay (non-blocking)."""
+"""Local trade sounds via macOS afplay (non-blocking).
+
+Mute without restarting bots:
+    ./obscalp-sounds mute
+    ./obscalp-sounds unmute
+    ./obscalp-sounds status
+
+Or env: OB_SOUNDS=0
+"""
 
 from __future__ import annotations
 
@@ -27,6 +35,7 @@ _ENV = {
 }
 
 _ROOT = Path(__file__).resolve().parent
+_MUTE_FLAG = _ROOT / ".run" / "sounds_muted"
 _PACMAN_DIR_LOCAL = _ROOT / "sounds" / "pacman"
 _PACMAN_DIR_ICLOUD = Path(
     "/Users/magoo/Library/Mobile Documents/F3LWYJ7GM7~com~apple~mobilegarageband/Documents"
@@ -44,8 +53,29 @@ _PACMAN_FILES = {
 }
 
 
+def mute_flag_path() -> Path:
+    return _MUTE_FLAG
+
+
+def is_muted() -> bool:
+    """True if muted via flag file or OB_SOUNDS=0."""
+    if _MUTE_FLAG.exists():
+        return True
+    return os.getenv("OB_SOUNDS", "1").strip().lower() in ("0", "false", "no", "off")
+
+
+def set_muted(muted: bool) -> Path:
+    """Create/remove .run/sounds_muted so running bots pick it up immediately."""
+    _MUTE_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    if muted:
+        _MUTE_FLAG.write_text("1\n", encoding="utf-8")
+    else:
+        _MUTE_FLAG.unlink(missing_ok=True)
+    return _MUTE_FLAG
+
+
 def sounds_enabled() -> bool:
-    return os.getenv("OB_SOUNDS", "1").strip().lower() not in ("0", "false", "no", "off")
+    return not is_muted()
 
 
 def _pacman_dir() -> Path:
@@ -138,37 +168,76 @@ def _play_sync(event: str) -> str | None:
     return play_sound(event, block=True)
 
 
+def _cmd_status() -> int:
+    muted = is_muted()
+    reasons = []
+    if _MUTE_FLAG.exists():
+        reasons.append(f"flag {_MUTE_FLAG}")
+    env = os.getenv("OB_SOUNDS", "1").strip()
+    if env.lower() in ("0", "false", "no", "off"):
+        reasons.append(f"OB_SOUNDS={env}")
+    state = "MUTED" if muted else "ON"
+    extra = f" ({', '.join(reasons)})" if reasons else ""
+    print(f"sounds: {state}{extra} · pack={sound_pack_label()}")
+    return 0
+
+
 if __name__ == "__main__":
     import argparse
     import sys
     import time
 
-    parser = argparse.ArgumentParser(description="Play trade sounds")
+    parser = argparse.ArgumentParser(
+        description="Trade sounds — play, mute, unmute (mute applies live to running bots)",
+    )
     _EVENTS = ("entry", "dca", "tp", "sl", "pick", "cycle_end", "all")
     parser.add_argument(
-        "event",
+        "command",
         nargs="?",
-        default="entry",
-        choices=_EVENTS,
-        help="Sound to play (default: entry)",
+        default="status",
+        help="mute | unmute | status | on | off | entry|dca|tp|sl|pick|cycle_end|all",
     )
     parser.add_argument("-l", "--list", action="store_true", help="Show resolved paths")
     args = parser.parse_args()
+    cmd = str(args.command).strip().lower()
 
     if args.list:
         print(f"pack: {sound_pack_label()}")
+        print(f"muted: {is_muted()}")
         for name in ("entry", "dca", "tp", "sl", "pick", "cycle_end"):
             print(f"  {name}: {_resolve_path(name)}")
         raise SystemExit(0)
 
-    if args.event == "all":
+    if cmd in ("mute", "off", "disable"):
+        set_muted(True)
+        print(f"sounds: MUTED ({_MUTE_FLAG})")
+        raise SystemExit(0)
+    if cmd in ("unmute", "on", "enable"):
+        set_muted(False)
+        print("sounds: ON")
+        raise SystemExit(0)
+    if cmd in ("status", "state"):
+        raise SystemExit(_cmd_status())
+
+    if cmd not in _EVENTS:
+        print(
+            f"Unknown command '{cmd}'. Use: mute|unmute|status|{'|'.join(_EVENTS)}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    if is_muted():
+        print("sounds are MUTED — run: obscalp-sounds unmute", file=sys.stderr)
+        raise SystemExit(1)
+
+    if cmd == "all":
         for name in ("entry", "dca", "tp", "sl", "pick", "cycle_end"):
             path = _play_sync(name)
             print(f"{name}: {path or 'MISSING'}")
             time.sleep(0.4)
     else:
-        path = _play_sync(args.event)
+        path = _play_sync(cmd)
         if not path:
-            print(f"No sound file for '{args.event}'", file=sys.stderr)
+            print(f"No sound file for '{cmd}'", file=sys.stderr)
             raise SystemExit(1)
-        print(f"{args.event} ({sound_pack_label()}): {path}")
+        print(f"{cmd} ({sound_pack_label()}): {path}")

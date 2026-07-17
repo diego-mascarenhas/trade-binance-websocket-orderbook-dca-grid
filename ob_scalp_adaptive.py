@@ -13,17 +13,19 @@ from ob_scalp_ml import feature_vector
 ROOT = Path(__file__).resolve().parent
 LOG_ROOT = ROOT / ".run" / "logs"
 
-# Minutes idle → relax filters (cumulative steps)
+# Minutes idle → relax filters (cumulative steps). Prefer more entries when quiet.
 _INACTIVITY_STEPS: tuple[tuple[int, dict[str, float]], ...] = (
-    (15, {"ml_min_prob": -0.03, "ema_slope_min": -0.005}),
-    (30, {"ml_min_prob": -0.02, "imb_long_adj": -0.012, "imb_short_adj": 0.012}),
-    (45, {"ml_min_prob": -0.02, "ema_slope_min": -0.005, "momentum_adj": -0.004}),
-    (60, {"ml_min_prob": -0.02, "imb_long_adj": -0.010, "imb_short_adj": 0.010}),
+    (10, {"ml_min_prob": -0.04, "ema_slope_min": -0.005}),
+    (20, {"ml_min_prob": -0.03, "imb_long_adj": -0.012, "imb_short_adj": 0.012}),
+    (30, {"ml_min_prob": -0.03, "ema_slope_min": -0.005, "momentum_adj": -0.004}),
+    (45, {"ml_min_prob": -0.03, "imb_long_adj": -0.010, "imb_short_adj": 0.010}),
+    (60, {"ml_min_prob": -0.02, "momentum_adj": -0.003}),
 )
 
+# Floor keeps ML on (still blocks junk) but allows enough entries in chop.
 _FLOORS = {
-    "ml_min_prob": 0.36,
-    "ema_slope_min": 0.015,
+    "ml_min_prob": 0.15,
+    "ema_slope_min": 0.005,
     "imb_long_adj": -0.06,
     "imb_short_adj": -0.02,
     "momentum_adj": -0.015,
@@ -33,7 +35,7 @@ _FLOORS = {
 _SL_ADJ_CEILING = 0.15
 
 _CEILINGS = {
-    "ml_min_prob": 0.58,
+    "ml_min_prob": 0.45,
     "ema_slope_min": 0.12,
     "imb_long_adj": 0.03,
     "imb_short_adj": 0.06,
@@ -44,8 +46,8 @@ _CEILINGS = {
 
 @dataclass
 class AdaptiveState:
-    ml_min_prob: float = 0.40
-    ema_slope_min: float = 0.025
+    ml_min_prob: float = 0.30
+    ema_slope_min: float = 0.020
     imb_long_adj: float = -0.015
     imb_short_adj: float = 0.015
     momentum_adj: float = -0.003
@@ -84,8 +86,8 @@ def load_adaptive(symbol: str) -> AdaptiveState:
     if not isinstance(raw, dict):
         return init_permissive(symbol)
     return AdaptiveState(
-        ml_min_prob=float(raw.get("ml_min_prob", 0.40)),
-        ema_slope_min=float(raw.get("ema_slope_min", 0.025)),
+        ml_min_prob=float(raw.get("ml_min_prob", 0.30)),
+        ema_slope_min=float(raw.get("ema_slope_min", 0.020)),
         imb_long_adj=float(raw.get("imb_long_adj", -0.015)),
         imb_short_adj=float(raw.get("imb_short_adj", 0.015)),
         momentum_adj=float(raw.get("momentum_adj", -0.003)),
@@ -171,12 +173,14 @@ def on_trade_close(
     state.trades += 1
     if won:
         state.wins += 1
-        apply_delta(state, {"ml_min_prob": 0.015, "ema_slope_min": 0.002})
+        # Mild tighten — do not starve entries after a win
+        apply_delta(state, {"ml_min_prob": 0.005, "ema_slope_min": 0.001})
         if state.relax_steps:
             state.relax_steps.pop()
     else:
         state.losses += 1
-        apply_delta(state, {"ml_min_prob": 0.025, "ema_slope_min": 0.004})
+        # Mild tighten — strong raises were blocking almost all signals
+        apply_delta(state, {"ml_min_prob": 0.010, "ema_slope_min": 0.002})
 
     sample = {
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -205,9 +209,10 @@ def effective_filters(
     base_imb_short: float,
     base_momentum: float,
 ) -> dict[str, float]:
+    # Use the looser of adaptive vs CLI base so ML stays on but does not starve entries.
     return {
-        "ml_min_prob": state.ml_min_prob,
-        "ema_slope_min": state.ema_slope_min,
+        "ml_min_prob": min(state.ml_min_prob, base_ml),
+        "ema_slope_min": min(state.ema_slope_min, base_ema),
         "imb_long": max(0.50, base_imb_long + state.imb_long_adj),
         "imb_short": min(0.50, base_imb_short + state.imb_short_adj),
         "momentum_min_pct": max(0.003, base_momentum + state.momentum_adj),

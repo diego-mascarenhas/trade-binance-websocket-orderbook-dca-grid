@@ -127,7 +127,7 @@ def start_stack(
     *,
     execute: bool = True,
     interval_min: float = 2.0,
-    min_bars: int = 12,
+    min_bars: int = 10,
     min_delta: float = 0.01,
 ) -> dict[str, int | str]:
     """Launch autotune (manages bot) + unified log watch in background."""
@@ -139,11 +139,13 @@ def start_stack(
     env = os.environ.copy()
 
     autotune_out = open(log_dir / "autotune_daemon.log", "a", encoding="utf-8")
+    # bootstrap-bars must match min-bars or empty symbols wait ~30 min (autotune default)
     autotune_cmd = [
         py, "-u", str(ROOT / "ob_scalp_autotune.py"),
         sym,
         "--interval-min", str(interval_min),
         "--min-bars", str(min_bars),
+        "--bootstrap-bars", str(min_bars),
         "--min-delta", str(min_delta),
         "--bar-sec", "60",
     ]

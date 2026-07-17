@@ -29,13 +29,13 @@ class TuneParams:
     imb_long: float = 0.58
     imb_short: float = 0.42
     momentum_min_pct: float = 0.02
-    tp_pct: float = 0.30
-    sl_pct: float = 0.12
+    tp_pct: float = 0.35
+    sl_pct: float = 0.25
     ema_slope_min: float = 0.05
     entry_cooldown_sec: float = 60.0
-    fee_buffer: float = 0.08
+    fee_buffer: float = 0.12
     use_ema: bool = True
-    ml_min_prob: float = 0.48
+    ml_min_prob: float = 0.32
 
     def to_cli(self) -> list[str]:
         args = [
@@ -124,7 +124,7 @@ def build_training_matrix(
     *,
     tp_pct: float = 0.30,
     sl_pct: float = 0.12,
-    fee_buffer: float = 0.08,
+    fee_buffer: float = 0.12,
 ) -> tuple[list[list[float]], list[int], list[int]]:
     """Features + labels: 1 if forward net PnL > 0 for long/short."""
     xs: list[list[float]] = []
@@ -296,17 +296,15 @@ def random_search(
             imb_long=round(rng.uniform(0.54, 0.65), 3),
             imb_short=round(rng.uniform(0.35, 0.46), 3),
             momentum_min_pct=round(rng.uniform(0.005, 0.04), 3),
-            tp_pct=round(rng.uniform(0.18, 0.45), 2),
-            sl_pct=round(rng.uniform(0.08, 0.18), 2),
+            tp_pct=round(rng.uniform(0.32, 0.55), 2),
+            sl_pct=round(rng.uniform(0.22, 0.35), 2),
             ema_slope_min=round(rng.uniform(0.02, 0.12), 3),
             entry_cooldown_sec=rng.choice([45.0, 60.0, 90.0]),
             fee_buffer=base.fee_buffer,
             use_ema=rng.random() > 0.15,
-            ml_min_prob=round(rng.uniform(0.42, 0.52), 2),
+            ml_min_prob=round(rng.uniform(0.28, 0.40), 2),
         )
-        if cand.imb_long <= cand.imb_short + 0.08:
-            continue
-        if cand.tp_pct <= cand.sl_pct:
+        if not _params_sane(cand):
             continue
         stats = backtest(bars, cand, model=model)
         if stats["score"] > best_stats["score"]:
@@ -320,21 +318,47 @@ def random_search(
         ("imb_short", 0.01),
         ("momentum_min_pct", 0.005),
         ("tp_pct", 0.02),
-        ("sl_pct", 0.01),
+        ("sl_pct", 0.02),
         ("ema_slope_min", 0.01),
     ]:
         for sign in (-1, 1):
             trial = TuneParams(**asdict(refined))
             val = getattr(trial, attr) + sign * delta
             setattr(trial, attr, round(val, 4))
-            if trial.imb_long <= trial.imb_short + 0.08 or trial.tp_pct <= trial.sl_pct:
+            if not _params_sane(trial):
                 continue
             stats = backtest(bars, trial, model=model)
             if stats["score"] > best_stats["score"]:
                 best_stats = stats
                 refined = trial
+                best_model = model
 
-    return refined, best_stats, model
+    return clamp_trade_params(refined), best_stats, best_model or model
+
+
+def _params_sane(p: TuneParams) -> bool:
+    if p.imb_long <= p.imb_short + 0.08:
+        return False
+    if p.tp_pct <= p.sl_pct:
+        return False
+    min_sl = max(0.20, p.fee_buffer + 0.08)
+    if p.sl_pct < min_sl:
+        return False
+    if p.tp_pct < p.sl_pct + p.fee_buffer + 0.05:
+        return False
+    return True
+
+
+def clamp_trade_params(p: TuneParams) -> TuneParams:
+    """Enforce usable TP/SL vs fee buffer (blocks tiny SL like 0.08–0.10%)."""
+    out = TuneParams(**asdict(p))
+    min_sl = max(0.22, out.fee_buffer + 0.10)
+    out.sl_pct = max(float(out.sl_pct), min_sl)
+    min_tp = out.sl_pct + out.fee_buffer + 0.08
+    out.tp_pct = max(float(out.tp_pct), min_tp)
+    out.sl_pct = round(out.sl_pct, 2)
+    out.tp_pct = round(out.tp_pct, 2)
+    return out
 
 
 def tuned_config_path(symbol: str) -> Path:

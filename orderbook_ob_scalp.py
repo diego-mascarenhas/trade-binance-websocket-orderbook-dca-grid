@@ -28,6 +28,12 @@ from ob_ema import (
     fetch_ema_snapshot,
     format_ema_console,
 )
+from ob_pattern import (
+    PatternConfig,
+    evaluate_pattern,
+    format_pattern_console,
+    pattern_allows,
+)
 from ob_scalp_ml import feature_vector, load_models, predict_prob
 from ob_scalp_adaptive import (
     effective_filters,
@@ -45,8 +51,10 @@ from ob_scalp_recovery import (
     ensure_base_notional,
     format_status,
     load_state,
+    maybe_expire_side_lock,
     pnl_usdt,
     record_close,
+    recovery_covers_debt,
     reset_state,
     save_state,
     target_notional,
@@ -303,29 +311,32 @@ def _print_close_event(
 ) -> None:
     net = gross_pct - fee_buffer
     side = _side_label(pos.is_long)
+    net_color = GREEN if net > 0 else RED
     if reason == "TP":
         print(
-            f"{GREEN}TP hit{RESET} {side} {gross_pct:+.3f}% "
-            f"(est. net {net:+.3f}%) @ {price_fmt(exit_price)}",
+            f"{GREEN}TP hit{RESET} {side} gross {gross_pct:+.3f}% "
+            f"(est. net {net_color}{net:+.3f}%{RESET}) @ {price_fmt(exit_price)}",
         )
     elif reason == "SL":
         print(
-            f"{RED}SL hit{RESET} {side} {gross_pct:+.3f}% @ {price_fmt(exit_price)}",
+            f"{RED}SL hit{RESET} {side} {gross_pct:+.3f}% "
+            f"(est. net {net_color}{net:+.3f}%{RESET}) @ {price_fmt(exit_price)}",
         )
     elif reason == "TRAIL":
+        label = f"{GREEN}Trail stop{RESET}" if net > 0 else f"{RED}Trail stop{RESET}"
         print(
-            f"{GREEN}Trail stop{RESET} {side} {gross_pct:+.3f}% "
-            f"(est. net {net:+.3f}%) @ {price_fmt(exit_price)}",
+            f"{label} {side} gross {gross_pct:+.3f}% "
+            f"(est. net {net_color}{net:+.3f}%{RESET}) @ {price_fmt(exit_price)}",
         )
     elif reason == "FLIP":
         print(
-            f"{YELLOW}Imbalance flip → exit{RESET} {side} {gross_pct:+.3f}% "
-            f"(est. net {net:+.3f}%) @ {price_fmt(exit_price)}",
+            f"{YELLOW}Imbalance flip → exit{RESET} {side} gross {gross_pct:+.3f}% "
+            f"(est. net {net_color}{net:+.3f}%{RESET}) @ {price_fmt(exit_price)}",
         )
     else:
         print(
-            f"{YELLOW}{reason} → exit{RESET} {side} {gross_pct:+.3f}% "
-            f"@ {price_fmt(exit_price)}",
+            f"{YELLOW}{reason} → exit{RESET} {side} gross {gross_pct:+.3f}% "
+            f"(est. net {net_color}{net:+.3f}%{RESET}) @ {price_fmt(exit_price)}",
         )
 
 
@@ -383,6 +394,29 @@ def _estimated_net_usdt(
     return gross - notional * fee_buffer_pct / 100.0
 
 
+def _recovery_allows_soft_exit(
+    *,
+    recover: bool,
+    recovery: RecoveryState,
+    entry: float,
+    exit_price: float,
+    qty: float,
+    is_long: bool,
+    fee_buffer: float,
+) -> tuple[bool, str]:
+    """While martingale debt remains, only soft-exit if this close would clear it."""
+    if not recover or recovery.cumulative_loss_usdt <= 0:
+        return True, ""
+    net = _estimated_net_usdt(entry, exit_price, qty, is_long, fee_buffer)
+    if recovery_covers_debt(net, recovery):
+        return True, ""
+    return (
+        False,
+        f"recovery hold — need ≥{recovery.cumulative_loss_usdt:.4f} USDT to clear debt "
+        f"(est. net {net:+.4f})",
+    )
+
+
 def _handle_close(
     sym: str,
     pos: PositionState,
@@ -404,6 +438,7 @@ def _handle_close(
         pos.entry, exit_price, pos.qty, pos.is_long, args.fee_buffer,
     )
     if args.recover:
+        debt_before = recovery.cumulative_loss_usdt
         record_close(
             sym,
             recovery,
@@ -416,8 +451,15 @@ def _handle_close(
             net_usdt=net_usdt,
             dry_run=args.dry_run,
         )
-        if net_usdt > 0:
-            print(f"{GREEN}Recovery reset — back to base size.{RESET}")
+        if recovery.level <= 0 and recovery.cumulative_loss_usdt <= 0:
+            print(f"{GREEN}Recovery reset — debt cleared, back to base size.{RESET}")
+        elif net_usdt > 0:
+            print(
+                f"{YELLOW}Partial recovery {net_usdt:+.4f} USDT "
+                f"(was {debt_before:.4f} → left {recovery.cumulative_loss_usdt:.4f}) · "
+                f"level {recovery.level} ({recovery.multiplier:g}x) "
+                f"locked {recovery.locked_side.upper()}{RESET}",
+            )
         else:
             lock = f" · retry {recovery.locked_side.upper()} only" if recovery.locked_side else ""
             print(
@@ -436,12 +478,8 @@ def _handle_close(
     refresh_pnl_stats(sym)
     _print_pnl_summary(sym, None, exit_price)
     if not args.dry_run:
-        if reason in ("TP", "TRAIL"):
-            play_sound("tp")
-        elif reason == "SL":
-            play_sound("sl")
-        else:
-            play_close_sound(net_usdt)
+        # Always use estimated net (after fee buffer) — never assume TP/TRAIL = win
+        play_close_sound(net_usdt)
     if args.adaptive and adaptive_state is not None and pos.entry_features:
         signal = pos.entry_signal or ("long" if pos.is_long else "short")
         watch_sec = max(args.bar_sec * 3, 120.0)
@@ -530,6 +568,13 @@ def run_loop(args: argparse.Namespace) -> None:
     builder = BarBuilder(bar_sec=args.bar_sec, band_pct=args.band_pct)
     recovery = reset_state(sym) if args.reset_recover else load_state(sym)
     if args.recover and not args.reset_recover:
+        if maybe_expire_side_lock(
+            sym, recovery, lock_min=args.recover_lock_min, dry_run=args.dry_run,
+        ):
+            print(
+                f"{YELLOW}Recovery side-lock expired ({args.recover_lock_min:g}m) — "
+                f"both sides allowed (size still {recovery.multiplier:g}x){RESET}",
+            )
         append_journal(sym, f"START recover={recovery.level} cumulative={recovery.cumulative_loss_usdt:.4f}")
 
     try:
@@ -542,7 +587,10 @@ def run_loop(args: argparse.Namespace) -> None:
     mode = f"{YELLOW}DRY-RUN{RESET}" if args.dry_run else f"{GREEN}LIVE{RESET}"
     recover_note = ""
     if args.recover:
-        recover_note = f"\n  recover {format_status(recovery)}  max level {args.recover_max_level}"
+        recover_note = (
+            f"\n  recover {format_status(recovery, lock_min=args.recover_lock_min)}  "
+            f"max level {args.recover_max_level}  side-lock {args.recover_lock_min:g}m"
+        )
         recover_note += f"\n  logs {Path('.run/logs') / sym}/scalp_trades.log"
     ema_note = ""
     if args.ema_filter:
@@ -550,6 +598,13 @@ def run_loop(args: argparse.Namespace) -> None:
             f"\n  EMA filter ON  {args.ema_fast}/{args.ema_slow} {args.ema_interval}  "
             f"slope≥{args.ema_slope_min:g}% over {args.ema_slope_bars} bars"
             f"\n  ema log {Path('.run/logs') / sym}/scalp_ema.log"
+        )
+    pat_note = ""
+    if args.pattern_filter:
+        pat_note = (
+            f"\n  pattern filter ON  {args.pattern_interval}+{args.pattern_fvg_interval} "
+            f"body≥{args.pattern_min_body_ratio:g} cont≥{args.pattern_min_continuity} "
+            f"volx≥{args.pattern_min_vol_ratio:g} (ATR/BB/FVG)"
         )
     trail_note = ""
     if args.trail_pct > 0:
@@ -571,7 +626,7 @@ def run_loop(args: argparse.Namespace) -> None:
         )
         + f"TP +{args.tp_pct:g}%  SL -{args.sl_pct:g}%  max {args.max_bars} bars\n"
         f"  fee buffer {args.fee_buffer:g}% (no TP/flip close if net ≤ 0)  "
-        f"size {size_note}{imb_note}{recover_note}{ema_note}{trail_note}{sound_note}  Ctrl+C to stop\n",
+        f"size {size_note}{imb_note}{recover_note}{ema_note}{pat_note}{trail_note}{sound_note}  Ctrl+C to stop\n",
     )
     refresh_pnl_stats(sym)
     _print_pnl_summary(sym, None, _preview_mid if _preview_mid > 0 else 0.0)
@@ -669,12 +724,24 @@ def run_loop(args: argparse.Namespace) -> None:
                 elif _trail_triggered(pos, mark, args.trail_pct) and should_discretionary_close(
                     pnl, args.fee_buffer,
                 ):
-                    _print_close_event("TRAIL", pos, pnl, mark, fee_buffer=args.fee_buffer)
-                    last_close_at = _handle_close(
-                        sym, pos, mark, pnl, "TRAIL", args, recovery, hedge, filt, api, sec,
-                        adaptive_state=adaptive,
+                    ok, hold_msg = _recovery_allows_soft_exit(
+                        recover=args.recover,
+                        recovery=recovery,
+                        entry=pos.entry,
+                        exit_price=mark,
+                        qty=pos.qty,
+                        is_long=pos.is_long,
+                        fee_buffer=args.fee_buffer,
                     )
-                    pos = None
+                    if not ok:
+                        print(f"{DIM}Trail armed but {hold_msg}{RESET}")
+                    else:
+                        _print_close_event("TRAIL", pos, pnl, mark, fee_buffer=args.fee_buffer)
+                        last_close_at = _handle_close(
+                            sym, pos, mark, pnl, "TRAIL", args, recovery, hedge, filt, api, sec,
+                            adaptive_state=adaptive,
+                        )
+                        pos = None
                 elif pnl >= args.tp_pct and not should_tp_close(pnl, args.tp_pct, args.fee_buffer):
                     print(
                         f"{DIM}TP gross {pnl:+.3f}% but est. net "
@@ -726,6 +793,28 @@ def run_loop(args: argparse.Namespace) -> None:
                 append_ema_log(sym, f"BLOCK {signal.upper()} trend={ema_snap.trend}")
                 signal = None
 
+            pat_snap = None
+            if args.pattern_filter:
+                try:
+                    pat_cfg = PatternConfig(
+                        interval=args.pattern_interval,
+                        fvg_interval=args.pattern_fvg_interval,
+                        min_body_ratio=args.pattern_min_body_ratio,
+                        min_continuity=args.pattern_min_continuity,
+                        min_vol_ratio=args.pattern_min_vol_ratio,
+                    )
+                    pat_snap = evaluate_pattern(sym, cfg=pat_cfg)
+                except Exception as exc:
+                    print(f"{YELLOW}Pattern fetch failed: {exc}{RESET}")
+                if pat_snap:
+                    print(format_pattern_console(pat_snap))
+                if signal and pat_snap and not pattern_allows(signal, pat_snap):
+                    print(
+                        f"{YELLOW}Pattern filter block {signal.upper()} "
+                        f"({pat_snap.reason}){RESET}",
+                    )
+                    signal = None
+
             if signal and ml_model and args.ml_filter:
                 prob = predict_prob(ml_model, bar_rec, signal)
                 if prob < ml_threshold:
@@ -745,12 +834,24 @@ def run_loop(args: argparse.Namespace) -> None:
                 if exit_on_flip(pos.is_long, bar, sig_cfg):
                     pnl = profit_pct(pos.entry, bar.mid_c, pos.is_long)
                     if should_discretionary_close(pnl, args.fee_buffer):
-                        _print_close_event("FLIP", pos, pnl, bar.mid_c, fee_buffer=args.fee_buffer)
-                        last_close_at = _handle_close(
-                            sym, pos, bar.mid_c, pnl, "FLIP", args, recovery, hedge, filt, api, sec,
-                            adaptive_state=adaptive,
+                        ok, hold_msg = _recovery_allows_soft_exit(
+                            recover=args.recover,
+                            recovery=recovery,
+                            entry=pos.entry,
+                            exit_price=bar.mid_c,
+                            qty=pos.qty,
+                            is_long=pos.is_long,
+                            fee_buffer=args.fee_buffer,
                         )
-                        pos = None
+                        if not ok:
+                            print(f"{DIM}Flip signal but {hold_msg}{RESET}")
+                        else:
+                            _print_close_event("FLIP", pos, pnl, bar.mid_c, fee_buffer=args.fee_buffer)
+                            last_close_at = _handle_close(
+                                sym, pos, bar.mid_c, pnl, "FLIP", args, recovery, hedge, filt, api, sec,
+                                adaptive_state=adaptive,
+                            )
+                            pos = None
                     else:
                         print(
                             f"{DIM}Flip signal but est. net {pnl - args.fee_buffer:+.3f}% ≤ 0 — holding{RESET}",
@@ -758,12 +859,24 @@ def run_loop(args: argparse.Namespace) -> None:
                 elif pos.bars_held >= args.max_bars:
                     pnl = profit_pct(pos.entry, bar.mid_c, pos.is_long)
                     if should_discretionary_close(pnl, args.fee_buffer):
-                        _print_close_event("MAXBARS", pos, pnl, bar.mid_c, fee_buffer=args.fee_buffer)
-                        last_close_at = _handle_close(
-                            sym, pos, bar.mid_c, pnl, "MAXBARS", args, recovery, hedge, filt, api, sec,
-                            adaptive_state=adaptive,
+                        ok, hold_msg = _recovery_allows_soft_exit(
+                            recover=args.recover,
+                            recovery=recovery,
+                            entry=pos.entry,
+                            exit_price=bar.mid_c,
+                            qty=pos.qty,
+                            is_long=pos.is_long,
+                            fee_buffer=args.fee_buffer,
                         )
-                        pos = None
+                        if not ok:
+                            print(f"{DIM}Max bars but {hold_msg}{RESET}")
+                        else:
+                            _print_close_event("MAXBARS", pos, pnl, bar.mid_c, fee_buffer=args.fee_buffer)
+                            last_close_at = _handle_close(
+                                sym, pos, bar.mid_c, pnl, "MAXBARS", args, recovery, hedge, filt, api, sec,
+                                adaptive_state=adaptive,
+                            )
+                            pos = None
                     else:
                         print(
                             f"{DIM}Max bars but est. net {pnl - args.fee_buffer:+.3f}% ≤ 0 — holding{RESET}",
@@ -780,10 +893,18 @@ def run_loop(args: argparse.Namespace) -> None:
                     builder.reset_after_bar(now)
                     time.sleep(args.sample_sec)
                     continue
+                if args.recover and recovery.locked_side:
+                    if maybe_expire_side_lock(
+                        sym, recovery, lock_min=args.recover_lock_min, dry_run=args.dry_run,
+                    ):
+                        print(
+                            f"{YELLOW}Recovery side-lock expired ({args.recover_lock_min:g}m) — "
+                            f"both sides allowed (size still {recovery.multiplier:g}x){RESET}",
+                        )
                 if args.recover and recovery.locked_side and signal != recovery.locked_side:
                     print(
                         f"{YELLOW}Recovery locked {recovery.locked_side.upper()} — "
-                        f"skip {signal.upper()} (same side until TP){RESET}",
+                        f"skip {signal.upper()} (same side ≤{args.recover_lock_min:g}m){RESET}",
                     )
                     builder.reset_after_bar(now)
                     time.sleep(args.sample_sec)
@@ -908,14 +1029,30 @@ def parse_args() -> argparse.Namespace:
                    help="Take profit %% (default: 0.25)")
     p.add_argument("--sl-pct", type=float, default=_env_float("OB_SL_PCT", 0.15),
                    help="Stop loss %% (default: 0.15)")
-    p.add_argument("--trail-pct", type=float, default=_env_float("OB_TRAIL_PCT", 0.08),
-                   help="Trailing stop distance %% from peak/trough once armed (0=off, default 0.08)")
+    p.add_argument("--trail-pct", type=float, default=_env_float("OB_TRAIL_PCT", 0.12),
+                   help="Trailing stop distance %% from peak/trough once armed (0=off, default 0.12)")
     p.add_argument("--trail-arm-pct", type=float, default=_env_float("OB_TRAIL_ARM_PCT", 0.0),
-                   help="Arm trailing after this gross profit %% (default: half of --tp-pct)")
-    p.add_argument("--fee-buffer", type=float, default=_env_float("OB_FEE_BUFFER", 0.08),
-                   help="Round-trip fee estimate %%; TP/flip/max-bars skip close if gross-fee ≤ 0")
-    p.add_argument("--max-bars", type=int, default=int(_env_float("OB_MAX_BARS", 5)),
-                   help="Max bars to hold before time exit (default: 5)")
+                   help="Arm trailing after this gross profit %% (default: ~65%% of TP or fee+0.15)")
+    p.add_argument("--fee-buffer", type=float, default=_env_float("OB_FEE_BUFFER", 0.12),
+                   help="Round-trip fee+slippage estimate %%; TP/flip/trail skip close if gross-fee ≤ 0")
+    p.add_argument("--max-bars", type=int, default=int(_env_float("OB_MAX_BARS", 12)),
+                   help="Max bars to hold before time exit (default: 12 — follow moves longer)")
+    p.add_argument("--pattern-filter", action=argparse.BooleanOptionalAction,
+                   default=_env_bool("OB_PATTERN_FILTER", True),
+                   help="Require HTF candle continuity/volume + ATR/BB/FVG context (default on)")
+    p.add_argument("--pattern-interval", default=os.getenv("OB_PATTERN_INTERVAL", "5m").strip() or "5m",
+                   help="Kline interval for continuity/volume (default 5m)")
+    p.add_argument("--pattern-fvg-interval", default=os.getenv("OB_PATTERN_FVG_INTERVAL", "15m").strip() or "15m",
+                   help="Kline interval for FVG scan (default 15m)")
+    p.add_argument("--pattern-min-body-ratio", type=float,
+                   default=_env_float("OB_PATTERN_MIN_BODY_RATIO", 0.40),
+                   help="Min candle body/range for a real candle (default 0.40)")
+    p.add_argument("--pattern-min-continuity", type=int,
+                   default=int(_env_float("OB_PATTERN_MIN_CONTINUITY", 1)),
+                   help="Min consecutive same-direction HTF candles (default 1)")
+    p.add_argument("--pattern-min-vol-ratio", type=float,
+                   default=_env_float("OB_PATTERN_MIN_VOL_RATIO", 0.90),
+                   help="Min last-candle volume vs 20-bar avg (default 0.90)")
     p.add_argument(
         "--size-mode",
         choices=["min", "wallet", "fixed"],
@@ -930,6 +1067,8 @@ def parse_args() -> argparse.Namespace:
                    help="After a losing close, double size on SAME side until TP (state in .run/logs/SYMBOL/)")
     p.add_argument("--recover-max-level", type=int, default=int(_env_float("OB_RECOVER_MAX_LEVEL", 4)),
                    help="Max martingale level (2^level multiplier cap, default 4 = 16x)")
+    p.add_argument("--recover-lock-min", type=float, default=_env_float("OB_RECOVER_LOCK_MIN", 15.0),
+                   help="Minutes to keep same-side lock after loss (0=until debt cleared, default 15)")
     p.add_argument("--entry-cooldown-sec", type=float, default=_env_float("OB_ENTRY_COOLDOWN_SEC", 45.0),
                    help="Seconds to wait after a close before a new entry (default 45)")
     p.add_argument("--ema-filter", action=argparse.BooleanOptionalAction,
@@ -970,7 +1109,8 @@ def main() -> None:
     args = parse_args()
     args.symbol = args.symbol.upper()
     if args.trail_arm_pct <= 0 and args.trail_pct > 0:
-        args.trail_arm_pct = max(args.tp_pct * 0.5, args.fee_buffer + 0.02)
+        # Arm later so trail does not cut winners before fees + room to run
+        args.trail_arm_pct = max(args.tp_pct * 0.65, args.fee_buffer + 0.15)
     if args.no_sounds:
         os.environ["OB_SOUNDS"] = "0"
 

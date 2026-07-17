@@ -240,13 +240,13 @@ def finalize_watch(watch: OutcomeWatch, state: AdaptiveState) -> str:
     )
 
     verdict_human = {
-        "premature_sl": "SL prematuro — la señal prosperó después",
-        "signal_ok_sl_tight": "Señal OK — SL demasiado ajustado",
-        "sl_correct": "SL correcto — precio siguió en contra",
-        "tp_good": "TP acertado — buen seguimiento",
-        "tp_early": "TP temprano — aún había recorrido",
-        "tp_weak_follow": "TP OK — poco follow-through",
-        "loss": "Cierre perdedor",
+        "premature_sl": "Premature SL — signal followed through after exit",
+        "signal_ok_sl_tight": "Signal OK — SL too tight",
+        "sl_correct": "SL correct — price kept going against",
+        "tp_good": "TP good — solid follow-through",
+        "tp_early": "TP early — more room left",
+        "tp_weak_follow": "TP OK — weak follow-through",
+        "loss": "Losing close",
     }.get(verdict, verdict)
 
     sl_adj = getattr(state, "sl_pct_adj", 0.0)
@@ -283,4 +283,5 @@ def tick_outcome_watches(symbol: str, mark: float, now: float | None = None) -> 
 
 def effective_sl_pct(state: AdaptiveState, base_sl: float) -> float:
     adj = float(getattr(state, "sl_pct_adj", 0.0) or 0.0)
-    return min(0.50, base_sl + adj)
+    # Never run tighter than ~0.22% — tiny SLs get eaten by fees/noise
+    return max(0.22, min(0.50, base_sl + adj))

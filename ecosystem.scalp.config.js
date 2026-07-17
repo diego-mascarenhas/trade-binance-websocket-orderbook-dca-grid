@@ -13,6 +13,16 @@ const python = path.join(root, ".venv", "bin", "python");
 module.exports = {
   apps: [
     {
+      // Keep Mac awake even if display sleeps (desktop iMac trading)
+      name: "keep-awake",
+      script: "/usr/bin/caffeinate",
+      args: "-dims",
+      interpreter: "none",
+      autorestart: true,
+      max_restarts: 50,
+      restart_delay: 2000,
+    },
+    {
       name: "scalp-pick",
       cwd: root,
       script: "ob_scalp_pick.py",
