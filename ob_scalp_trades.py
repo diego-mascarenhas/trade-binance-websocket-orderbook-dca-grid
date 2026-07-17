@@ -338,6 +338,26 @@ def _format_report(
             f"{ml_s:>5} {bt_wr_s:>6} {bt_n_s:>5}  {DIM}{ada_note}{RESET}"
         )
 
+    try:
+        from ob_trig_learn import format_disabled_summary, load_disabled, refresh_trig_disabled
+
+        refresh_trig_disabled()
+        disabled = load_disabled()
+        lines.append(
+            f"\n{BOLD}Trig auto-disable{RESET}  {DIM}(n≥15 · pnl<0 · wr≤45%){RESET}"
+        )
+        if disabled:
+            for name, info in sorted(disabled.items(), key=lambda x: float(x[1].get("pnl", 0))):
+                lines.append(
+                    f"  {name:<28} {RED}{float(info.get('pnl', 0)):+.4f}{RESET}  "
+                    f"{DIM}{info.get('wins', 0)}W/{info.get('losses', 0)}L · "
+                    f"n={info.get('n', 0)} · OFF{RESET}"
+                )
+        else:
+            lines.append(f"  {DIM}{format_disabled_summary(disabled)}{RESET}")
+    except Exception as exc:
+        lines.append(f"\n{DIM}Trig auto-disable unavailable: {exc}{RESET}")
+
     for s in syms:
         recovery = load_state(s)
         if recovery.level > 0 or recovery.cumulative_loss_usdt > 0:

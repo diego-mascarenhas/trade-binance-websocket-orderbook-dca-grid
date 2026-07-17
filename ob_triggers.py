@@ -10,12 +10,13 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from ob_bars import OBBar
-from ob_candles import ALL_CANDLE_NAMES, candle_side
+from ob_candles import candle_side
 from ob_ema import EmaSnapshot
 from ob_oscillators import OscillatorSnapshot
 from ob_pattern import PatternSnapshot
 from ob_structure import StructureSnapshot
 from ob_signals import SignalConfig, entry_signal
+from ob_trig_learn import apply_disabled_to_enable, disabled_names
 
 # Display / priority order when several fire together
 TRIGGER_PRIORITY = (
@@ -116,58 +117,62 @@ def collect_triggers(
     # Legacy enable key "pattern" → htf
     if "pattern" in (enable or {}):
         on["htf"] = bool(enable.get("pattern"))  # type: ignore[union-attr]
+    banned = disabled_names()
+    on = apply_disabled_to_enable(on, banned)
     hits: list[TriggerHit] = []
 
-    if on.get("momentum", True):
+    if on.get("momentum", True) and "momentum" not in banned:
         side = _momentum_side(bar, cfg)
         if side:
             hits.append(TriggerHit(side, "momentum"))
 
-    if on.get("imbalance", True):
+    if on.get("imbalance", True) and "imbalance" not in banned:
         side = _imbalance_side(bar, cfg)
         if side:
             hits.append(TriggerHit(side, "imbalance"))
 
     if ema is not None:
-        if on.get("ema_cross", True):
+        if on.get("ema_cross", True) and "ema_cross" not in banned:
             if getattr(ema, "cross_up", False):
                 hits.append(TriggerHit("long", "ema_cross"))
             if getattr(ema, "cross_down", False):
                 hits.append(TriggerHit("short", "ema_cross"))
-        if on.get("ema_trend", True):
+        if on.get("ema_trend", True) and "ema_trend" not in banned:
             if ema.allow_long:
                 hits.append(TriggerHit("long", "ema_trend"))
             if ema.allow_short:
                 hits.append(TriggerHit("short", "ema_trend"))
 
     if pattern is not None:
-        if on.get("htf", True):
+        if on.get("htf", True) and "htf" not in banned and "pattern" not in banned:
             if pattern.allow_long:
                 hits.append(TriggerHit("long", "htf"))
             if pattern.allow_short:
                 hits.append(TriggerHit("short", "htf"))
         if on.get("candles", True):
             for name in getattr(pattern, "candles", None) or []:
+                if name in banned:
+                    continue
                 side = candle_side(name)
                 if side in ("long", "short"):
                     hits.append(TriggerHit(side, name))
 
     if structure is not None:
-        choch_on = on.get("choch", True) or on.get("ichocho", True)
+        choch_on = (on.get("choch", True) or on.get("ichocho", True)) and "choch" not in banned
         if choch_on and structure.choch in ("long", "short"):
             hits.append(TriggerHit(structure.choch, "choch"))
-        if on.get("eql", True) and structure.eql:
+        if on.get("eql", True) and "eql" not in banned and structure.eql:
             hits.append(TriggerHit("long", "eql"))
-        if on.get("eqh", True) and structure.eqh:
+        if on.get("eqh", True) and "eqh" not in banned and structure.eqh:
             hits.append(TriggerHit("short", "eqh"))
 
     if oscillators is not None:
-        if on.get("rsi", True) and oscillators.rsi_side in ("long", "short"):
+        if on.get("rsi", True) and "rsi" not in banned and oscillators.rsi_side in ("long", "short"):
             hits.append(TriggerHit(oscillators.rsi_side, "rsi"))
-        if on.get("stoch", True) and oscillators.stoch_side in ("long", "short"):
+        if on.get("stoch", True) and "stoch" not in banned and oscillators.stoch_side in ("long", "short"):
             hits.append(TriggerHit(oscillators.stoch_side, "stoch"))
 
-    if on.get("ml", True):
+    if on.get("ml", True) and "ml" not in banned:
         if ml_prob_long is not None and ml_prob_long >= ml_min_prob:
             hits.append(TriggerHit("long", "ml"))
         if ml_prob_short is not None and ml_prob_short >= ml_min_prob:

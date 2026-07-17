@@ -28,6 +28,7 @@ from ob_scalp_ml import (
     train_models,
 )
 from ob_signals import SignalConfig, entry_signal
+from ob_trig_learn import format_disabled_summary, refresh_trig_disabled
 from orderbook_dca_grid import fetch_depth, load_env_file
 from trade_sounds import pacman_available
 
@@ -439,6 +440,10 @@ def main() -> None:
                     log(sym, f"No restart — delta {new_stats['score'] - (old_stats or {}).get('score', 0):.4f} < {args.min_delta}")
             else:
                 log(sym, f"Waiting for bars ({bars_n}/{args.min_bars})")
+
+            disabled = refresh_trig_disabled()
+            if disabled:
+                log(sym, f"Trig auto-disable: {format_disabled_summary(disabled)}")
         except Exception as exc:
             log(sym, f"Tune error: {exc}")
 
