@@ -1,19 +1,18 @@
-"""Higher-timeframe pattern filter for OB scalp entries.
+"""Higher-timeframe pattern filter + candlestick detectors for OB scalp.
 
-Uses Binance futures klines to require:
-  - Continuity: consecutive same-direction candles with real bodies
-  - Volume: last candle above average
-  - Context: ATR (enough movement), Bollinger position, optional FVG
+HTF vote (tag ``htf``): continuity / volume / ATR / Bollinger / FVG.
+Candlestick votes: classic patterns tagged by name (hammer, engulfing, …).
 
-Default interval: 5m (continuity/volume) + 15m (FVG / BB backdrop).
+Default interval: 5m (HTF + candles) + 15m (FVG backdrop).
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from futures_scan import FAPI_BASE, fetch_klines
+from ob_candles import detect_candlesticks
 
 
 @dataclass
@@ -30,14 +29,16 @@ class PatternSnapshot:
     allow_long: bool
     allow_short: bool
     reason: str
+    candles: list[str] = field(default_factory=list)
     ts: float = 0.0
 
     def log_line(self) -> str:
+        cndl = "+".join(self.candles) if self.candles else "none"
         return (
             f"{self.interval} body={self.body_pct:.3f}% ratio={self.body_ratio:.2f} "
             f"dir={self.direction} cont={self.continuity} volx={self.vol_ratio:.2f} "
             f"atr={self.atr_pct:.3f}% bb={self.bb_pos:.2f} fvg={self.fvg_bias} "
-            f"allow L={self.allow_long} S={self.allow_short} · {self.reason}"
+            f"htf L={self.allow_long} S={self.allow_short} candles={cndl} · {self.reason}"
         )
 
 
@@ -267,7 +268,11 @@ def evaluate_pattern(
             reasons.append("short: " + ", ".join(miss) if miss else "short denied")
 
     if allow_long or allow_short:
-        reasons = [r for r in reasons if "boost" in r] or ["pattern ok"]
+        reasons = [r for r in reasons if "boost" in r] or ["htf ok"]
+
+    candles = detect_candlesticks(o, h, l, c)
+    if candles:
+        reasons.append("candles=" + "+".join(candles))
 
     snap = PatternSnapshot(
         interval=cfg.interval,
@@ -282,6 +287,7 @@ def evaluate_pattern(
         allow_long=allow_long,
         allow_short=allow_short,
         reason="; ".join(reasons) if reasons else "ok",
+        candles=candles,
         ts=now,
     )
     _CACHE[key] = snap
@@ -309,10 +315,11 @@ def format_pattern_console(snap: PatternSnapshot) -> str:
         dcol = RED
     else:
         dcol = YELLOW
+    cndl = "+".join(snap.candles) if snap.candles else "—"
     return (
         f"  {DIM}PAT {snap.interval}{RESET}  "
         f"{dcol}{snap.direction}{RESET} body {snap.body_ratio:.2f} "
         f"cont {snap.continuity} volx {CYAN}{snap.vol_ratio:.2f}{RESET} "
         f"atr {snap.atr_pct:.2f}% bb {snap.bb_pos:.2f} fvg {snap.fvg_bias} "
-        f"allow {al}/{ash}"
+        f"htf {al}/{ash}  candles {CYAN}{cndl}{RESET}"
     )

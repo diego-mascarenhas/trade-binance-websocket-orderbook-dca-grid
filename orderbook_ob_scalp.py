@@ -700,7 +700,7 @@ def run_loop(args: argparse.Namespace) -> None:
     imb_note = ""
     if getattr(args, "multi_trigger", True):
         imb_note = (
-            "\n  multi-trigger OR: choch · eql/eqh · rsi · stoch · momentum · imbalance · ema · pattern · ml"
+            "\n  multi-trigger OR: choch · eql/eqh · rsi · stoch · htf · candles · momentum · imbalance · ema · ml"
             f"\n  (need ≥{getattr(args, 'trig_min_hits', 2)} agreeing · tagged in ./obscalp-trades)"
         )
     elif not args.imb_filter:
@@ -1019,7 +1019,12 @@ def run_loop(args: argparse.Namespace) -> None:
                     "imbalance": _env_trig("OB_TRIG_IMBALANCE", True),
                     "ema_trend": _env_trig("OB_TRIG_EMA_TREND", True),
                     "ema_cross": _env_trig("OB_TRIG_EMA_CROSS", True),
-                    "pattern": _env_trig("OB_TRIG_PATTERN", True) and bool(args.pattern_filter or True),
+                    "htf": (
+                        _env_trig("OB_TRIG_HTF", True)
+                        if os.getenv("OB_TRIG_HTF", "").strip()
+                        else _env_trig("OB_TRIG_PATTERN", True)
+                    ) and bool(args.pattern_filter or True),
+                    "candles": _env_trig("OB_TRIG_CANDLES", True),
                     "ml": _env_trig("OB_TRIG_ML", True) and bool(args.ml_filter and ml_model),
                     "choch": _env_trig("OB_TRIG_CHOCH", True),
                     "eql": _env_trig("OB_TRIG_EQL", True),

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from ob_bars import OBBar
+from ob_candles import ALL_CANDLE_NAMES, candle_side
 from ob_ema import EmaSnapshot
 from ob_oscillators import OscillatorSnapshot
 from ob_pattern import PatternSnapshot
@@ -23,11 +24,13 @@ TRIGGER_PRIORITY = (
     "eqh",
     "rsi",
     "stoch",
+    "htf",
+    *sorted(ALL_CANDLE_NAMES),
     "ema_cross",
     "ema_trend",
     "imbalance",
     "momentum",
-    "pattern",
+    "pattern",  # legacy alias (maps to htf in collect)
     "ml",
 )
 
@@ -99,7 +102,8 @@ def collect_triggers(
         "imbalance": True,
         "ema_trend": True,
         "ema_cross": True,
-        "pattern": True,
+        "htf": True,
+        "candles": True,
         "ml": True,
         "ichocho": True,
         "choch": True,
@@ -109,6 +113,9 @@ def collect_triggers(
         "stoch": True,
         **(enable or {}),
     }
+    # Legacy enable key "pattern" → htf
+    if "pattern" in (enable or {}):
+        on["htf"] = bool(enable.get("pattern"))  # type: ignore[union-attr]
     hits: list[TriggerHit] = []
 
     if on.get("momentum", True):
@@ -133,11 +140,17 @@ def collect_triggers(
             if ema.allow_short:
                 hits.append(TriggerHit("short", "ema_trend"))
 
-    if pattern is not None and on.get("pattern", True):
-        if pattern.allow_long:
-            hits.append(TriggerHit("long", "pattern"))
-        if pattern.allow_short:
-            hits.append(TriggerHit("short", "pattern"))
+    if pattern is not None:
+        if on.get("htf", True):
+            if pattern.allow_long:
+                hits.append(TriggerHit("long", "htf"))
+            if pattern.allow_short:
+                hits.append(TriggerHit("short", "htf"))
+        if on.get("candles", True):
+            for name in getattr(pattern, "candles", None) or []:
+                side = candle_side(name)
+                if side in ("long", "short"):
+                    hits.append(TriggerHit(side, name))
 
     if structure is not None:
         choch_on = on.get("choch", True) or on.get("ichocho", True)
