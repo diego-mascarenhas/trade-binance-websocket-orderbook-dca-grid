@@ -11,6 +11,7 @@ from decimal import Decimal
 
 from ob_bars import OBBar
 from ob_ema import EmaSnapshot
+from ob_oscillators import OscillatorSnapshot
 from ob_pattern import PatternSnapshot
 from ob_structure import StructureSnapshot
 from ob_signals import SignalConfig, entry_signal
@@ -20,6 +21,8 @@ TRIGGER_PRIORITY = (
     "choch",
     "eql",
     "eqh",
+    "rsi",
+    "stoch",
     "ema_cross",
     "ema_trend",
     "imbalance",
@@ -79,6 +82,7 @@ def collect_triggers(
     ema: EmaSnapshot | None = None,
     pattern: PatternSnapshot | None = None,
     structure: StructureSnapshot | None = None,
+    oscillators: OscillatorSnapshot | None = None,
     ml_prob_long: float | None = None,
     ml_prob_short: float | None = None,
     ml_min_prob: float = 0.20,
@@ -101,6 +105,8 @@ def collect_triggers(
         "choch": True,
         "eql": True,
         "eqh": True,
+        "rsi": True,
+        "stoch": True,
         **(enable or {}),
     }
     hits: list[TriggerHit] = []
@@ -141,6 +147,12 @@ def collect_triggers(
             hits.append(TriggerHit("long", "eql"))
         if on.get("eqh", True) and structure.eqh:
             hits.append(TriggerHit("short", "eqh"))
+
+    if oscillators is not None:
+        if on.get("rsi", True) and oscillators.rsi_side in ("long", "short"):
+            hits.append(TriggerHit(oscillators.rsi_side, "rsi"))
+        if on.get("stoch", True) and oscillators.stoch_side in ("long", "short"):
+            hits.append(TriggerHit(oscillators.stoch_side, "stoch"))
 
     if on.get("ml", True):
         if ml_prob_long is not None and ml_prob_long >= ml_min_prob:

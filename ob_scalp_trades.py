@@ -275,20 +275,22 @@ def _format_report(
             by_part[part].append(r.pnl or 0.0)
 
     if any(t != "unknown" for t in by_tag):
+        tag_w = max(28, max((len(t) for t in by_tag), default=28))
+        part_w = max(28, max((len(t) for t in by_part), default=28))
         lines.append(f"\n{BOLD}By trigger tag{RESET}")
         for tag, pnls in sorted(by_tag.items(), key=lambda x: sum(x[1]), reverse=True):
             s = sum(pnls)
             w = sum(1 for p in pnls if p > 0)
             l = len(pnls) - w
             c = GREEN if s > 0 else RED if s < 0 else DIM
-            lines.append(f"  {tag:<28} {c}{s:+.4f}{RESET}  {DIM}{w}W/{l}L · {len(pnls)}{RESET}")
+            lines.append(f"  {tag:<{tag_w}} {c}{s:+.4f}{RESET}  {DIM}{w}W/{l}L · {len(pnls)}{RESET}")
         lines.append(f"\n{BOLD}By trigger component{RESET}  {DIM}(credit each part of a combo){RESET}")
         for part, pnls in sorted(by_part.items(), key=lambda x: sum(x[1]), reverse=True):
             s = sum(pnls)
             w = sum(1 for p in pnls if p > 0)
             l = len(pnls) - w
             c = GREEN if s > 0 else RED if s < 0 else DIM
-            lines.append(f"  {part:<28} {c}{s:+.4f}{RESET}  {DIM}{w}W/{l}L · {len(pnls)}{RESET}")
+            lines.append(f"  {part:<{part_w}} {c}{s:+.4f}{RESET}  {DIM}{w}W/{l}L · {len(pnls)}{RESET}")
 
     for s in syms:
         recovery = load_state(s)

@@ -39,6 +39,11 @@ from ob_structure import (
     fetch_structure,
     format_structure_console,
 )
+from ob_oscillators import (
+    OscillatorConfig,
+    fetch_oscillators,
+    format_oscillators_console,
+)
 from ob_triggers import (
     collect_triggers,
     hit_sl,
@@ -695,7 +700,7 @@ def run_loop(args: argparse.Namespace) -> None:
     imb_note = ""
     if getattr(args, "multi_trigger", True):
         imb_note = (
-            "\n  multi-trigger OR: choch · eql/eqh · momentum · imbalance · ema · pattern · ml"
+            "\n  multi-trigger OR: choch · eql/eqh · rsi · stoch · momentum · imbalance · ema · pattern · ml"
             f"\n  (need ≥{getattr(args, 'trig_min_hits', 2)} agreeing · tagged in ./obscalp-trades)"
         )
     elif not args.imb_filter:
@@ -982,6 +987,26 @@ def run_loop(args: argparse.Namespace) -> None:
                 except Exception as exc:
                     print(f"{YELLOW}Structure fetch failed: {exc}{RESET}")
 
+            osc_snap = None
+            if getattr(args, "multi_trigger", True) and (
+                _env_trig("OB_TRIG_RSI", True) or _env_trig("OB_TRIG_STOCH", True)
+            ):
+                try:
+                    osc_cfg = OscillatorConfig(
+                        interval=getattr(args, "osc_interval", "5m"),
+                        rsi_period=int(getattr(args, "rsi_period", 14)),
+                        rsi_oversold=float(getattr(args, "rsi_oversold", 30.0)),
+                        rsi_overbought=float(getattr(args, "rsi_overbought", 70.0)),
+                        stoch_k=int(getattr(args, "stoch_k", 14)),
+                        stoch_d=int(getattr(args, "stoch_d", 3)),
+                        stoch_oversold=float(getattr(args, "stoch_oversold", 20.0)),
+                        stoch_overbought=float(getattr(args, "stoch_overbought", 80.0)),
+                    )
+                    osc_snap = fetch_oscillators(sym, cfg=osc_cfg)
+                    print(format_oscillators_console(osc_snap))
+                except Exception as exc:
+                    print(f"{YELLOW}Oscillator fetch failed: {exc}{RESET}")
+
             ml_prob_long = ml_prob_short = None
             if ml_model and args.ml_filter:
                 ml_prob_long = predict_prob(ml_model, bar_rec, "long")
@@ -999,12 +1024,15 @@ def run_loop(args: argparse.Namespace) -> None:
                     "choch": _env_trig("OB_TRIG_CHOCH", True),
                     "eql": _env_trig("OB_TRIG_EQL", True),
                     "eqh": _env_trig("OB_TRIG_EQH", True),
+                    "rsi": _env_trig("OB_TRIG_RSI", True),
+                    "stoch": _env_trig("OB_TRIG_STOCH", True),
                 }
                 decision = collect_triggers(
                     bar, sig_cfg,
                     ema=ema_snap,
                     pattern=pat_snap,
                     structure=struct_snap,
+                    oscillators=osc_snap,
                     ml_prob_long=ml_prob_long,
                     ml_prob_short=ml_prob_short,
                     ml_min_prob=ml_threshold,
@@ -1324,6 +1352,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--structure-equal-tol", type=float,
                    default=_env_float("OB_STRUCTURE_EQUAL_TOL", 0.12),
                    help="EQH/EQL match tolerance %% (default 0.12)")
+    p.add_argument("--osc-interval", default=os.getenv("OB_OSC_INTERVAL", "5m").strip() or "5m",
+                   help="Kline interval for RSI/Stochastic (default 5m)")
+    p.add_argument("--rsi-period", type=int, default=int(_env_float("OB_RSI_PERIOD", 14)),
+                   help="RSI period (default 14)")
+    p.add_argument("--rsi-oversold", type=float, default=_env_float("OB_RSI_OVERSOLD", 30.0),
+                   help="RSI long zone (default 30)")
+    p.add_argument("--rsi-overbought", type=float, default=_env_float("OB_RSI_OVERBOUGHT", 70.0),
+                   help="RSI short zone (default 70)")
+    p.add_argument("--stoch-k", type=int, default=int(_env_float("OB_STOCH_K", 14)),
+                   help="Stochastic %%K period (default 14)")
+    p.add_argument("--stoch-d", type=int, default=int(_env_float("OB_STOCH_D", 3)),
+                   help="Stochastic %%D smooth (default 3)")
+    p.add_argument("--stoch-oversold", type=float, default=_env_float("OB_STOCH_OVERSOLD", 20.0),
+                   help="Stochastic long zone (default 20)")
+    p.add_argument("--stoch-overbought", type=float, default=_env_float("OB_STOCH_OVERBOUGHT", 80.0),
+                   help="Stochastic short zone (default 80)")
     p.add_argument("--structure-near-pct", type=float,
                    default=_env_float("OB_STRUCTURE_NEAR_PCT", 0.35),
                    help="Max distance %% to EQH/EQL to fire trigger (default 0.35)")
