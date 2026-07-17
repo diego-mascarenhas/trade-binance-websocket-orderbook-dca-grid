@@ -173,8 +173,11 @@ def start_bot(
     log_dir.mkdir(parents=True, exist_ok=True)
     bars_n = len(load_bars(symbol))
     tuned = clamp_trade_params(TuneParams(**params.__dict__))
-    ml_cap = float(os.getenv("OB_ML_MIN_PROB", "0.25") or 0.25)
-    tuned.ml_min_prob = min(tuned.ml_min_prob, ml_cap, 0.35)
+    ml_env = float(os.getenv("OB_ML_MIN_PROB", "0") or 0)
+    if ml_env > 0:
+        # Env is a floor (stricter). Previously used as a cap for aggressive mode.
+        tuned.ml_min_prob = max(tuned.ml_min_prob, ml_env)
+    tuned.ml_min_prob = min(tuned.ml_min_prob, 0.55)
     cooldown = os.getenv("OB_ENTRY_COOLDOWN_SEC", "").strip()
     if cooldown:
         try:
@@ -234,6 +237,11 @@ def start_bot(
         cmd.append("--no-ob-exits")
     else:
         cmd.append("--ob-exits")
+    hits = os.getenv("OB_TRIG_MIN_HITS", "2").strip() or "2"
+    try:
+        cmd.extend(["--trig-min-hits", str(max(1, int(float(hits))))])
+    except ValueError:
+        cmd.extend(["--trig-min-hits", "2"])
     # Keep ML on once we have a small sample; soft threshold handles low-confidence bars.
     if bars_n < 20:
         cmd.append("--no-ml-filter")

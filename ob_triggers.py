@@ -12,10 +12,14 @@ from decimal import Decimal
 from ob_bars import OBBar
 from ob_ema import EmaSnapshot
 from ob_pattern import PatternSnapshot
+from ob_structure import StructureSnapshot
 from ob_signals import SignalConfig, entry_signal
 
 # Display / priority order when several fire together
 TRIGGER_PRIORITY = (
+    "choch",
+    "eql",
+    "eqh",
     "ema_cross",
     "ema_trend",
     "imbalance",
@@ -74,12 +78,18 @@ def collect_triggers(
     *,
     ema: EmaSnapshot | None = None,
     pattern: PatternSnapshot | None = None,
+    structure: StructureSnapshot | None = None,
     ml_prob_long: float | None = None,
     ml_prob_short: float | None = None,
     ml_min_prob: float = 0.20,
+    min_hits: int = 1,
     enable: dict[str, bool] | None = None,
 ) -> EntryDecision:
-    """OR across enabled triggers; prefer the side with more / higher-priority hits."""
+    """OR across enabled triggers; prefer the side with more / higher-priority hits.
+
+    ``min_hits`` requires at least that many agreeing triggers on the chosen side
+    (default 1 = classic OR). Use 2+ to cut weak single-source entries.
+    """
     on = {
         "momentum": True,
         "imbalance": True,
@@ -87,6 +97,10 @@ def collect_triggers(
         "ema_cross": True,
         "pattern": True,
         "ml": True,
+        "ichocho": True,
+        "choch": True,
+        "eql": True,
+        "eqh": True,
         **(enable or {}),
     }
     hits: list[TriggerHit] = []
@@ -119,13 +133,25 @@ def collect_triggers(
         if pattern.allow_short:
             hits.append(TriggerHit("short", "pattern"))
 
+    if structure is not None:
+        choch_on = on.get("choch", True) or on.get("ichocho", True)
+        if choch_on and structure.choch in ("long", "short"):
+            hits.append(TriggerHit(structure.choch, "choch"))
+        if on.get("eql", True) and structure.eql:
+            hits.append(TriggerHit("long", "eql"))
+        if on.get("eqh", True) and structure.eqh:
+            hits.append(TriggerHit("short", "eqh"))
+
     if on.get("ml", True):
         if ml_prob_long is not None and ml_prob_long >= ml_min_prob:
             hits.append(TriggerHit("long", "ml"))
         if ml_prob_short is not None and ml_prob_short >= ml_min_prob:
             hits.append(TriggerHit("short", "ml"))
 
+    need = max(1, int(min_hits))
     if not hits:
+        if need > 1:
+            return EntryDecision(side=None, triggers=[])
         # Fallback: legacy single entry_signal if configured for imbalance-only path
         legacy = entry_signal(bar, cfg)
         if legacy:
@@ -140,15 +166,19 @@ def collect_triggers(
         pri = min((TRIGGER_PRIORITY.index(n) for n in names if n in TRIGGER_PRIORITY), default=99)
         return (len(names), -pri)
 
+    chosen: EntryDecision
     if long_hits and not short_hits:
-        return EntryDecision(side="long", triggers=sorted(set(long_hits)))
-    if short_hits and not long_hits:
-        return EntryDecision(side="short", triggers=sorted(set(short_hits)))
+        chosen = EntryDecision(side="long", triggers=sorted(set(long_hits)))
+    elif short_hits and not long_hits:
+        chosen = EntryDecision(side="short", triggers=sorted(set(short_hits)))
+    elif score(long_hits) >= score(short_hits):
+        chosen = EntryDecision(side="long", triggers=sorted(set(long_hits)))
+    else:
+        chosen = EntryDecision(side="short", triggers=sorted(set(short_hits)))
 
-    # Both sides: pick the stronger set
-    if score(long_hits) >= score(short_hits):
-        return EntryDecision(side="long", triggers=sorted(set(long_hits)))
-    return EntryDecision(side="short", triggers=sorted(set(short_hits)))
+    if chosen.side and len(chosen.triggers) < need:
+        return EntryDecision(side=None, triggers=[])
+    return chosen
 
 
 @dataclass
@@ -180,6 +210,9 @@ def resolve_ob_exits(
     from orderbook_dca_grid import choose_tp_activation, select_walls
 
     min_dist = fee_buffer if min_dist_pct is None else min_dist_pct
+    # Round-trip fee floor: wall must clear fees with margin (fee_buffer alone is too tight).
+    min_tp_pct = max(fee_buffer * 2.0, fee_buffer + 0.15, 0.30)
+
     # TP: opposing wall (callback=0 → activation ≈ wall / fee floor)
     tp_info = choose_tp_activation(
         bids, asks, entry, entry, is_long,
@@ -192,13 +225,14 @@ def resolve_ob_exits(
     tp_price = float(tp_info["activation"])
     tp_on_wall = bool(tp_info.get("on_wall"))
     tp_dist = abs(tp_price - entry) / entry * 100 if entry > 0 else 0.0
-    if tp_dist < fee_buffer or (max_range_pct > 0 and tp_dist > max_range_pct):
+    if tp_dist < min_tp_pct or (max_range_pct > 0 and tp_dist > max_range_pct):
+        use_pct = max(tp_pct_fallback, min_tp_pct)
         if is_long:
-            tp_price = entry * (1 + tp_pct_fallback / 100)
+            tp_price = entry * (1 + use_pct / 100)
         else:
-            tp_price = entry * (1 - tp_pct_fallback / 100)
+            tp_price = entry * (1 - use_pct / 100)
         tp_on_wall = False
-        tp_dist = tp_pct_fallback
+        tp_dist = use_pct
 
     # SL: supporting wall via select_walls
     levels = bids if is_long else asks

@@ -34,6 +34,11 @@ from ob_pattern import (
     format_pattern_console,
     pattern_allows,
 )
+from ob_structure import (
+    StructureConfig,
+    fetch_structure,
+    format_structure_console,
+)
 from ob_triggers import (
     collect_triggers,
     hit_sl,
@@ -690,8 +695,8 @@ def run_loop(args: argparse.Namespace) -> None:
     imb_note = ""
     if getattr(args, "multi_trigger", True):
         imb_note = (
-            "\n  multi-trigger OR: momentum · imbalance · ema_trend/cross · pattern · ml"
-            "\n  (tagged in journal for ./obscalp-trades)"
+            "\n  multi-trigger OR: choch · eql/eqh · momentum · imbalance · ema · pattern · ml"
+            f"\n  (need ≥{getattr(args, 'trig_min_hits', 2)} agreeing · tagged in ./obscalp-trades)"
         )
     elif not args.imb_filter:
         imb_note = f"\n  entry signal: momentum≥{args.momentum_min_pct:g}% (imbalance filter OFF by default)"
@@ -960,6 +965,23 @@ def run_loop(args: argparse.Namespace) -> None:
                 if pat_snap:
                     print(format_pattern_console(pat_snap))
 
+            struct_snap = None
+            if getattr(args, "multi_trigger", True) and (
+                _env_trig("OB_TRIG_CHOCH", True)
+                or _env_trig("OB_TRIG_EQL", True)
+                or _env_trig("OB_TRIG_EQH", True)
+            ):
+                try:
+                    struct_cfg = StructureConfig(
+                        interval=getattr(args, "structure_interval", "5m"),
+                        equal_tol_pct=float(getattr(args, "structure_equal_tol", 0.12)),
+                        near_pct=float(getattr(args, "structure_near_pct", 0.35)),
+                    )
+                    struct_snap = fetch_structure(sym, cfg=struct_cfg)
+                    print(format_structure_console(struct_snap))
+                except Exception as exc:
+                    print(f"{YELLOW}Structure fetch failed: {exc}{RESET}")
+
             ml_prob_long = ml_prob_short = None
             if ml_model and args.ml_filter:
                 ml_prob_long = predict_prob(ml_model, bar_rec, "long")
@@ -974,20 +996,28 @@ def run_loop(args: argparse.Namespace) -> None:
                     "ema_cross": _env_trig("OB_TRIG_EMA_CROSS", True),
                     "pattern": _env_trig("OB_TRIG_PATTERN", True) and bool(args.pattern_filter or True),
                     "ml": _env_trig("OB_TRIG_ML", True) and bool(args.ml_filter and ml_model),
+                    "choch": _env_trig("OB_TRIG_CHOCH", True),
+                    "eql": _env_trig("OB_TRIG_EQL", True),
+                    "eqh": _env_trig("OB_TRIG_EQH", True),
                 }
                 decision = collect_triggers(
                     bar, sig_cfg,
                     ema=ema_snap,
                     pattern=pat_snap,
+                    structure=struct_snap,
                     ml_prob_long=ml_prob_long,
                     ml_prob_short=ml_prob_short,
                     ml_min_prob=ml_threshold,
+                    min_hits=int(getattr(args, "trig_min_hits", 2) or 1),
                     enable=enable,
                 )
                 signal = decision.side
                 trigger_tag = decision.tag
                 if signal and trigger_tag:
                     print(f"{CYAN}Triggers {signal.upper()}: {trigger_tag}{RESET}")
+                elif not signal and getattr(args, "trig_min_hits", 2) > 1:
+                    # Quiet unless we almost had a signal (avoid spam)
+                    pass
             else:
                 signal = ob_signal
                 trigger_tag = "momentum" if signal and not args.imb_filter else ("imbalance" if signal else "")
@@ -1286,6 +1316,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--multi-trigger", action=argparse.BooleanOptionalAction,
                    default=_env_bool("OB_MULTI_TRIGGER", True),
                    help="OR entry triggers (momentum/imb/ema/pattern/ml) and tag trades (default on)")
+    p.add_argument("--trig-min-hits", type=int,
+                   default=int(_env_float("OB_TRIG_MIN_HITS", 2)),
+                   help="Min agreeing triggers for entry when --multi-trigger (default 2)")
+    p.add_argument("--structure-interval", default=os.getenv("OB_STRUCTURE_INTERVAL", "5m").strip() or "5m",
+                   help="Kline interval for choch/eql/eqh (default 5m)")
+    p.add_argument("--structure-equal-tol", type=float,
+                   default=_env_float("OB_STRUCTURE_EQUAL_TOL", 0.12),
+                   help="EQH/EQL match tolerance %% (default 0.12)")
+    p.add_argument("--structure-near-pct", type=float,
+                   default=_env_float("OB_STRUCTURE_NEAR_PCT", 0.35),
+                   help="Max distance %% to EQH/EQL to fire trigger (default 0.35)")
     p.add_argument("--ob-exits", action=argparse.BooleanOptionalAction,
                    default=_env_bool("OB_EXITS", True),
                    help="TP/SL from order-book walls with %% fallback (default on)")

@@ -339,7 +339,8 @@ def main() -> int:
                    help="Live refresh; without SYMBOL, follows active pick")
     p.add_argument("--interval", type=float, default=2.0,
                    help="Follow refresh seconds (default 2)")
-    p.add_argument("--opens", action="store_true", help="Also show OPEN lines")
+    p.add_argument("--opens", action=argparse.BooleanOptionalAction, default=True,
+                   help="Include OPEN rows in the table (default on; use --no-opens to hide)")
     p.add_argument("--list", action="store_true", help="List symbols with journals")
     args = p.parse_args()
 

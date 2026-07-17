@@ -181,6 +181,17 @@ def place_scalp_exchange_exits(
     if tp <= 0 or sl <= 0:
         raise ValueError("tp/sl prices required")
 
+    # Never arm a TP that cannot clear round-trip fees.
+    min_tp_pct = max(fee_buffer_pct * 2.0, fee_buffer_pct + 0.15, 0.30)
+    if entry > 0:
+        tp_dist = abs(tp - entry) / entry * 100
+        if tp_dist < min_tp_pct:
+            if is_long:
+                tp = entry * (1 + min_tp_pct / 100)
+            else:
+                tp = entry * (1 - min_tp_pct / 100)
+            print(f"{YELLOW}TP too tight ({tp_dist:.2f}%) — floored to {min_tp_pct:.2f}%{RESET}")
+
     if _tp_would_fire(is_long, tp, mark, tick):
         tp = _nudge_away(is_long, is_tp=True, trigger=tp, mark=mark, tick=tick, fee_buffer_pct=fee_buffer_pct)
         print(f"{YELLOW}TP was at/through mark — nudged to {price_fmt(tp)}{RESET}")
