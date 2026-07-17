@@ -169,6 +169,7 @@ def start_bot(
     recover_max_level: int,
     bar_sec: float,
 ) -> int:
+    load_env_file(None)
     log_dir = ROOT / ".run/logs" / symbol.upper()
     log_dir.mkdir(parents=True, exist_ok=True)
     bars_n = len(load_bars(symbol))
@@ -182,6 +183,12 @@ def start_bot(
     if cooldown:
         try:
             tuned.entry_cooldown_sec = float(cooldown)
+        except ValueError:
+            pass
+    env_max = os.getenv("OB_RECOVER_MAX_LEVEL", "").strip()
+    if env_max:
+        try:
+            recover_max_level = max(0, int(float(env_max)))
         except ValueError:
             pass
     cmd = [
@@ -351,6 +358,7 @@ def should_apply(new_stats: dict[str, float], old_stats: dict[str, float] | None
 
 
 def main() -> None:
+    load_env_file(None)
     p = argparse.ArgumentParser(description="ML autotuner for OB scalp")
     p.add_argument("symbol", nargs="?", default="ZECUSDT")
     p.add_argument("--interval-min", type=float, default=2.0,
@@ -364,10 +372,11 @@ def main() -> None:
     p.add_argument("--execute", action="store_true", help="Run bot live (default dry-run)")
     p.add_argument("--recover", action="store_true", default=True)
     p.add_argument("--no-recover", action="store_true")
-    p.add_argument("--recover-max-level", type=int, default=3)
+    p.add_argument("--recover-max-level", type=int,
+                   default=int(os.getenv("OB_RECOVER_MAX_LEVEL", "4") or 4),
+                   help="Max martingale level (env OB_RECOVER_MAX_LEVEL; 4 = 5 entries up to 16x)")
     p.add_argument("--once", action="store_true", help="Single tune cycle then exit")
     args = p.parse_args()
-    load_env_file(None)
 
     sym = args.symbol.upper()
     ensure_single_instance(sym)
@@ -378,7 +387,8 @@ def main() -> None:
     params = tuned or TuneParams()
     old_stats = meta.get("stats") if meta else None
 
-    log(sym, f"Autotune start execute={execute} recover={recover} interval={args.interval_min}m")
+    log(sym, f"Autotune start execute={execute} recover={recover} "
+        f"max_level={args.recover_max_level} interval={args.interval_min}m")
 
     backfilled = backfill_from_stdout(sym)
     if backfilled:

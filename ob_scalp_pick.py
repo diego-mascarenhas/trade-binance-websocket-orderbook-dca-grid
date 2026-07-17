@@ -368,7 +368,7 @@ def run_daemon(args: argparse.Namespace) -> int:
     idle_note = f" · idle rescan after {args.idle_min:g}m ({args.idle_mode})" if args.idle_min > 0 else ""
     on_start_note = " · pick on start" if args.on_start else ""
     print(f"{BOLD}Scalp pick daemon{RESET} — schedule {sched}{idle_note}{on_start_note}")
-    print(f"{DIM}Ctrl+C to stop · log {PICK_LOG}{RESET}\n")
+    print(f"{DIM}pool size {args.count} · Ctrl+C to stop · log {PICK_LOG}{RESET}\n")
 
     last_run: dict[str, str] = {}
     last_idle_pick_at = 0.0
@@ -436,6 +436,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    load_env_file(None)
     args = parse_args()
     if args.daemon:
         raise SystemExit(run_daemon(args))

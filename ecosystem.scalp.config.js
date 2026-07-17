@@ -27,7 +27,8 @@ module.exports = {
       cwd: root,
       script: "ob_scalp_pick.py",
       interpreter: python,
-      args: "--daemon -y --idle-min 90 --count 3",
+      // Count from .env OB_PICK_COUNT (default 3 in ob_scalp_pick.py)
+      args: "--daemon -y --idle-min 90",
       autorestart: true,
       max_restarts: 20,
       restart_delay: 5000,

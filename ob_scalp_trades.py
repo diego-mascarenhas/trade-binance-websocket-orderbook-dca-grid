@@ -221,10 +221,10 @@ def _format_report(
 
     if multi:
         hdr = (
-            f"{'When':<19} {'Symbol':<10} {'Evt':<7} {'Side':<5} {'Vol USDT':>9} "
+            f"{'When':<19} {'Symbol':<14} {'Evt':<7} {'Side':<5} {'Vol USDT':>9} "
             f"{'Gross':>8} {'PnL USDT':>10}  {'Trigger':<28} Note"
         )
-        sep = "-" * 108
+        sep = "-" * 112
     else:
         hdr = (
             f"{'When':<19} {'Evt':<7} {'Side':<5} {'Vol USDT':>9} "
@@ -241,7 +241,7 @@ def _format_report(
         vol_s = f"{vol:.2f}" if vol is not None else ""
         trig = (r.trigger or "—")[:28]
         row_sym = r.symbol or syms[0]
-        sym_cell = f"{BOLD}{row_sym:<10}{RESET} " if multi else ""
+        sym_cell = f"{BOLD}{row_sym:<14}{RESET} " if multi else ""
         if r.kind == "OPEN":
             note = f"qty {r.qty:g} · level {r.level} ({r.mult})"
             lines.append(

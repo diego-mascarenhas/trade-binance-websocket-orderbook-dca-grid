@@ -99,7 +99,18 @@ def pnl_usdt(entry: float, exit_price: float, qty: float, is_long: bool) -> floa
 
 
 def ensure_base_notional(state: RecoveryState, base_notional: float) -> None:
-    if state.base_notional_usdt <= 0 and base_notional > 0:
+    """Seed or refresh the martingale base from the current size config.
+
+    When flat (no level / debt), always adopt ``base_notional`` so a switch from
+    exchange-min to fixed size (or any config change) takes effect on the next
+    entry. Mid-ladder, keep the locked base so recovery math stays consistent.
+    """
+    if base_notional <= 0:
+        return
+    if state.level <= 0 and state.cumulative_loss_usdt <= 0:
+        state.base_notional_usdt = base_notional
+        return
+    if state.base_notional_usdt <= 0:
         state.base_notional_usdt = base_notional
 
 
@@ -197,6 +208,7 @@ def record_close(
             state.level = 0
             state.loss_streak = 0
             state.cumulative_loss_usdt = 0.0
+            state.base_notional_usdt = 0.0  # re-seed from size config on next open
             _clear_side_lock(state)
             line += " → RESET"
         else:
