@@ -2,10 +2,10 @@
 """Show OB scalp trade history from scalp_trades.log.
 
 Usage:
-    ./obscalp-trades              # active symbol — all closes + total PnL
+    ./obscalp-trades              # active pool — all closes + total PnL
     ./obscalp-trades PYTHUSDT
-    ./obscalp-trades -f           # live refresh (tail-style)
-    ./obscalp-trades -f -n 15     # live, last 15 closes
+    ./obscalp-trades -f           # live: all pool symbols (not only primary)
+    ./obscalp-trades -f -n 15     # live, last 15 closes across pool
     ./obscalp-trades --list
 """
 
@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ob_scalp_recovery import format_status, journal_path, load_state
-from ob_scalp_stack import active_symbol, running_symbols
+from ob_scalp_stack import active_symbol, load_active, running_symbols
 
 ROOT = Path(__file__).resolve().parent
 LOG_ROOT = ROOT / ".run" / "logs"
@@ -65,12 +65,31 @@ class TradeRow:
     mult: str
     outcome: str
     trigger: str = ""
+    symbol: str = ""
+
+
+def pool_symbols() -> list[str]:
+    """Symbols to follow: pick pool if set, else primary / running."""
+    data = load_active()
+    pool = data.get("pool") or []
+    out: list[str] = []
+    for s in pool:
+        u = str(s).upper().strip()
+        if u and u not in out:
+            out.append(u)
+    if out:
+        return out
+    primary = (data.get("symbol") or active_symbol() or "").upper().strip()
+    if primary:
+        return [primary]
+    return [s.upper() for s in running_symbols()]
 
 
 def parse_journal(symbol: str) -> list[TradeRow]:
     path = journal_path(symbol)
     if not path.exists():
         return []
+    sym = symbol.upper()
     rows: list[TradeRow] = []
     last_open_trigger = ""
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -95,6 +114,7 @@ def parse_journal(symbol: str) -> list[TradeRow]:
                     mult=f"{m.group(6)}x",
                     outcome="",
                     trigger=last_open_trigger,
+                    symbol=sym,
                 )
             )
             continue
@@ -117,6 +137,7 @@ def parse_journal(symbol: str) -> list[TradeRow]:
                     mult="",
                     outcome=outcome,
                     trigger=trig,
+                    symbol=sym,
                 )
             )
             last_open_trigger = ""
@@ -144,24 +165,38 @@ def _reason_color(kind: str) -> str:
 
 
 def _format_report(
-    symbol: str,
+    symbols: str | list[str],
     *,
     limit: int | None,
     show_opens: bool,
     live: bool = False,
     show_symbol_col: bool = False,
 ) -> str:
-    sym = symbol.upper()
-    all_rows = parse_journal(sym)
+    if isinstance(symbols, str):
+        syms = [symbols.upper()]
+    else:
+        syms = [s.upper() for s in symbols if s]
+    if not syms:
+        msg = f"{DIM}No symbols to follow · waiting… · Ctrl+C to stop{RESET}\n"
+        return msg
+
+    all_rows: list[TradeRow] = []
+    for s in syms:
+        all_rows.extend(parse_journal(s))
+    all_rows.sort(key=lambda r: (r.ts, r.symbol, r.kind))
+
     closes = [r for r in all_rows if r.kind != "OPEN"]
     rows = all_rows if show_opens else closes
     if limit is not None and limit > 0:
         rows = rows[-limit:]
 
+    multi = len(syms) > 1 or show_symbol_col
+    label = "+".join(syms) if len(syms) <= 3 else f"{len(syms)} symbols"
     lines: list[str] = []
     if not closes and not rows:
-        lines.append(f"{DIM}No trades in journal for {sym}{RESET}")
-        lines.append(f"  {DIM}{journal_path(sym)}{RESET}")
+        lines.append(f"{DIM}No trades in journal for {label}{RESET}")
+        for s in syms:
+            lines.append(f"  {DIM}{journal_path(s)}{RESET}")
         if live:
             lines.append(f"\n{DIM}live · waiting for trades · Ctrl+C to stop{RESET}")
         return "\n".join(lines) + "\n"
@@ -172,11 +207,11 @@ def _format_report(
     t_color = GREEN if total_pnl > 0 else RED if total_pnl < 0 else DIM
     now = time.strftime("%H:%M:%S")
 
-    head = f"{BOLD}{CYAN}{sym}{RESET}  {DIM}{len(closes)} closed trades{RESET}"
+    head = f"{BOLD}{CYAN}{label}{RESET}  {DIM}{len(closes)} closed trades{RESET}"
     if live:
         head += f"  {DIM}live {now}{RESET}"
-        if show_symbol_col:
-            head += f"  {DIM}(following active){RESET}"
+        if multi:
+            head += f"  {DIM}(pool){RESET}"
     lines.append(head)
     lines.append(
         f"{BOLD}Total PnL  {t_color}{total_pnl:+.4f} USDT{RESET}  "
@@ -184,7 +219,7 @@ def _format_report(
     )
     lines.append("")
 
-    if show_symbol_col:
+    if multi:
         hdr = (
             f"{'When':<19} {'Symbol':<10} {'Evt':<7} {'Side':<5} {'Vol USDT':>9} "
             f"{'Gross':>8} {'PnL USDT':>10}  {'Trigger':<28} Note"
@@ -205,7 +240,8 @@ def _format_report(
             vol = r.entry * r.qty
         vol_s = f"{vol:.2f}" if vol is not None else ""
         trig = (r.trigger or "—")[:28]
-        sym_cell = f"{BOLD}{sym:<10}{RESET} " if show_symbol_col else ""
+        row_sym = r.symbol or syms[0]
+        sym_cell = f"{BOLD}{row_sym:<10}{RESET} " if multi else ""
         if r.kind == "OPEN":
             note = f"qty {r.qty:g} · level {r.level} ({r.mult})"
             lines.append(
@@ -254,16 +290,17 @@ def _format_report(
             c = GREEN if s > 0 else RED if s < 0 else DIM
             lines.append(f"  {part:<28} {c}{s:+.4f}{RESET}  {DIM}{w}W/{l}L · {len(pnls)}{RESET}")
 
-    recovery = load_state(sym)
-    if recovery.level > 0 or recovery.cumulative_loss_usdt > 0:
-        prefix = f"{sym}  " if show_symbol_col else ""
-        lines.append(f"{DIM}{prefix}{format_status(recovery)}{RESET}")
-        if recovery.base_notional_usdt > 0:
-            nxt = recovery.base_notional_usdt * (2 ** max(0, recovery.level))
-            lines.append(
-                f"{DIM}{prefix}next entry ~{nxt:g} USDT "
-                f"({recovery.multiplier:g}x · base {recovery.base_notional_usdt:g}){RESET}"
-            )
+    for s in syms:
+        recovery = load_state(s)
+        if recovery.level > 0 or recovery.cumulative_loss_usdt > 0:
+            prefix = f"{s}  " if multi else ""
+            lines.append(f"{DIM}{prefix}{format_status(recovery)}{RESET}")
+            if recovery.base_notional_usdt > 0:
+                nxt = recovery.base_notional_usdt * (2 ** max(0, recovery.level))
+                lines.append(
+                    f"{DIM}{prefix}next entry ~{nxt:g} USDT "
+                    f"({recovery.multiplier:g}x · base {recovery.base_notional_usdt:g}){RESET}"
+                )
     if live:
         lines.append(f"{DIM}refreshing · Ctrl+C to stop{RESET}")
     lines.append("")
@@ -271,14 +308,14 @@ def _format_report(
 
 
 def print_trades(
-    symbol: str,
+    symbols: str | list[str],
     *,
     limit: int | None,
     show_opens: bool,
     show_symbol_col: bool = False,
 ) -> int:
     text = _format_report(
-        symbol,
+        symbols,
         limit=limit,
         show_opens=show_opens,
         live=False,
@@ -298,28 +335,31 @@ def follow_trades(
 ) -> int:
     """Clear and redraw until Ctrl+C.
 
-    If ``symbol`` is None, re-resolve ``active_symbol()`` each tick (follow pick).
+    If ``symbol`` is None, follow the whole pick pool (all journals merged).
     """
     last = ""
-    last_sym = ""
-    follow_active = symbol is None
+    last_key = ""
+    follow_pool = symbol is None
     try:
         while True:
-            sym = (symbol or active_symbol() or "").upper()
-            if not sym:
-                text = f"{DIM}No active symbol yet · waiting… · Ctrl+C to stop{RESET}\n"
+            if follow_pool:
+                syms = pool_symbols()
             else:
-                if follow_active and sym != last_sym and last_sym:
-                    # Force redraw banner when pick switches
+                syms = [symbol.upper()] if symbol else []
+            key = ",".join(syms)
+            if not syms:
+                text = f"{DIM}No active pool yet · waiting… · Ctrl+C to stop{RESET}\n"
+            else:
+                if key != last_key and last_key:
                     last = ""
                 text = _format_report(
-                    sym,
+                    syms,
                     limit=limit,
                     show_opens=show_opens,
                     live=True,
-                    show_symbol_col=follow_active,
+                    show_symbol_col=follow_pool or len(syms) > 1,
                 )
-                last_sym = sym
+                last_key = key
             if text != last:
                 sys.stdout.write(CLEAR + text)
                 sys.stdout.flush()
@@ -332,11 +372,11 @@ def follow_trades(
 
 def main() -> int:
     p = argparse.ArgumentParser(description="All OB scalp trades + total PnL for a symbol")
-    p.add_argument("symbol", nargs="?", help="Symbol (default: follow active stack)")
+    p.add_argument("symbol", nargs="?", help="Symbol (default: follow active pool)")
     p.add_argument("-n", "--limit", type=int, default=0,
                    help="Show only last N closes (0 = all)")
     p.add_argument("-f", "--follow", action="store_true",
-                   help="Live refresh; without SYMBOL, follows active pick")
+                   help="Live refresh; without SYMBOL, follows whole pick pool")
     p.add_argument("--interval", type=float, default=2.0,
                    help="Follow refresh seconds (default 2)")
     p.add_argument("--opens", action=argparse.BooleanOptionalAction, default=True,
@@ -361,9 +401,9 @@ def main() -> int:
     limit = args.limit if args.limit and args.limit > 0 else None
 
     if args.follow:
-        if pinned is None and not active_symbol():
+        if pinned is None and not pool_symbols():
             print(
-                f"{DIM}No active symbol yet — will wait for pick…{RESET}",
+                f"{DIM}No active pool yet — will wait for pick…{RESET}",
                 file=sys.stderr,
             )
         return follow_trades(
@@ -373,16 +413,23 @@ def main() -> int:
             interval=args.interval,
         )
 
-    sym = pinned or (active_symbol() or "").upper()
-    if not sym:
-        print(f"{RED}No active symbol — pass one: ./obscalp-trades PYTHUSDT{RESET}", file=sys.stderr)
+    if pinned:
+        return print_trades(
+            pinned,
+            limit=limit,
+            show_opens=args.opens,
+            show_symbol_col=False,
+        )
+
+    syms = pool_symbols()
+    if not syms:
+        print(f"{RED}No active pool — pass a symbol: ./obscalp-trades PYTHUSDT{RESET}", file=sys.stderr)
         return 1
-    # Explicit SYMBOL → no Symbol column; one-shot of active → show column
     return print_trades(
-        sym,
+        syms,
         limit=limit,
         show_opens=args.opens,
-        show_symbol_col=pinned is None,
+        show_symbol_col=True,
     )
 
 
