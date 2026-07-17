@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -30,7 +31,7 @@ from typing import Any
 
 from futures_scan import BOLD, CYAN, DIM, GREEN, RESET, YELLOW, FAPI_BASE, TickerRow, trading_usdt_perps, fetch_tickers
 from ob_scalp_activity import activity_summary, idle_minutes
-from ob_scalp_stack import active_symbol, load_active, running_symbols, switch_stack
+from ob_scalp_stack import active_symbol, load_active, running_symbols, switch_stack, sync_stacks
 from orderbook_dca_grid import load_env_file
 
 from trade_pick import (
@@ -122,6 +123,46 @@ def resolve_pick(
     return fallback_pick_scalp(candidates)
 
 
+def resolve_pool(
+    candidates: list[Candidate],
+    pick: dict[str, Any],
+    *,
+    count: int,
+    keep_rank: int,
+    current: str | None,
+    idle_switch: bool,
+    manual: str | None,
+) -> list[str]:
+    """Build the multi-symbol pool. Primary is pick['symbol']; fill with next best."""
+    if manual:
+        return [manual.upper()]
+
+    n = max(1, int(count))
+    ranked = [c.ticker.symbol.upper() for c in candidates]
+    if not ranked:
+        return [str(pick.get("symbol", "")).upper()] if pick.get("symbol") else []
+
+    primary = str(pick.get("symbol", ranked[0])).upper()
+
+    if idle_switch and current:
+        # Prefer not keeping the idle symbol as primary; pool from ranked excluding it first
+        others = [s for s in ranked if s != current.upper()]
+        if others:
+            primary = others[0]
+            rest = [s for s in others[1:] + ([current.upper()] if current.upper() in ranked else [])]
+            return [primary] + [s for s in rest if s != primary][: n - 1]
+
+    if keep_rank > 0 and current and not idle_switch:
+        cur = current.upper()
+        if cur in ranked[:keep_rank]:
+            primary = cur
+
+    if primary not in ranked:
+        ranked = [primary] + ranked
+    rest = [s for s in ranked if s != primary]
+    return [primary] + rest[: n - 1]
+
+
 def run_scan(args: argparse.Namespace, *, idle_switch: bool = False) -> tuple[list[Candidate], dict[str, Any]]:
     base = args.base.rstrip("/")
     universe = collect_fscan_universe(
@@ -176,6 +217,19 @@ def run_once(args: argparse.Namespace, *, idle_switch: bool = False, trigger: st
     if trigger and not pick.get("reason", "").startswith("Idle"):
         pick = {**pick, "reason": f"{trigger} · {pick.get('reason', '')}"}
 
+    pool = resolve_pool(
+        candidates,
+        pick,
+        count=getattr(args, "count", 1),
+        keep_rank=args.keep_rank,
+        current=active_symbol(),
+        idle_switch=idle_switch,
+        manual=args.symbol.upper() if args.symbol else None,
+    )
+    # Primary follows pool[0]
+    if pool:
+        pick = {**pick, "symbol": pool[0], "pool": pool}
+
     if not args.json:
         print(f"{BOLD}fscan scalp pool · {len(candidates)} analyzed{RESET}")
         if trigger:
@@ -184,6 +238,7 @@ def run_once(args: argparse.Namespace, *, idle_switch: bool = False, trigger: st
             print(f"{DIM}Running stacks: {', '.join(running_symbols())}{RESET}")
         if active_symbol():
             print(f"{DIM}Active symbol: {active_symbol()}{RESET}")
+        print(f"{DIM}Target pool ({len(pool)}): {', '.join(pool) or '—'}{RESET}")
         print_ranking_scalp(candidates, limit=args.show)
 
     sym = pick["symbol"].upper()
@@ -191,9 +246,26 @@ def run_once(args: argparse.Namespace, *, idle_switch: bool = False, trigger: st
     pids: dict[str, Any] = {}
 
     if args.execute:
-        if sym != active_symbol() or sym not in running_symbols():
-            pids = switch_stack(
-                sym,
+        from ob_scalp_stack import autotune_alive, is_draining
+
+        active_data = load_active()
+        current_pool = [str(s).upper() for s in (active_data.get("pool") or [])]
+        if not current_pool and active_symbol():
+            current_pool = [active_symbol()]  # type: ignore[list-item]
+
+        need_sync = not (
+            pool == current_pool
+            and sym == active_symbol()
+            and all(autotune_alive(s) for s in pool)
+            and not any(
+                s for s in running_symbols()
+                if s not in pool and not is_draining(s)
+            )
+        )
+
+        if need_sync:
+            pids = sync_stacks(
+                pool,
                 execute=True,
                 meta={
                     "pick_reason": pick.get("reason", ""),
@@ -205,23 +277,31 @@ def run_once(args: argparse.Namespace, *, idle_switch: bool = False, trigger: st
                 },
             )
             executed = True
-            print(f"\n{GREEN}Stack started on {sym}{RESET}  autotune={pids.get('autotune_pid')} watch={pids.get('watch_pid')}")
-            drained = str(pids.get("drained") or "")
-            stopped = str(pids.get("stopped") or "")
-            if drained:
-                print(f"{YELLOW}Draining (exits only): {drained}{RESET}")
-            if stopped:
-                print(f"{DIM}Stopped: {stopped}{RESET}")
+            print(
+                f"\n{GREEN}Pool synced{RESET}  primary={CYAN}{sym}{RESET}  "
+                f"[{', '.join(pool)}]"
+            )
+            if pids.get("started"):
+                print(f"{GREEN}Started: {', '.join(pids['started'])}{RESET}")
+            if pids.get("kept"):
+                print(f"{DIM}Kept: {', '.join(pids['kept'])}{RESET}")
+            if pids.get("drained"):
+                print(f"{YELLOW}Draining (exits only): {', '.join(pids['drained'])}{RESET}")
+            if pids.get("stopped"):
+                print(f"{DIM}Stopped: {', '.join(pids['stopped'])}{RESET}")
         else:
-            print(f"\n{DIM}Already running on {sym} — no switch{RESET}")
+            print(f"\n{DIM}Pool already synced [{', '.join(pool)}] — no change{RESET}")
 
     record = {
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "symbol": sym,
+        "pool": pool,
         "executed": executed,
         "pick": pick,
         "top": [scalp_candidate_payload(c) for c in candidates[:5]],
-        "pids": pids,
+        "pids": {
+            k: pids.get(k) for k in ("started", "kept", "drained", "stopped", "pool") if pids
+        },
         "trigger": trigger or ("idle" if idle_switch else "manual" if args.symbol else "scheduled"),
     }
     append_pick_record(record)
@@ -230,6 +310,8 @@ def run_once(args: argparse.Namespace, *, idle_switch: bool = False, trigger: st
         print(json.dumps(record, indent=2))
     elif not args.quiet:
         print_pick(pick, executed=executed)
+        if len(pool) > 1:
+            print(f"  {BOLD}Pool{RESET}       {', '.join(pool)}")
 
     return 0
 
@@ -327,7 +409,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--analyze", type=int, default=12, help="Deep OB score on top N from pool")
     p.add_argument("--show", type=int, default=8, help="Rows to print in ranking")
     p.add_argument("--keep-rank", type=int, default=3,
-                   help="If active symbol still in top N, keep it (default: 3, 0=always switch)")
+                   help="If active symbol still in top N, keep it as primary (default: 3, 0=always reshuffle)")
+    p.add_argument("--count", type=int,
+                   default=int(os.getenv("OB_PICK_COUNT", "3") or 3),
+                   help="How many symbols to run in parallel (default: 3, env OB_PICK_COUNT)")
     p.add_argument("-y", "--execute", action="store_true",
                    help="Start full stack on pick (autotune + watch + bot)")
     p.add_argument("--daemon", action="store_true",

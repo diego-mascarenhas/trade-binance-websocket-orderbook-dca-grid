@@ -99,6 +99,17 @@ def bot_alive(symbol: str) -> bool:
     return bool(pid and _pid_alive(pid, "orderbook_ob_scalp.py"))
 
 
+def autotune_alive(symbol: str) -> bool:
+    path = autotune_pid_path(symbol.upper())
+    if not path.exists():
+        return False
+    try:
+        pid = int(path.read_text().strip())
+    except ValueError:
+        return False
+    return _pid_alive(pid, "ob_scalp_autotune.py")
+
+
 def symbol_has_open_position(symbol: str, *, recv: int = 15000) -> bool:
     """True if Binance futures has a non-zero position on symbol."""
     from orderbook_dca_grid import load_env_file, load_keys, _signed_request
@@ -255,44 +266,106 @@ def switch_stack(
     meta: dict[str, Any] | None = None,
 ) -> dict[str, int | str]:
     """Start the chosen symbol. Other stacks: drain if open position, else stop."""
-    sym = symbol.upper()
-    prev = active_symbol()
-    to_retire: set[str] = set()
-    if stop_others:
-        to_retire.update(s for s in running_symbols() if s != sym)
-        if prev and prev != sym:
-            to_retire.add(prev)
+    return sync_stacks(
+        [symbol],
+        execute=execute,
+        retire_others=stop_others,
+        meta=meta,
+    )
+
+
+def _retire_symbol(other: str, *, reason: str) -> str:
+    """Drain or stop one symbol. Returns 'drained' | 'stopped'."""
+    if is_draining(other) and bot_alive(other):
+        return "drained"
+    has_pos = False
+    try:
+        has_pos = symbol_has_open_position(other)
+    except Exception as exc:
+        print(f"warn: position check {other} failed: {exc}", file=sys.stderr)
+    if has_pos and bot_alive(other):
+        begin_drain(other, reason=reason)
+        return "drained"
+    stop_stack(other)
+    if has_pos and not bot_alive(other):
+        print(
+            f"warn: {other} had an open position but no live bot — "
+            f"stopped stack; manage/close manually on Binance",
+            file=sys.stderr,
+        )
+    return "stopped"
+
+
+def sync_stacks(
+    symbols: list[str],
+    *,
+    execute: bool = True,
+    retire_others: bool = True,
+    meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Keep exactly these scalp stacks running (primary = first).
+
+    - Missing → start_stack
+    - Outside list → drain (open pos) or stop
+    - Primary saved as active for follow / trades -f
+    """
+    wanted = [s.upper() for s in symbols if s]
+    if not wanted:
+        raise ValueError("sync_stacks requires at least one symbol")
+    primary = wanted[0]
+    wanted_set = set(wanted)
 
     drained: list[str] = []
     stopped: list[str] = []
-    if to_retire:
-        play_sound("cycle_end")
-        for other in sorted(to_retire):
-            if is_draining(other) and bot_alive(other):
-                drained.append(other)
-                continue
-            has_pos = False
-            try:
-                has_pos = symbol_has_open_position(other)
-            except Exception as exc:
-                print(f"warn: position check {other} failed: {exc}", file=sys.stderr)
-            if has_pos and bot_alive(other):
-                begin_drain(other, reason=f"switch → {sym}")
-                drained.append(other)
-            else:
-                stop_stack(other)
-                stopped.append(other)
-                if has_pos and not bot_alive(other):
-                    print(
-                        f"warn: {other} had an open position but no live bot — "
-                        f"stopped stack; manage/close manually on Binance",
-                        file=sys.stderr,
-                    )
+    started: list[str] = []
+    kept: list[str] = []
+
+    if retire_others:
+        to_retire = {s for s in running_symbols() if s not in wanted_set}
+        # Also retire previous active if it somehow isn't running-listed
+        prev = load_active().get("symbol", "")
+        if prev and prev.upper() not in wanted_set:
+            to_retire.add(prev.upper())
+        if to_retire:
+            play_sound("cycle_end")
+            reason = f"sync → {','.join(wanted)}"
+            for other in sorted(to_retire):
+                result = _retire_symbol(other, reason=reason)
+                if result == "drained":
+                    drained.append(other)
+                else:
+                    stopped.append(other)
 
     play_sound("pick")
-    clear_drain(sym)  # new active must be allowed to enter
-    pids = start_stack(sym, execute=execute)
-    save_active(sym, meta)
-    pids["drained"] = ",".join(drained)
-    pids["stopped"] = ",".join(stopped)
-    return pids
+    for sym in wanted:
+        if is_draining(sym):
+            clear_drain(sym)
+        if autotune_alive(sym):
+            kept.append(sym)
+            continue
+        pids = start_stack(sym, execute=execute)
+        started.append(sym)
+        # brief stagger so Binance / disk aren't slammed
+        time.sleep(0.4)
+        _ = pids
+
+    save_active(
+        primary,
+        {
+            **(meta or {}),
+            "pool": wanted,
+            "pool_count": len(wanted),
+        },
+    )
+    return {
+        "symbol": primary,
+        "pool": wanted,
+        "started": started,
+        "kept": kept,
+        "drained": drained,
+        "stopped": stopped,
+        "drained_csv": ",".join(drained),
+        "stopped_csv": ",".join(stopped),
+        "started_csv": ",".join(started),
+        "kept_csv": ",".join(kept),
+    }
