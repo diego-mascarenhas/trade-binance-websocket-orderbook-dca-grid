@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from ob_bars import OBBar
-from ob_candles import candle_side
+from ob_candles import ALL_CANDLE_NAMES, candle_side
 from ob_ema import EmaSnapshot
 from ob_oscillators import OscillatorSnapshot
 from ob_pattern import PatternSnapshot
