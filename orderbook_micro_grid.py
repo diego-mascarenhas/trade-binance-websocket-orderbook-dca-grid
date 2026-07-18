@@ -752,6 +752,8 @@ def build_grid_plan(
     is_long: bool,
     args: argparse.Namespace,
     filt: dict[str, Decimal],
+    *,
+    ignore_arm_window: bool = False,
 ) -> GridPlan | None:
     """Build Fib (default) or step grid.
 
@@ -790,29 +792,30 @@ def build_grid_plan(
             )
 
         # Arm only while mark is between Fib 0.000 and Fib arm_max (default 0.236)
-        arm_max = float(getattr(args, "arm_max_fib", FIB_ARM_MAX))
-        if is_long and entry > swing.high:
-            print(f"{YELLOW}Mark above swing high — no chase — skip{RESET}")
-            return None
-        if (not is_long) and entry < swing.low:
-            print(f"{YELLOW}Mark below swing low — no chase — skip{RESET}")
-            return None
-        if mark_through_origin(swing, entry, is_long=is_long):
-            print(
-                f"{YELLOW}Mark through origin "
-                f"({price_fmt(swing.low if is_long else swing.high)}) — skip{RESET}"
-            )
-            return None
-        depth = pullback_depth(swing, entry, is_long=is_long)
-        if depth < 0:
-            print(f"{YELLOW}Mark beyond swing extreme — skip{RESET}")
-            return None
-        if depth > arm_max:
-            print(
-                f"{YELLOW}Mark past arm window "
-                f"(depth {depth:.2f} > Fib {arm_max:g}; need between 0–{arm_max:g}) — skip{RESET}"
-            )
-            return None
+        if not ignore_arm_window:
+            arm_max = float(getattr(args, "arm_max_fib", FIB_ARM_MAX))
+            if is_long and entry > swing.high:
+                print(f"{YELLOW}Mark above swing high — no chase — skip{RESET}")
+                return None
+            if (not is_long) and entry < swing.low:
+                print(f"{YELLOW}Mark below swing low — no chase — skip{RESET}")
+                return None
+            if mark_through_origin(swing, entry, is_long=is_long):
+                print(
+                    f"{YELLOW}Mark through origin "
+                    f"({price_fmt(swing.low if is_long else swing.high)}) — skip{RESET}"
+                )
+                return None
+            depth = pullback_depth(swing, entry, is_long=is_long)
+            if depth < 0:
+                print(f"{YELLOW}Mark beyond swing extreme — skip{RESET}")
+                return None
+            if depth > arm_max:
+                print(
+                    f"{YELLOW}Mark past arm window "
+                    f"(depth {depth:.2f} > Fib {arm_max:g}; need between 0–{arm_max:g}) — skip{RESET}"
+                )
+                return None
 
         fvg: FvgZone | None = None
         require_fvg = bool(getattr(args, "require_fvg", False))
@@ -858,19 +861,20 @@ def build_grid_plan(
             sl_buf_pct=args.fib_sl_buf,
             fvg=fvg,
         )
-        if not plan.levels:
+        if not plan.levels and not ignore_arm_window:
             print(
                 f"{YELLOW}No Fib levels below/above mark toward origin — skip{RESET}"
             )
             return None
         # Full grid: need enough LIMITs still under/above mark (arm window ⇒ most fit)
-        want = max(1, int(args.levels))
-        if len(plan.levels) < want:
-            print(
-                f"{YELLOW}Incomplete grid ({len(plan.levels)}/{want} LIMITs) "
-                f"— mark not high enough in window — skip{RESET}"
-            )
-            return None
+        if not ignore_arm_window:
+            want = max(1, int(args.levels))
+            if len(plan.levels) < want:
+                print(
+                    f"{YELLOW}Incomplete grid ({len(plan.levels)}/{want} LIMITs) "
+                    f"— mark not high enough in window — skip{RESET}"
+                )
+                return None
         return plan
 
     return build_step_grid(
@@ -1057,7 +1061,7 @@ def render_ladder_lines(
         )
     lines.append(
         f"{CYAN}{'▶ MARK':<12} {'live':>8} {price_fmt(mark):>14} "
-        f"{'0.00':>+7}% {'':>10}{RESET}"
+        f"{'0.00%':>8} {'':>10}{RESET}"
     )
     return lines
 
@@ -1323,6 +1327,132 @@ def cancel_our_exits(symbol: str, api: str, sec: str, recv: int) -> int:
         except Exception:
             pass
     return killed
+
+
+def read_our_exit_triggers(
+    symbol: str,
+    api: str,
+    sec: str,
+    recv: int,
+) -> tuple[float, float]:
+    """Return (tp, sl) trigger prices from our open algo orders (0 if missing)."""
+    sym = symbol.upper()
+    tp = 0.0
+    sl = 0.0
+    for o in list_open_algos(symbol, api, sec, recv):
+        cid = _algo_cid_of(o)
+        if not (cid.startswith(ALGO_PREFIX) and cid.endswith(sym)):
+            continue
+        trig = float(o.get("triggerPrice") or 0)
+        if trig <= 0:
+            continue
+        otype = str(o.get("orderType") or o.get("type") or "").upper()
+        if "TAKE_PROFIT" in otype or "TP" in cid:
+            tp = trig
+        elif "STOP" in otype or "SL" in cid:
+            sl = trig
+    return tp, sl
+
+
+def adopt_existing_position(
+    symbol: str,
+    is_long: bool,
+    mark: float,
+    filt: dict[str, Decimal],
+    hedge: bool,
+    api: str,
+    sec: str,
+    recv: int,
+    args: argparse.Namespace,
+) -> CycleState | None:
+    """Rebuild cycle state + live table from an already-open same-side position."""
+    qty, entry = get_position(symbol, is_long, hedge, api, sec, recv)
+    if qty <= 0 or entry <= 0:
+        return None
+
+    plan = build_grid_plan(
+        symbol, mark, is_long, args, filt, ignore_arm_window=True,
+    )
+    if plan is None:
+        plan = build_step_grid(
+            entry,
+            is_long,
+            levels=max(1, int(args.levels)),
+            step_pct=args.step_pct,
+            base_usdt=args.base_size,
+            level_usdt=args.level_size,
+            tp_pct=args.tp_pct,
+            sl_pct=args.sl_pct,
+            filt=filt,
+        )
+    plan.note = ((plan.note + " · ") if plan.note else "") + "adopted"
+
+    tp, sl = read_our_exit_triggers(symbol, api, sec, recv)
+    exits_armed = tp > 0 and sl > 0
+    if not exits_armed:
+        tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT))
+        tp = resolve_tp_price(
+            is_long, entry, plan, tp_mode=tp_mode,
+            tp_pct=float(getattr(args, "tp_pct", 0.35)), first_fill=True,
+        )
+        sl = float(plan.sl_price)
+        try:
+            tp, sl = place_exchange_exits(
+                symbol, is_long, qty, entry, mark or entry,
+                tp, sl, filt, hedge, api, sec, recv,
+            )
+            exits_armed = True
+            append_journal(
+                symbol,
+                f"ADOPT_EXITS tp={tp:.8g} sl={sl:.8g} qty={qty:g}",
+            )
+        except Exception as exc:
+            print(f"{YELLOW}Adopt: could not arm exits ({exc}){RESET}")
+            tp = tp or float(plan.tp_price)
+            sl = sl or float(plan.sl_price)
+
+    side = "LONG" if is_long else "SHORT"
+    print(
+        f"{CYAN}Adopted existing {side} on {symbol.upper()} · "
+        f"qty={qty:g} @ {price_fmt(entry)} · rebuilding table{RESET}"
+    )
+    append_journal(
+        symbol,
+        f"ADOPT {side} qty={qty:g} entry={entry:.8g} tp={tp:.8g} sl={sl:.8g}",
+    )
+
+    state = CycleState(
+        active=True,
+        pending=False,
+        exits_armed=exits_armed,
+        is_long=is_long,
+        entry=entry,
+        plan=plan,
+        tp=tp,
+        sl=sl,
+        last_qty=qty,
+        opened_at=time.time(),
+        armed_at=time.time(),
+        swing_high_anchor=(
+            plan.swing.high if plan.swing and is_long else (
+                plan.swing.low if plan.swing else 0.0
+            )
+        ),
+    )
+    open_idxs, filled_idxs = sync_grid_level_status(symbol, state, api, sec, recv)
+    meta = get_position_meta(symbol, is_long, hedge, api, sec, recv)
+    upnl = float(meta.get("unrealized_pnl") or 0)
+    print_live_table(
+        state,
+        render_live_table(
+            symbol, state, mark,
+            qty=qty, entry=entry, upnl=upnl,
+            open_level_idxs=open_idxs,
+            filled_level_idxs=filled_idxs,
+        ),
+        force=True,
+    )
+    return state
 
 
 def place_exchange_exits(
@@ -1985,6 +2115,28 @@ def run(args: argparse.Namespace) -> int:
         f"execute={int(args.execute)} lev={lev} base={args.base_size:g}",
     )
 
+    # If a same-side position is already open, adopt it and show the live table
+    if args.execute:
+        depth0 = fetch_depth(sym, args.depth_limit)
+        mark0 = mid_from_depth(depth0)
+        adopt_sides: list[bool] = []
+        if args.direction == "long":
+            adopt_sides = [True]
+        elif args.direction == "short":
+            adopt_sides = [False]
+        else:
+            adopt_sides = [True, False]
+        for is_long0 in adopt_sides:
+            q0, _ = get_position(sym, is_long0, hedge, api, sec, args.recv_window)
+            if q0 > 0 and mark0 > 0:
+                adopted = adopt_existing_position(
+                    sym, is_long0, mark0, filt, hedge,
+                    api, sec, args.recv_window, args,
+                )
+                if adopted is not None:
+                    state = adopted
+                    break
+
     builder.start_bar(time.time())
     try:
         while True:
@@ -2055,10 +2207,13 @@ def run(args: argparse.Namespace) -> int:
                             sym, is_long, hedge, api, sec, args.recv_window,
                         )
                         if q_same > 0:
-                            print(
-                                f"{YELLOW}Skip — existing "
-                                f"{'LONG' if is_long else 'SHORT'} on {sym}{RESET}"
-                            )
+                            if not state.active:
+                                adopted = adopt_existing_position(
+                                    sym, is_long, mark, filt, hedge,
+                                    api, sec, args.recv_window, args,
+                                )
+                                if adopted is not None:
+                                    state = adopted
                             builder.reset_after_bar(time.time())
                             time.sleep(args.sample_sec)
                             continue

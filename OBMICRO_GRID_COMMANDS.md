@@ -156,14 +156,17 @@ OB_MG_SWEEP=0
 ./obmicro-grid LDOUSDT --entry-usdt 50 --no-max-leverage
 ```
 
-**`Skip — existing LONG/SHORT on SYMBOL`**  
-Same-side position is already open → bot will not arm another grid on that side.
+**`Skip — existing LONG/SHORT` / adopt**  
+If the same side is already open, the bot **adopts** it and rebuilds the live Fib table (no spam). It reuses open TP/SL algos when present, or arms them if missing.
 
 ```bash
-# Wait for TP/SL to flatten, or force-close:
+# Restart while LONG is open → adopts + table
+./obmicro-grid LDOUSDT
+
+# Force-close instead:
 ./obmicro-grid LDOUSDT --flatten
 
-# Hedge only: open the opposite side while LONG stays open
+# Hedge: open the opposite side while LONG stays open
 ./obmicro-grid LDOUSDT --direction short --position-mode hedge
 ```
 
@@ -176,7 +179,7 @@ Same-side position is already open → bot will not arm another grid on that sid
 3. Default: LIMIT pullback (no MARKET); exchange TP/SL after first fill.
 4. `--no-wait-pullback`: MARKET base + grid + TP/SL immediately.
 5. Hedge: allows inverse side if the same side is flat.
-6. `Skip — existing LONG/SHORT`: same side already open — use `--flatten` or wait for exit.
+6. Same-side position already open → **adopt** + rebuild live table (not spam skip).
 7. Ctrl+C does not flatten; `--flatten` does.
 8. `--entry-usdt N`: notional size; leverage set to symbol max unless `--no-max-leverage` / `--set-leverage`.
 
