@@ -5,10 +5,11 @@ Default grid mode is **Fibonacci** (5m swing impulse → retrace levels).
 Geometric ``--grid-mode step`` remains available as fallback.
 
 Fib entry (default):
-  1. Detect swing + FVG on 5m
-  2. Place LIMIT grid on Fib retraces (no MARKET chase)
-  3. On first fill → arm TP at swing high/low + SL beyond origin
-  4. If no fill before timeout / SL blown → disarm and wait for next setup
+  1. Detect swing on fib TF (default 1m)
+  2. Arm only while mark is between Fib 0.000 (extreme) and Fib 0.236
+  3. Place FULL LIMIT grid on retraces toward ORIGIN (no chase / no ext past 1.0)
+  4. On first fill → arm TP at swing extreme + SL beyond origin
+  5. If no fill before timeout / through origin → disarm and wait
 
 Optional ``--sweep``: when a grid level fills, re-place it one step further
 (barrido). Launch wiring comes later — run this file directly for now.
@@ -20,6 +21,7 @@ Usage:
 
 Env (optional):
   OB_MG_GRID_MODE=fib  OB_MG_FIB_INTERVAL=1m  OB_MG_FIB_MIN_RANGE=0.40
+  OB_MG_ARM_MAX_FIB=0.236
   OB_MG_FVG_MIN_PCT=0.08  OB_MG_REQUIRE_FVG=0
   OB_MG_WAIT_PULLBACK=1  OB_MG_ARM_TIMEOUT_SEC=900
   OB_MG_RAISE_TOP=1  OB_MG_RAISE_MIN_PCT=0.05
@@ -197,10 +199,11 @@ class GridPlan:
     fvg: FvgZone | None = None
 
 
-# Default Fib retracement set (closest → deepest). Grid fills from this list
-# until --levels valid rungs sit on the adverse side of mark; then extensions.
-FIB_RETRACES = (0.236, 0.382, 0.5, 0.618, 0.786)
-FIB_EXTEND = (0.886, 1.0, 1.272, 1.618)  # when mark already through classic zone
+# Fib ladder toward impulse origin (1.0). No extensions past origin.
+FIB_RETRACES = (0.236, 0.382, 0.5, 0.618, 0.786, 0.886, 1.0)
+FIB_ORIGIN = 1.0
+# Arm window: mark between Fib 0.000 (extreme) and this depth (default 0.236).
+FIB_ARM_MAX = 0.236
 FIB_TP_EXT = 1.272  # extension beyond impulse end (legacy / swing-mode helper)
 FIB_SL_BUF = 0.15   # % beyond swing origin
 FVG_MIN_PCT = 0.08  # min FVG height % (1m majors rarely clear 0.25%)
@@ -214,6 +217,15 @@ def _fib_px(swing: SwingImpulse, ratio: float, *, is_long: bool) -> float:
     return swing.low + swing.span * ratio
 
 
+def pullback_depth(swing: SwingImpulse, mark: float, *, is_long: bool) -> float:
+    """0 = at impulse extreme (TP side), 1 = at origin. >1 = through origin."""
+    if swing.span <= 0 or mark <= 0:
+        return 0.0
+    if is_long:
+        return (swing.high - mark) / swing.span
+    return (mark - swing.low) / swing.span
+
+
 def fib_levels_with_room(
     swing: SwingImpulse,
     mark: float,
@@ -221,19 +233,28 @@ def fib_levels_with_room(
     is_long: bool,
     need: int = 1,
 ) -> int:
-    """How many Fib/ext levels sit on the pullback side of ``mark``."""
+    """How many Fib levels (through origin) sit on the pullback side of ``mark``."""
     if mark <= 0 or swing.span <= 0:
         return 0
     n = 0
-    for r in (*FIB_RETRACES, *FIB_EXTEND):
+    for r in FIB_RETRACES:
         px = _fib_px(swing, r, is_long=is_long)
-        if is_long and px < mark * 0.9995:
+        if is_long and px < mark:
             n += 1
-        elif (not is_long) and px > mark * 1.0005:
+        elif (not is_long) and px > mark:
             n += 1
         if n >= need:
             return n
     return n
+
+
+def mark_through_origin(swing: SwingImpulse, mark: float, *, is_long: bool) -> bool:
+    """True when price already broke past the impulse origin."""
+    if mark <= 0:
+        return True
+    if is_long:
+        return mark < swing.low
+    return mark > swing.high
 
 
 def resolve_tp_price(
@@ -336,13 +357,19 @@ def detect_swing_impulse(
                     best_bull_any = (score, cand)
                 room_ok = True
                 if mark is not None and mark > 0:
-                    room = fib_levels_with_room(
-                        cand, mark, is_long=True, need=min_fib_room
-                    )
-                    room_ok = room >= min_fib_room
-                    # Prefer price still near the impulse high (not fully dumped)
-                    if mark <= hi:
-                        score *= 1.0 + max(0.0, (mark - lo) / (hi - lo)) * 0.25
+                    if mark_through_origin(cand, mark, is_long=True):
+                        room_ok = False
+                    else:
+                        room = fib_levels_with_room(
+                            cand, mark, is_long=True, need=min_fib_room
+                        )
+                        room_ok = room >= min_fib_room
+                        depth = pullback_depth(cand, mark, is_long=True)
+                        # Prefer mark still in arm window (≤ Fib 0.236 from extreme)
+                        if 0.0 <= depth <= FIB_ARM_MAX:
+                            score *= 1.0 + (1.0 - depth / max(FIB_ARM_MAX, 1e-9)) * 0.4
+                        elif depth > FIB_ARM_MAX:
+                            score *= 0.45  # already deeper than arm window
                 if room_ok and (best_bull is None or score > best_bull[0]):
                     best_bull = (score, cand)
             if hi_i < lo_i:
@@ -354,12 +381,18 @@ def detect_swing_impulse(
                     best_bear_any = (score, cand)
                 room_ok = True
                 if mark is not None and mark > 0:
-                    room = fib_levels_with_room(
-                        cand, mark, is_long=False, need=min_fib_room
-                    )
-                    room_ok = room >= min_fib_room
-                    if mark >= lo:
-                        score *= 1.0 + max(0.0, (hi - mark) / (hi - lo)) * 0.25
+                    if mark_through_origin(cand, mark, is_long=False):
+                        room_ok = False
+                    else:
+                        room = fib_levels_with_room(
+                            cand, mark, is_long=False, need=min_fib_room
+                        )
+                        room_ok = room >= min_fib_room
+                        depth = pullback_depth(cand, mark, is_long=False)
+                        if 0.0 <= depth <= FIB_ARM_MAX:
+                            score *= 1.0 + (1.0 - depth / max(FIB_ARM_MAX, 1e-9)) * 0.4
+                        elif depth > FIB_ARM_MAX:
+                            score *= 0.45
                 if room_ok and (best_bear is None or score > best_bear[0]):
                     best_bear = (score, cand)
 
@@ -462,37 +495,37 @@ def build_fib_grid(
     sl_buf_pct: float = FIB_SL_BUF,
     fvg: FvgZone | None = None,
 ) -> GridPlan:
-    """Retrace grid on swing; only levels on the adverse side of ``entry``.
+    """Retrace grid on swing down to origin (1.0); no levels past origin.
 
-    Walks classic retraces then extensions until ``levels`` valid rungs exist
-    (so a mark already through 0.786 can still arm on 1.0 / 1.272 / …).
+    Only rungs on the adverse side of ``entry``. Deepest rung is Fib 1.0
+    (impulse origin) when still below/above mark.
     """
     if entry <= 0 or swing.span <= 0:
         raise ValueError("invalid entry/swing for fib grid")
     n_take = max(1, int(levels))
-    ratios = (*FIB_RETRACES, *FIB_EXTEND)
 
     rows: list[GridLevel] = []
-    for r in ratios:
+    for r in FIB_RETRACES:
         if len(rows) >= n_take:
             break
         px = _fib_px(swing, r, is_long=is_long)
         if is_long:
-            # Must be below mark (pullback buys) — wait for retrace, no chase
-            if px >= entry * 0.9995:
+            # Buy LIMITs must sit strictly below mark (incl. ORIGIN)
+            if px >= entry:
                 continue
         else:
-            if px <= entry * 1.0005:
+            if px <= entry:
                 continue
-        # Shallowest fill gets base size; deeper rungs use level_usdt
         size = base_usdt if not rows else level_usdt
         _, qty = qty_for_notional(size, px, filt)
+        if qty <= 0:
+            continue
         dist = (px / entry - 1.0) * 100
-        tag = "ext" if r > FIB_RETRACES[-1] + 1e-9 else "Fib"
+        name = "ORIGIN" if abs(r - FIB_ORIGIN) < 1e-9 else f"Fib {r:.3f}"
         rows.append(
             GridLevel(
                 idx=len(rows) + 1,
-                name=f"{tag} {r:.3f}",
+                name=name,
                 price=px,
                 size_usdt=float(qty) * px,
                 qty=qty,
@@ -500,7 +533,6 @@ def build_fib_grid(
                 fib_ratio=r,
             )
         )
-    # Re-index after skips
     for i, lv in enumerate(rows, start=1):
         lv.idx = i
 
@@ -532,7 +564,7 @@ def build_fib_grid(
     base_qty = rows[0].qty
     base_usdt_eff = rows[0].size_usdt
 
-    # TP at swing extreme (punto máximo / mínimo). SL beyond origin.
+    # TP at swing extreme. SL beyond origin (never inside the impulse start).
     if is_long:
         tp = swing.high
         sl_swing = swing.low * (1 - sl_buf_pct / 100)
@@ -552,10 +584,8 @@ def build_fib_grid(
         f"fib {swing.interval} swing "
         f"{price_fmt(swing.low)}→{price_fmt(swing.high)} "
         f"({swing.range_pct:.2f}%) · TP ref @ swing {'high' if is_long else 'low'} "
-        f"· wait pullback"
+        f"· arm window Fib 0–{FIB_ARM_MAX:g}"
     )
-    if any((lv.fib_ratio or 0) > FIB_RETRACES[-1] + 1e-9 for lv in rows):
-        note += " · ext beyond origin"
     if fvg is not None:
         note += (
             f" · FVG {price_fmt(fvg.low)}–{price_fmt(fvg.high)} "
@@ -694,6 +724,31 @@ def build_grid_plan(
                 f"still anchoring Fib to that swing{RESET}"
             )
 
+        # Arm only while mark is between Fib 0.000 and Fib arm_max (default 0.236)
+        arm_max = float(getattr(args, "arm_max_fib", FIB_ARM_MAX))
+        if is_long and entry > swing.high:
+            print(f"{YELLOW}Mark above swing high — no chase — skip{RESET}")
+            return None
+        if (not is_long) and entry < swing.low:
+            print(f"{YELLOW}Mark below swing low — no chase — skip{RESET}")
+            return None
+        if mark_through_origin(swing, entry, is_long=is_long):
+            print(
+                f"{YELLOW}Mark through origin "
+                f"({price_fmt(swing.low if is_long else swing.high)}) — skip{RESET}"
+            )
+            return None
+        depth = pullback_depth(swing, entry, is_long=is_long)
+        if depth < 0:
+            print(f"{YELLOW}Mark beyond swing extreme — skip{RESET}")
+            return None
+        if depth > arm_max:
+            print(
+                f"{YELLOW}Mark past arm window "
+                f"(depth {depth:.2f} > Fib {arm_max:g}; need between 0–{arm_max:g}) — skip{RESET}"
+            )
+            return None
+
         fvg: FvgZone | None = None
         require_fvg = bool(getattr(args, "require_fvg", False))
         min_fvg = float(getattr(args, "fvg_min_pct", FVG_MIN_PCT))
@@ -740,8 +795,15 @@ def build_grid_plan(
         )
         if not plan.levels:
             print(
-                f"{YELLOW}Fib/ext levels all on wrong side of mark "
-                f"(price already through swing) — skip{RESET}"
+                f"{YELLOW}No Fib levels below/above mark toward origin — skip{RESET}"
+            )
+            return None
+        # Full grid: need enough LIMITs still under/above mark (arm window ⇒ most fit)
+        want = max(1, int(args.levels))
+        if len(plan.levels) < want:
+            print(
+                f"{YELLOW}Incomplete grid ({len(plan.levels)}/{want} LIMITs) "
+                f"— mark not high enough in window — skip{RESET}"
             )
             return None
         return plan
@@ -772,97 +834,118 @@ def render_plan(symbol: str, plan: GridPlan) -> str:
     ]
     if plan.note:
         lines.append(f"{DIM}{plan.note}{RESET}")
-    # Preview live TP if avg-mode (from planned avg)
-    # actual mode comes from CLI at runtime — show both hints
     lines.append(
         f"{DIM}TP: 1st fill @ swing max · later fills avg+tp% (or --tp-mode swing = always max){RESET}"
     )
+    lines.extend(
+        render_ladder_lines(
+            plan,
+            mark=plan.entry,
+            tp_price=plan.tp_price,
+            sl_price=plan.sl_price,
+        )
+    )
+    if plan.mode == "fib" and plan.swing is not None:
+        lines.append(f"{DIM}(LIMIT only on GRID rows · TP/SL armed after first fill){RESET}")
+    return "\n".join(lines)
+
+
+def render_ladder_lines(
+    plan: GridPlan,
+    *,
+    mark: float,
+    tp_price: float | None = None,
+    sl_price: float | None = None,
+    entry: float | None = None,
+    qty: float | None = None,
+    upnl: float | None = None,
+    status: str = "",
+) -> list[str]:
+    """Fib/step ladder with MARK (and optional ENTRY) inserted in price order."""
+    tp_px = float(tp_price if tp_price is not None else plan.tp_price)
+    sl_px = float(sl_price if sl_price is not None else plan.sl_price)
 
     if plan.mode == "fib" and plan.swing is not None:
         swing = plan.swing
-        mark = plan.entry
         limit_by_r = {
             round(lv.fib_ratio, 3): lv
             for lv in plan.levels
             if lv.fib_ratio is not None
         }
-        # Full ladder: 0 (TP/impulse high) → retraces → 1 (origin) → SL
-        ladder_ratios = (0.0, *FIB_RETRACES, 1.0)
-        lines += [
+        ladder_ratios = (0.0, *FIB_RETRACES)
+        lines = [
             "",
             f"{'LEVEL':<14} {'ROLE':<10} {'PRICE':>14} {'Δ mark':>9} {'LIMIT':>18}",
             f"{DIM}{'-' * 70}{RESET}",
         ]
-        rows_out: list[tuple[float, str, str, float, str]] = []
+        # (price, label, role, lim_text, kind) kind: level|mark|entry
+        rows_out: list[tuple[float, str, str, str, str]] = []
         for r in ladder_ratios:
             if plan.is_long:
                 px = swing.high - swing.span * r
             else:
                 px = swing.low + swing.span * r
             if r <= 0.0:
-                role = "TP"
-                label = "Fib 0.000"
+                role, label = "TP", "Fib 0.000"
             elif r >= 1.0:
-                role = "ORIGIN"
-                label = "Fib 1.000"
+                role, label = "ORIGIN", "Fib 1.000"
             else:
-                role = "GRID"
-                label = f"Fib {r:.3f}"
+                role, label = "GRID", f"Fib {r:.3f}"
             lv = limit_by_r.get(round(r, 3))
             if lv is not None:
                 lim = f"{lv.qty:g} / {lv.size_usdt:.2f}U"
                 role = "LIMIT"
-            elif role == "GRID":
-                lim = "—"
+            elif r <= 0.0:
+                lim = "algo"
+                px = tp_px  # live TP trigger (may equal swing high)
             else:
                 lim = "—"
-            rows_out.append((px, label, role, r, lim))
+            rows_out.append((px, label, role, lim, "level"))
 
-        # SL row (beyond origin)
-        rows_out.append((plan.sl_price, "SL", "SL", -1.0, "algo"))
+        rows_out.append((sl_px, "SL", "SL", "algo", "level"))
 
-        # Sort: long = high→low; short = low→high (toward adverse)
+        if entry is not None and entry > 0:
+            ent_lim = f"qty={qty:g}" if qty and qty > 0 else ""
+            rows_out.append((entry, "▶ ENTRY", "avg", ent_lim, "entry"))
+
+        mark_lim = ""
+        if upnl is not None:
+            mark_lim = f"uPnL={upnl:+.4f}"
+        elif status:
+            mark_lim = status
+        rows_out.append((mark, "▶ MARK", "live", mark_lim, "mark"))
+
         rows_out.sort(key=lambda x: x[0], reverse=plan.is_long)
 
-        mark_drawn = False
-        for px, label, role, r, lim in rows_out:
+        for px, label, role, lim, kind in rows_out:
             dist = (px / mark - 1.0) * 100 if mark > 0 else 0.0
-            # Insert mark marker once when we cross it
-            if not mark_drawn:
-                if plan.is_long and px <= mark:
-                    lines.append(
-                        f"{CYAN}{'▶ MARK':<14} {'live':<10} {price_fmt(mark):>14} "
-                        f"{'0.00%':>9} {'':>18}{RESET}"
-                    )
-                    mark_drawn = True
-                elif not plan.is_long and px >= mark:
-                    lines.append(
-                        f"{CYAN}{'▶ MARK':<14} {'live':<10} {price_fmt(mark):>14} "
-                        f"{'0.00%':>9} {'':>18}{RESET}"
-                    )
-                    mark_drawn = True
-            role_c = GREEN if role == "TP" else RED if role == "SL" else (
-                YELLOW if role == "LIMIT" else DIM
-            )
-            lines.append(
-                f"{label:<14} {role_c}{role:<10}{RESET} {price_fmt(px):>14} "
-                f"{dist:>+8.2f}% {lim:>18}"
-            )
-        if not mark_drawn:
-            lines.append(
-                f"{CYAN}{'▶ MARK':<14} {'live':<10} {price_fmt(mark):>14} "
-                f"{'0.00%':>9} {'':>18}{RESET}"
-            )
+            if kind == "mark":
+                lines.append(
+                    f"{CYAN}{label:<14} {role:<10} {price_fmt(px):>14} "
+                    f"{'0.00%':>9} {lim:>18}{RESET}"
+                )
+            elif kind == "entry":
+                lines.append(
+                    f"{YELLOW}{label:<14} {role:<10} {price_fmt(px):>14} "
+                    f"{dist:>+8.2f}% {lim:>18}{RESET}"
+                )
+            else:
+                role_c = GREEN if role == "TP" else RED if role == "SL" else (
+                    YELLOW if role == "LIMIT" else DIM
+                )
+                lines.append(
+                    f"{label:<14} {role_c}{role:<10}{RESET} {price_fmt(px):>14} "
+                    f"{dist:>+8.2f}% {lim:>18}"
+                )
         if plan.fvg is not None:
             lines.append(
                 f"{DIM}FVG zone {price_fmt(plan.fvg.low)}–{price_fmt(plan.fvg.high)} "
                 f"({plan.fvg.size_pct:.2f}%){RESET}"
             )
-        lines.append(f"{DIM}(LIMIT only on GRID rows · TP/SL armed after first fill){RESET}")
-        return "\n".join(lines)
+        return lines
 
-    # step mode — simple list
-    lines += [
+    # step mode
+    lines = [
         "",
         f"{'ORDER':<12} {'QTY':>12} {'PRICE':>14} {'Δ%':>8} {'USDT':>10}",
         f"{DIM}{'-' * 60}{RESET}",
@@ -872,8 +955,99 @@ def render_plan(symbol: str, plan: GridPlan) -> str:
             f"{lv.name:<12} {lv.qty:>12g} {price_fmt(lv.price):>14} "
             f"{lv.dist_pct:>+7.2f}% {lv.size_usdt:>10.2f}"
         )
-    lines.append(f"{DIM}(no MARKET — wait for pullback fills; disarm if timeout){RESET}")
-    return "\n".join(lines)
+    lines.append(
+        f"{CYAN}{'▶ MARK':<12} {'':>12} {price_fmt(mark):>14} "
+        f"{'0.00':>+7}% {'':>10}{RESET}"
+    )
+    return lines
+
+
+def render_live_table(
+    symbol: str,
+    state: "CycleState",
+    mark: float,
+    *,
+    qty: float = 0.0,
+    entry: float = 0.0,
+    upnl: float | None = None,
+    open_limits: int | None = None,
+    age_sec: float | None = None,
+) -> list[str]:
+    """Live ladder (same columns) with MARK/ENTRY in price order."""
+    plan = state.plan
+    if plan is None:
+        return []
+    side = "LONG" if state.is_long else "SHORT"
+    color = GREEN if state.is_long else RED
+    if state.pending:
+        head = (
+            f"{DIM}PENDING {color}{side}{RESET}{DIM} · {symbol.upper()} · "
+            f"mid {price_fmt(mark)} · limits={open_limits if open_limits is not None else '?'} · "
+            f"age={age_sec:.0f}s{RESET}" if age_sec is not None else
+            f"{DIM}PENDING {color}{side}{RESET}{DIM} · {symbol.upper()} · mid {price_fmt(mark)}{RESET}"
+        )
+        status = f"lim={open_limits}" if open_limits is not None else "wait"
+        body = render_ladder_lines(
+            plan, mark=mark, tp_price=state.tp, sl_price=state.sl, status=status,
+        )
+    else:
+        head = (
+            f"{color}{side}{RESET} {symbol.upper()} · qty={qty:g} · "
+            f"entry {price_fmt(entry)} · mid {price_fmt(mark)}"
+            + (f" · uPnL={upnl:+.4f}" if upnl is not None else "")
+        )
+        body = render_ladder_lines(
+            plan,
+            mark=mark,
+            tp_price=state.tp or plan.tp_price,
+            sl_price=state.sl or plan.sl_price,
+            entry=entry if entry > 0 else None,
+            qty=qty if qty > 0 else None,
+            upnl=upnl,
+        )
+    return [head, *body]
+
+
+def print_live_table(state: "CycleState", lines: list[str], *, force: bool = False) -> None:
+    """Refresh live ladder in-place (overwrite previous block)."""
+    if not lines:
+        return
+    out = sys.stdout
+    now = time.time()
+    if not out.isatty():
+        # Log files / pipes: avoid spam — refresh at most every 10s
+        last = float(getattr(state, "ui_last_print", 0.0) or 0.0)
+        if not force and now - last < 10.0:
+            return
+        state.ui_last_print = now
+        print()
+        for line in lines:
+            print(line)
+        state.ui_lines = 0
+        return
+
+    prev = int(getattr(state, "ui_lines", 0) or 0)
+    if prev > 0:
+        out.write(f"\033[{prev}A")
+        for _ in range(prev):
+            out.write("\033[2K\n")
+        out.write(f"\033[{prev}A")
+    for line in lines:
+        print(line)
+    state.ui_lines = len(lines)
+    state.ui_last_print = now
+    out.flush()
+
+
+def clear_live_table(state: "CycleState") -> None:
+    prev = int(getattr(state, "ui_lines", 0) or 0)
+    if prev > 0 and sys.stdout.isatty():
+        sys.stdout.write(f"\033[{prev}A")
+        for _ in range(prev):
+            sys.stdout.write("\033[2K\n")
+        sys.stdout.write(f"\033[{prev}A")
+        sys.stdout.flush()
+    state.ui_lines = 0
 
 
 # ── exchange I/O ─────────────────────────────────────────────────────────────
@@ -1110,6 +1284,8 @@ class CycleState:
     armed_at: float = 0.0
     last_swing_check_at: float = 0.0
     swing_high_anchor: float = 0.0  # last raised top (long) / bottom (short)
+    ui_lines: int = 0  # live table rows currently on screen (for in-place refresh)
+    ui_last_print: float = 0.0
 
 
 def arm_cycle(
@@ -1222,6 +1398,7 @@ def disarm_pending(
     reason: str,
 ) -> None:
     """Cancel unfilled grid (and exits if any) and clear pending state."""
+    clear_live_table(state)
     n_g = cancel_our_grid(symbol, api, sec, recv)
     n_e = cancel_our_exits(symbol, api, sec, recv)
     print(f"{YELLOW}Disarm ({reason}) · cancelled grid={n_g} exits={n_e}{RESET}")
@@ -1401,6 +1578,12 @@ def tick_pending(
             disarm_pending(symbol, state, api, sec, recv, reason="sl_before_fill")
             return
 
+    # Invalidation: mark broke through impulse origin while still pending
+    if qty <= 0 and state.plan is not None and state.plan.swing is not None:
+        if mark_through_origin(state.plan.swing, mark, is_long=state.is_long):
+            disarm_pending(symbol, state, api, sec, recv, reason="through_origin")
+            return
+
     # Timeout with no fill
     if qty <= 0 and age >= timeout:
         disarm_pending(symbol, state, api, sec, recv, reason=f"timeout_{timeout:g}s")
@@ -1412,16 +1595,19 @@ def tick_pending(
             1 for o in list_open_orders(symbol, api, sec, recv)
             if _order_cid(o).startswith(GRID_PREFIX)
         )
-        print(
-            f"{DIM}{time.strftime('%H:%M:%S')}  PENDING "
-            f"{'LONG' if state.is_long else 'SHORT'} mid={price_fmt(mark)} "
-            f"limits={open_n} age={age:.0f}s/{timeout:g}s "
-            f"TP@{price_fmt(state.tp)} SL@{price_fmt(state.sl)}{RESET}"
+        print_live_table(
+            state,
+            render_live_table(
+                symbol, state, mark,
+                open_limits=open_n,
+                age_sec=age,
+            ),
         )
         return
 
     # First fill — promote to active and arm TP (avg by default)
     if not state.exits_armed:
+        clear_live_table(state)
         tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT))
         tp_target = resolve_tp_price(
             state.is_long, entry, state.plan,
@@ -1457,6 +1643,7 @@ def tick_pending(
 
 
 def close_cycle_cleanup(symbol: str, state: CycleState, api: str, sec: str, recv: int) -> None:
+    clear_live_table(state)
     n_g = cancel_our_grid(symbol, api, sec, recv)
     n_e = cancel_our_exits(symbol, api, sec, recv)
     if n_g or n_e:
@@ -1494,6 +1681,7 @@ def refresh_exits_if_grown(
 
     grown = qty > state.last_qty * 1.02
     if grown:
+        clear_live_table(state)
         print(f"{CYAN}Position grew {state.last_qty:g} → {qty:g} — refreshing TP/SL{RESET}")
         tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT))
         tp = resolve_tp_price(
@@ -1623,6 +1811,7 @@ def run(args: argparse.Namespace) -> int:
     print(
         f"{BOLD}{CYAN}Micro-grid{RESET} {sym}  {mode}\n"
         f"{DIM}grid={args.grid_mode} · fib {args.fib_interval} minΔ{args.fib_min_range:g}% · "
+        f"arm Fib0–{args.arm_max_fib:g} · "
         f"FVG≥{args.fvg_min_pct:g}%{' req' if args.require_fvg else ''} · "
         f"wait_pullback={'ON' if args.wait_pullback else 'OFF'} "
         f"raise_top={'ON' if args.raise_top else 'OFF'} "
@@ -1664,6 +1853,7 @@ def run(args: argparse.Namespace) -> int:
             if args.execute and state.active:
                 qty, entry = get_position(sym, state.is_long, hedge, api, sec, args.recv_window)
                 if qty <= 0:
+                    clear_live_table(state)
                     print(f"{GREEN}Position flat — cycle done{RESET}")
                     close_cycle_cleanup(sym, state, api, sec, args.recv_window)
                     cooldown_until = time.time() + args.cooldown_sec
@@ -1673,11 +1863,12 @@ def run(args: argparse.Namespace) -> int:
                     )
                     meta = get_position_meta(sym, state.is_long, hedge, api, sec, args.recv_window)
                     upnl = float(meta.get("unrealized_pnl") or 0)
-                    print(
-                        f"{DIM}{time.strftime('%H:%M:%S')}  "
-                        f"{'LONG' if state.is_long else 'SHORT'} qty={qty:g} "
-                        f"entry={price_fmt(entry)} mid={price_fmt(mark)} "
-                        f"uPnL={upnl:+.4f}  TP={price_fmt(state.tp)} SL={price_fmt(state.sl)}{RESET}"
+                    print_live_table(
+                        state,
+                        render_live_table(
+                            sym, state, mark,
+                            qty=qty, entry=entry, upnl=upnl,
+                        ),
                     )
 
             # New cycle on bar close when flat and not pending
@@ -1776,6 +1967,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--fib-tp-ext", type=float, default=_env_float("OB_MG_FIB_TP_EXT", FIB_TP_EXT))
     p.add_argument("--fib-sl-buf", type=float, default=_env_float("OB_MG_FIB_SL_BUF", FIB_SL_BUF),
                    help="%% buffer beyond swing origin for SL")
+    p.add_argument("--arm-max-fib", type=float, default=_env_float("OB_MG_ARM_MAX_FIB", FIB_ARM_MAX),
+                   help="Arm only while pullback depth ≤ this Fib (0=extreme … 0.236 default)")
+    # Back-compat alias
+    p.add_argument("--arm-min-fib", type=float, default=None, help=argparse.SUPPRESS)
     p.add_argument("--fvg-min-pct", type=float, default=_env_float("OB_MG_FVG_MIN_PCT", FVG_MIN_PCT),
                    help="Min FVG height %% of mid (default 0.08; suited to 1m)")
     p.add_argument("--require-fvg", action=argparse.BooleanOptionalAction,
