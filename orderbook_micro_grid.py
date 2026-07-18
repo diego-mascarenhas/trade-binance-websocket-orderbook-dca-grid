@@ -10,6 +10,8 @@ Fib entry (default):
   3. Place FULL LIMIT grid on retraces toward ORIGIN (no chase / no ext past 1.0)
   4. On first fill → arm TP at swing extreme + SL beyond origin
   5. If no fill before timeout / through origin → disarm and wait
+  6. When all ``--levels`` are filled and position is in profit → replace SL
+     with TRAILING_STOP_MARKET (default on) so a pullback does not exit at a loss
 
 Optional ``--sweep``: when a grid level fills, re-place it one step further
 (barrido). Launch wiring comes later — run this file directly for now.
@@ -26,6 +28,7 @@ Env (optional):
   OB_MG_WAIT_PULLBACK=1  OB_MG_ARM_TIMEOUT_SEC=900
   OB_MG_RAISE_TOP=1  OB_MG_RAISE_MIN_PCT=0.05
   OB_MG_TP_MODE=avg  OB_MG_TP_PCT=0.35
+  OB_MG_PROTECT_TRAIL=1  OB_MG_PROTECT_TRAIL_CALLBACK=0.2
   OB_MG_BASE_SIZE=10  OB_MG_LEVEL_SIZE=8  OB_MG_BAR_SEC=15
 """
 
@@ -932,6 +935,8 @@ def render_ladder_lines(
     status: str = "",
     open_level_idxs: set[int] | None = None,
     filled_level_idxs: set[int] | None = None,
+    trail_armed: bool = False,
+    trail_callback: float = 0.2,
 ) -> list[str]:
     """Fib/step ladder with MARK (and optional ENTRY) inserted in price order."""
     tp_px = float(tp_price if tp_price is not None else plan.tp_price)
@@ -988,7 +993,14 @@ def render_ladder_lines(
                 lim = "—"
             rows_out.append((px, label, role, lim, "level"))
 
-        rows_out.append((sl_px, "SL", "SL", "algo", "level"))
+        if trail_armed:
+            # Show trail at entry (BE floor); Binance trails from mark extreme.
+            trail_px = float(entry) if entry and entry > 0 else sl_px
+            rows_out.append(
+                (trail_px, "TRAIL", "TRAIL", f"cb={trail_callback:g}%", "level")
+            )
+        else:
+            rows_out.append((sl_px, "SL", "SL", "algo", "level"))
 
         if entry is not None and entry > 0:
             if qty and qty > 0:
@@ -1027,6 +1039,8 @@ def render_ladder_lines(
                     role_c = GREEN
                 elif role == "SL":
                     role_c = RED
+                elif role == "TRAIL":
+                    role_c = CYAN
                 elif role == "LIMIT":
                     role_c = YELLOW
                 else:
@@ -1129,6 +1143,7 @@ def render_live_table(
         body = render_ladder_lines(
             plan, mark=mark, tp_price=state.tp, sl_price=state.sl, status=status,
             open_level_idxs=open_level_idxs, filled_level_idxs=filled_level_idxs,
+            trail_armed=state.trail_armed,
         )
     else:
         notional = (qty * entry) if qty > 0 and entry > 0 else 0.0
@@ -1137,6 +1152,7 @@ def render_live_table(
             f"entry {price_fmt(entry)} · mid {price_fmt(mark)}"
             + (f" · uPnL={upnl:+.4f}" if upnl is not None else "")
             + (f" · filled={n_fill} open={n_open if n_open is not None else 0}" if plan.levels else "")
+            + (f" · {CYAN}TRAIL{RESET}" if state.trail_armed else "")
         )
         body = render_ladder_lines(
             plan,
@@ -1148,6 +1164,8 @@ def render_live_table(
             upnl=upnl,
             open_level_idxs=open_level_idxs,
             filled_level_idxs=filled_level_idxs,
+            trail_armed=state.trail_armed,
+            trail_callback=float(state.trail_callback or 0.2),
         )
     return [head, *body]
 
@@ -1329,6 +1347,206 @@ def cancel_our_exits(symbol: str, api: str, sec: str, recv: int) -> int:
     return killed
 
 
+def _algo_order_type(o: dict) -> str:
+    return str(o.get("orderType") or o.get("type") or "").upper()
+
+
+def cancel_our_sl(symbol: str, api: str, sec: str, recv: int) -> int:
+    """Cancel fixed STOP_MARKET SL algos (keep TP / trailing)."""
+    sym = symbol.upper()
+    killed = 0
+    for o in list_open_algos(symbol, api, sec, recv):
+        cid = _algo_cid_of(o)
+        if not (cid.startswith(ALGO_PREFIX) and cid.endswith(sym)):
+            continue
+        otype = _algo_order_type(o)
+        if "TRAILING" in otype:
+            continue
+        if "TAKE_PROFIT" in otype or "TP" in cid:
+            continue
+        if "STOP" not in otype and "SL" not in cid:
+            continue
+        try:
+            _signed_request(
+                "DELETE", "/fapi/v1/algoOrder",
+                {"symbol": sym, "algoId": o.get("algoId")},
+                api, sec, recv,
+            )
+            killed += 1
+        except Exception:
+            pass
+    return killed
+
+
+def cancel_our_trailing(symbol: str, api: str, sec: str, recv: int) -> int:
+    sym = symbol.upper()
+    killed = 0
+    for o in list_open_algos(symbol, api, sec, recv):
+        cid = _algo_cid_of(o)
+        if not (cid.startswith(ALGO_PREFIX) and cid.endswith(sym)):
+            continue
+        if "TRAILING" not in _algo_order_type(o) and "TR" not in cid:
+            continue
+        try:
+            _signed_request(
+                "DELETE", "/fapi/v1/algoOrder",
+                {"symbol": sym, "algoId": o.get("algoId")},
+                api, sec, recv,
+            )
+            killed += 1
+        except Exception:
+            pass
+    return killed
+
+
+def find_our_trailing(symbol: str, api: str, sec: str, recv: int) -> dict | None:
+    sym = symbol.upper()
+    for o in list_open_algos(symbol, api, sec, recv):
+        cid = _algo_cid_of(o)
+        if not (cid.startswith(ALGO_PREFIX) and cid.endswith(sym)):
+            continue
+        if "TRAILING" in _algo_order_type(o) or cid.startswith(f"{ALGO_PREFIX}TR"):
+            return o
+    return None
+
+
+def grid_levels_complete(
+    state: "CycleState",
+    open_idxs: set[int],
+    filled_idxs: set[int],
+) -> bool:
+    """True when every placed ``--levels`` rung is filled and none remain open."""
+    if state.plan is None or not state.plan.levels:
+        return False
+    needed = {lv.idx for lv in state.plan.levels}
+    return bool(needed) and not open_idxs and needed <= filled_idxs
+
+
+def mark_profit_pct(is_long: bool, entry: float, mark: float) -> float:
+    """Gross mark vs entry %% (positive = in profit)."""
+    if entry <= 0 or mark <= 0:
+        return 0.0
+    raw = (mark / entry - 1.0) * 100.0
+    return raw if is_long else -raw
+
+
+def place_protect_trailing(
+    symbol: str,
+    is_long: bool,
+    qty: float,
+    filt: dict[str, Decimal],
+    hedge: bool,
+    api: str,
+    sec: str,
+    recv: int,
+    callback: float,
+) -> dict:
+    """Replace fixed SL with reduce-only TRAILING_STOP_MARKET (activates immediately)."""
+    step = filt["step_size"]
+    qty_dp = _dec_places(step)
+    qty_d = _round_to(qty, step, ROUND_DOWN)
+    if qty_d <= 0:
+        raise ValueError("qty too small for trailing")
+    qty_str = f"{qty_d:.{qty_dp}f}"
+    cb = max(0.1, min(10.0, float(callback)))
+    close_side = "SELL" if is_long else "BUY"
+
+    cancel_our_sl(symbol, api, sec, recv)
+    cancel_our_trailing(symbol, api, sec, recv)
+
+    params: dict[str, Any] = {
+        "algoType": "CONDITIONAL",
+        "symbol": symbol.upper(),
+        "side": close_side,
+        "type": "TRAILING_STOP_MARKET",
+        "quantity": qty_str,
+        "callbackRate": cb,
+        "workingType": "CONTRACT_PRICE",
+        "clientAlgoId": algo_cid("TR", symbol),
+    }
+    if hedge:
+        params["positionSide"] = "LONG" if is_long else "SHORT"
+    else:
+        params["reduceOnly"] = "true"
+    return _signed_request("POST", "/fapi/v1/algoOrder", params, api, sec, recv)
+
+
+def maybe_arm_full_fill_trail(
+    symbol: str,
+    state: "CycleState",
+    mark: float,
+    qty: float,
+    entry: float,
+    upnl: float,
+    open_idxs: set[int],
+    filled_idxs: set[int],
+    filt: dict[str, Decimal],
+    hedge: bool,
+    api: str,
+    sec: str,
+    recv: int,
+    args: argparse.Namespace,
+) -> bool:
+    """After all grid levels fill, arm trailing once mark profit covers the callback.
+
+    Returns True if trailing was newly armed (or refreshed).
+    """
+    if not bool(getattr(args, "protect_trail", True)):
+        return False
+    if not state.active or state.pending or state.trail_armed:
+        return False
+    if qty <= 0 or entry <= 0:
+        return False
+    if not grid_levels_complete(state, open_idxs, filled_idxs):
+        return False
+
+    callback = float(getattr(args, "protect_trail_callback", 0.2) or 0.2)
+    # Need enough green that a callback% pullback from mark stays ~flat (no loss).
+    min_pct = max(
+        float(getattr(args, "protect_arm_pnl_pct", 0.0) or 0.0),
+        callback,
+    )
+    profit = mark_profit_pct(state.is_long, entry, mark)
+    if upnl < 0 or profit < min_pct:
+        return False
+
+    # Already have our trailing on the book (e.g. restart) — adopt it.
+    existing = find_our_trailing(symbol, api, sec, recv)
+    if existing is not None:
+        state.trail_armed = True
+        state.trail_callback = callback
+        try:
+            state.trail_callback = float(existing.get("callbackRate") or callback)
+        except (TypeError, ValueError):
+            pass
+        state.sl = entry
+        return False
+
+    clear_live_table(state)
+    try:
+        resp = place_protect_trailing(
+            symbol, state.is_long, qty, filt, hedge, api, sec, recv, callback,
+        )
+    except Exception as exc:
+        print(f"{RED}Protect trail failed: {exc}{RESET}")
+        append_journal(symbol, f"ERROR protect_trail {exc}")
+        return False
+
+    state.trail_armed = True
+    state.trail_callback = callback
+    state.sl = entry  # display: trail protects toward avg
+    print(
+        f"{GREEN}✓ Full grid filled · profit {profit:+.2f}% — "
+        f"SL → TRAILING cb={callback:g}% (algoId={resp.get('algoId')}){RESET}"
+    )
+    append_journal(
+        symbol,
+        f"PROTECT_TRAIL cb={callback:g} profit={profit:.3f}% qty={qty:g} "
+        f"entry={entry:.8g} mark={mark:.8g} upnl={upnl:.4f}",
+    )
+    return True
+
+
 def read_our_exit_triggers(
     symbol: str,
     api: str,
@@ -1347,6 +1565,8 @@ def read_our_exit_triggers(
         if trig <= 0:
             continue
         otype = str(o.get("orderType") or o.get("type") or "").upper()
+        if "TRAILING" in otype:
+            continue
         if "TAKE_PROFIT" in otype or "TP" in cid:
             tp = trig
         elif "STOP" in otype or "SL" in cid:
@@ -1388,7 +1608,16 @@ def adopt_existing_position(
     plan.note = ((plan.note + " · ") if plan.note else "") + "adopted"
 
     tp, sl = read_our_exit_triggers(symbol, api, sec, recv)
-    exits_armed = tp > 0 and sl > 0
+    trail = find_our_trailing(symbol, api, sec, recv)
+    trail_armed = trail is not None
+    trail_cb = float(getattr(args, "protect_trail_callback", 0.2) or 0.2)
+    if trail is not None:
+        try:
+            trail_cb = float(trail.get("callbackRate") or trail_cb)
+        except (TypeError, ValueError):
+            pass
+        cancel_our_sl(symbol, api, sec, recv)  # trail replaces fixed SL
+    exits_armed = (tp > 0 and sl > 0) or trail_armed
     if not exits_armed:
         tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT))
         tp = resolve_tp_price(
@@ -1418,18 +1647,21 @@ def adopt_existing_position(
     )
     append_journal(
         symbol,
-        f"ADOPT {side} qty={qty:g} entry={entry:.8g} tp={tp:.8g} sl={sl:.8g}",
+        f"ADOPT {side} qty={qty:g} entry={entry:.8g} tp={tp:.8g} sl={sl:.8g}"
+        f"{' trail' if trail_armed else ''}",
     )
 
     state = CycleState(
         active=True,
         pending=False,
         exits_armed=exits_armed,
+        trail_armed=trail_armed,
+        trail_callback=trail_cb,
         is_long=is_long,
         entry=entry,
         plan=plan,
         tp=tp,
-        sl=sl,
+        sl=entry if trail_armed else sl,
         last_qty=qty,
         opened_at=time.time(),
         armed_at=time.time(),
@@ -1540,6 +1772,8 @@ class CycleState:
     active: bool = False       # position open
     pending: bool = False      # grid LIMITs armed, waiting for pullback fill
     exits_armed: bool = False
+    trail_armed: bool = False  # full-grid protect trailing replaced fixed SL
+    trail_callback: float = 0.2
     is_long: bool = True
     entry: float = 0.0
     plan: GridPlan | None = None
@@ -1929,6 +2163,7 @@ def close_cycle_cleanup(symbol: str, state: CycleState, api: str, sec: str, recv
     state.active = False
     state.pending = False
     state.exits_armed = False
+    state.trail_armed = False
     state.plan = None
     state.last_qty = 0.0
     state.filled_levels.clear()
@@ -1949,7 +2184,7 @@ def refresh_exits_if_grown(
     mark: float,
     args: argparse.Namespace,
 ) -> None:
-    """When DCA fills grow qty, re-arm TP/SL for full position (and optional sweep)."""
+    """When DCA fills grow qty, re-arm TP/SL (or trailing) for full position."""
     if not state.active or state.plan is None:
         return
     qty, entry = get_position(symbol, state.is_long, hedge, api, sec, recv)
@@ -1959,30 +2194,52 @@ def refresh_exits_if_grown(
     grown = qty > state.last_qty * 1.02
     if grown:
         clear_live_table(state)
-        print(f"{CYAN}Position grew {state.last_qty:g} → {qty:g} — refreshing TP/SL{RESET}")
-        tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT))
-        tp = resolve_tp_price(
-            state.is_long, entry, state.plan,
-            tp_mode=tp_mode, tp_pct=float(getattr(args, "tp_pct", 0.35)),
-            first_fill=False,
-        )
-        sl = state.plan.sl_price if state.plan else state.sl
-        print(
-            f"{DIM}TP → {price_fmt(tp)} (compensation · {tp_mode} from avg {price_fmt(entry)}){RESET}"
-        )
-        try:
-            tp, sl = place_exchange_exits(
-                symbol, state.is_long, qty, entry, mark or entry,
-                tp, sl, filt, hedge, api, sec, recv,
+        print(f"{CYAN}Position grew {state.last_qty:g} → {qty:g} — refreshing exits{RESET}")
+        if state.trail_armed:
+            callback = float(
+                getattr(args, "protect_trail_callback", state.trail_callback) or 0.2
             )
-            state.tp, state.sl = tp, sl
-            state.entry = entry
-            append_journal(
-                symbol,
-                f"EXITS refresh tp={tp:.8g} sl={sl:.8g} qty={qty:g} tp_mode={tp_mode}",
+            try:
+                resp = place_protect_trailing(
+                    symbol, state.is_long, qty, filt, hedge, api, sec, recv, callback,
+                )
+                state.trail_callback = callback
+                state.entry = entry
+                state.sl = entry
+                print(
+                    f"{GREEN}✓ Trail refreshed qty={qty:g} cb={callback:g}% "
+                    f"(algoId={resp.get('algoId')}){RESET}"
+                )
+                append_journal(
+                    symbol,
+                    f"PROTECT_TRAIL refresh cb={callback:g} qty={qty:g}",
+                )
+            except Exception as exc:
+                print(f"{RED}Trail refresh failed: {exc}{RESET}")
+        else:
+            tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT))
+            tp = resolve_tp_price(
+                state.is_long, entry, state.plan,
+                tp_mode=tp_mode, tp_pct=float(getattr(args, "tp_pct", 0.35)),
+                first_fill=False,
             )
-        except Exception as exc:
-            print(f"{RED}Exit refresh failed: {exc}{RESET}")
+            sl = state.plan.sl_price if state.plan else state.sl
+            print(
+                f"{DIM}TP → {price_fmt(tp)} (compensation · {tp_mode} from avg {price_fmt(entry)}){RESET}"
+            )
+            try:
+                tp, sl = place_exchange_exits(
+                    symbol, state.is_long, qty, entry, mark or entry,
+                    tp, sl, filt, hedge, api, sec, recv,
+                )
+                state.tp, state.sl = tp, sl
+                state.entry = entry
+                append_journal(
+                    symbol,
+                    f"EXITS refresh tp={tp:.8g} sl={sl:.8g} qty={qty:g} tp_mode={tp_mode}",
+                )
+            except Exception as exc:
+                print(f"{RED}Exit refresh failed: {exc}{RESET}")
         state.last_qty = qty
 
         if args.sweep:
@@ -2105,6 +2362,8 @@ def run(args: argparse.Namespace) -> int:
         f"base {args.base_size:g} · level {args.level_size:g} USDT"
         f"{margin_hint} · "
         f"TP={args.tp_mode}+{args.tp_pct:g}% · SL {args.sl_pct:g}% · "
+        f"protect_trail={'ON' if args.protect_trail else 'OFF'}"
+        f"(cb={args.protect_trail_callback:g}%) · "
         f"sweep={'ON' if args.sweep else 'OFF'} · "
         f"dir={args.direction}{RESET}\n"
         f"{DIM}log {journal_path(sym)}{RESET}"
@@ -2174,6 +2433,11 @@ def run(args: argparse.Namespace) -> int:
                     upnl = float(meta.get("unrealized_pnl") or 0)
                     open_idxs, filled_idxs = sync_grid_level_status(
                         sym, state, api, sec, args.recv_window,
+                    )
+                    maybe_arm_full_fill_trail(
+                        sym, state, mark, qty, entry, upnl,
+                        open_idxs, filled_idxs, filt, hedge,
+                        api, sec, args.recv_window, args,
                     )
                     print_live_table(
                         state,
@@ -2356,6 +2620,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--tp-pct", type=float, default=_env_float("OB_MG_TP_PCT", 0.35),
                    help="With --tp-mode avg: %% above/below live average (default 0.35)")
     p.add_argument("--sl-pct", type=float, default=_env_float("OB_MG_SL_PCT", 0.50))
+    p.add_argument(
+        "--protect-trail",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("OB_MG_PROTECT_TRAIL", True),
+        help="After all --levels fill, replace SL with trailing once in profit (default on)",
+    )
+    p.add_argument(
+        "--protect-trail-callback",
+        type=float,
+        default=_env_float("OB_MG_PROTECT_TRAIL_CALLBACK", 0.2),
+        help="Trailing callbackRate %% (default 0.2; also min profit before arm)",
+    )
+    p.add_argument(
+        "--protect-arm-pnl-pct",
+        type=float,
+        default=_env_float("OB_MG_PROTECT_ARM_PNL_PCT", 0.0),
+        help="Extra min mark profit %% before arming trail (default 0; effective min=callback)",
+    )
     p.add_argument("--bar-sec", type=float, default=_env_float("OB_MG_BAR_SEC", 15.0))
     p.add_argument("--sample-sec", type=float, default=_env_float("OB_MG_SAMPLE_SEC", 1.0))
     p.add_argument("--band-pct", type=float, default=1.0)

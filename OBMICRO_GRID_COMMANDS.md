@@ -74,6 +74,9 @@ Stop: `Ctrl+C` (does **not** flatten; use `--flatten` to close)
 | `--tp-mode` | `avg` | `avg` (1st fill @ swing max, then avg±tp%) \| `swing` |
 | `--tp-pct` | `0.35` | TP % from avg (avg mode) |
 | `--sl-pct` | `0.50` | SL % from entry/mark |
+| `--protect-trail` / `--no-protect-trail` | on | After all `--levels` fill + in profit → SL becomes trailing |
+| `--protect-trail-callback` | `0.2` | Trailing `callbackRate` % (also min profit before arm) |
+| `--protect-arm-pnl-pct` | `0` | Extra min mark profit % (effective min = max of this and callback) |
 | `--sweep` / `--no-sweep` | off | Re-place filled rung further (barrido) |
 
 ### 15s signal (only with `--direction auto`)
@@ -107,6 +110,8 @@ OB_MG_RAISE_MIN_PCT=0.05
 OB_MG_TP_MODE=avg
 OB_MG_TP_PCT=0.35
 OB_MG_SL_PCT=0.50
+OB_MG_PROTECT_TRAIL=1
+OB_MG_PROTECT_TRAIL_CALLBACK=0.2
 OB_MG_BASE_SIZE=10
 OB_MG_LEVEL_SIZE=8
 OB_MG_ENTRY_USDT=0
@@ -178,10 +183,11 @@ If the same side is already open, the bot **adopts** it and rebuilds the live Fi
 2. Fib: arm only if mark is between Fib **0.000** and **`--arm-max-fib`** (default 0.236).
 3. Default: LIMIT pullback (no MARKET); exchange TP/SL after first fill.
 4. `--no-wait-pullback`: MARKET base + grid + TP/SL immediately.
-5. Hedge: allows inverse side if the same side is flat.
-6. Same-side position already open → **adopt** + rebuild live table (not spam skip).
-7. Ctrl+C does not flatten; `--flatten` does.
-8. `--entry-usdt N`: notional size; leverage set to symbol max unless `--no-max-leverage` / `--set-leverage`.
+5. When all `--levels` are filled and mark profit ≥ callback % → replace SL with **trailing** (default on; TP kept).
+6. Hedge: allows inverse side if the same side is flat.
+7. Same-side position already open → **adopt** + rebuild live table (not spam skip).
+8. Ctrl+C does not flatten; `--flatten` does.
+9. `--entry-usdt N`: notional size; leverage set to symbol max unless `--no-max-leverage` / `--set-leverage`.
 
 ---
 
