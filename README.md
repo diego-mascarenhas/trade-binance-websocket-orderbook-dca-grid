@@ -10,8 +10,22 @@ Both scripts read the live order book, place DCA orders on real walls, size entr
 |-----|--------|-------|------|
 | `orderbook_dca_grid.py` | Futures | LONG/SHORT grid on walls | **Staged** (default): TP1 + SL@entry + trail |
 | `orderbook_dca_grid_spot.py` | Spot | BUY grid on bid walls | OCO (TP + SL) |
+| `orderbook_micro_grid.py` | Futures | Fib pullback micro-grid (`fib`) | TP/SL + protect trailing |
 
 `orderbook_staged_exit.py` is legacy/experimental — use **`orderbook_dca_grid.py --supervise`** with staged exit (built-in) instead of two processes.
+
+### Fib micro-grid (`fib`)
+
+Short pullback grid on Fibonacci retraces (default 1m, arm Fib 0–0.236, LIMIT-only, protect trail after full fill, **1h cooldown** after flat).
+
+```bash
+fib LTCUSDT                 # PATH wrapper (or ./fib)
+fib SKLUSDT short --entry-usdt 50
+python3 botctl.py fib LTCUSDT
+# Telegram: /fib LTCUSDT · /stop LTCUSDT
+```
+
+Full docs: **[OBMICRO_GRID_COMMANDS.md](OBMICRO_GRID_COMMANDS.md)**
 
 Self-contained: **Python standard library only** — no third-party dependencies.
 
@@ -20,11 +34,16 @@ Self-contained: **Python standard library only** — no third-party dependencies
 ```
 trade-binance-websocket-orderbook-dca-grid/
 ├── orderbook_dca_grid.py        # Futures bot (grid + exit plugins)
+├── orderbook_micro_grid.py      # Fib micro-grid (./fib · /fib Telegram)
 ├── orderbook_staged_exit.py     # Staged exit logic (used by exits/staged.py; standalone optional)
 ├── orderbook_dca_grid_spot.py   # Spot bot
-├── botctl.py                    # CLI: start/stop/status per symbol
-├── telegram_botctl.py           # Telegram remote control daemon
-├── telegram_notify.py           # Telegram alerts (send-only)
+├── fib                          # Short wrapper → micro-grid
+├── obmicro-grid                 # Same bot, flags passthrough
+├── dca                          # Short wrapper → DCA supervise
+├── botctl.py                    # CLI: start/stop/status/fib per symbol
+├── telegram_botctl.py           # Telegram remote control (/start /fib /stop)
+├── telegram_notify.py           # Telegram alerts (DCA + #FIB)
+├── OBMICRO_GRID_COMMANDS.md     # Fib micro-grid full guide
 ├── exits/                       # Exit plugins (staged, trailing)
 ├── .state/                      # Staged exit state per symbol (gitignored)
 ├── .run/                        # PID files + logs (Mac pidfile backend; gitignored)
@@ -147,9 +166,9 @@ Add new exit strategies under `exits/` and register them in `exits/__init__.py`.
 
 Uses `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` in `.env`. If unset, alerts and remote control are skipped.
 
-**Alerts** (`telegram_notify.py`): supervise start, grid/DCA re-arm, DCA fill, position open/close (with PnL), staged TP1/SL/trail, supervisor errors.
+**Alerts** (`telegram_notify.py`): DCA supervise start, grid/DCA re-arm, fills, open/close (PnL), staged TP1/SL/trail; **FIB** `#FIB` armed/open/fill/trail/disarm/closed.
 
-**Remote control** (`telegram_botctl.py` + `botctl.py`): start/stop/status supervisors **without closing positions or cancelling orders** on stop.
+**Remote control** (`telegram_botctl.py` + `botctl.py`): start/stop/status **without closing positions or cancelling orders** on stop. Works for DCA and FIB (same machine as the process).
 
 #### Telegram commands
 
@@ -157,22 +176,27 @@ Only messages from `TELEGRAM_CHAT_ID` are accepted.
 
 | Command | Action |
 |---------|--------|
-| `/start SYMBOL` | Start supervisor for symbol |
-| `/stop SYMBOL` | Stop supervisor (orders & position stay on Binance) |
-| `/status SYMBOL` | Process state + position + staged phase + PnL |
-| `/list` | All running supervisors |
+| `/start SYMBOL` | Start **DCA** supervisor |
+| `/fib SYMBOL [long\|short\|auto]` | Start **FIB** micro-grid in background |
+| `/stop SYMBOL` | Stop DCA **and/or** FIB (orders & position stay) |
+| `/status SYMBOL` | Process state + position + PnL |
+| `/list` | All running bots (DCA + `FIB:SYMBOL`) |
 | `/help` | Command list |
 
-`/start` only works for symbols listed in `FUTURES_PAIRS` (whitelist). `/stop` and `/status` work for any symbol.
+`/start` and `/fib` respect `FUTURES_PAIRS` whitelist when set. `/stop` and `/status` work for any symbol.
 
 CLI equivalent:
 
 ```bash
 python3 botctl.py start SXTUSDT
-python3 botctl.py stop SXTUSDT
-python3 botctl.py status SXTUSDT
+python3 botctl.py fib LTCUSDT short
+python3 botctl.py stop LTCUSDT
+python3 botctl.py fib-stop LTCUSDT
+python3 botctl.py status LTCUSDT
 python3 botctl.py list
 ```
+
+Fib full guide: [OBMICRO_GRID_COMMANDS.md](OBMICRO_GRID_COMMANDS.md)
 
 #### Local (Mac) — manual daemon
 

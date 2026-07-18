@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """15s micro-grid scalp: place FULL grid + exchange TP/SL at open.
 
-Default grid mode is **Fibonacci** (5m swing impulse → retrace levels).
+Default grid mode is **Fibonacci** (1m swing impulse → retrace levels).
 Geometric ``--grid-mode step`` remains available as fallback.
 
 Fib entry (default):
@@ -12,12 +12,13 @@ Fib entry (default):
   5. If no fill before timeout / through origin → disarm and wait
   6. When all ``--levels`` are filled and position is in profit → replace SL
      with TRAILING_STOP_MARKET (default on) so a pullback does not exit at a loss
+  7. After flat → cooldown 1h (``--cooldown-sec``) before next arm
 
-Optional ``--sweep``: when a grid level fills, re-place it one step further
-(barrido). Launch wiring comes later — run this file directly for now.
+Wrappers: ``./fib`` · ``./obmicro-grid`` · Telegram ``/fib`` ``/stop`` (see OBMICRO_GRID_COMMANDS.md).
 
 Usage:
-  ./obmicro-grid LDOUSDT                 # execute · fib 1m · direction auto
+  fib LDOUSDT
+  fib LDOUSDT short --entry-usdt 50
   ./obmicro-grid LDOUSDT --dry-run
   ./obmicro-grid LDOUSDT --direction long --fib-interval 5m
 
@@ -29,13 +30,17 @@ Env (optional):
   OB_MG_RAISE_TOP=1  OB_MG_RAISE_MIN_PCT=0.05
   OB_MG_TP_MODE=avg  OB_MG_TP_PCT=0.35
   OB_MG_PROTECT_TRAIL=1  OB_MG_PROTECT_TRAIL_CALLBACK=0.2
+  OB_MG_COOLDOWN_SEC=3600
   OB_MG_BASE_SIZE=10  OB_MG_LEVEL_SIZE=8  OB_MG_BAR_SEC=15
+  TELEGRAM_BOT_TOKEN=  TELEGRAM_CHAT_ID=
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
+import signal
 import sys
 import time
 from dataclasses import dataclass, field
@@ -88,6 +93,37 @@ def _tg():
     except Exception:
         pass
     return None
+
+
+def fib_pid_path(symbol: str) -> Path:
+    d = ROOT / ".run" / "pids"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"fib-{symbol.upper()}.pid"
+
+
+def register_fib_pidfile(symbol: str) -> Path:
+    """Write pidfile so Telegram /stop SYMBOL can find this process."""
+    path = fib_pid_path(symbol)
+    path.write_text(str(os.getpid()), encoding="utf-8")
+
+    def _cleanup() -> None:
+        try:
+            if path.exists() and path.read_text().strip() == str(os.getpid()):
+                path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    atexit.register(_cleanup)
+
+    def _on_term(signum: int, frame: object) -> None:  # noqa: ARG001
+        _cleanup()
+        raise SystemExit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, _on_term)
+    except (ValueError, OSError):
+        pass
+    return path
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -2458,6 +2494,7 @@ def run(args: argparse.Namespace) -> int:
         f"TP={args.tp_mode}+{args.tp_pct:g}% · SL {args.sl_pct:g}% · "
         f"protect_trail={'ON' if args.protect_trail else 'OFF'}"
         f"(cb={args.protect_trail_callback:g}%) · "
+        f"cooldown={args.cooldown_sec:g}s · "
         f"sweep={'ON' if args.sweep else 'OFF'} · "
         f"dir={args.direction}{RESET}\n"
         f"{DIM}log {journal_path(sym)}{RESET}"
@@ -2467,6 +2504,9 @@ def run(args: argparse.Namespace) -> int:
         f"START mode={args.grid_mode} bar={args.bar_sec} levels={args.levels} "
         f"execute={int(args.execute)} lev={lev} base={args.base_size:g}",
     )
+    if args.execute:
+        pid_path = register_fib_pidfile(sym)
+        print(f"{DIM}pidfile {pid_path} (Telegram /stop {sym}){RESET}")
     tg = _tg()
     if tg is not None and args.execute:
         note = (
@@ -2754,7 +2794,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--imb-long", type=float, default=0.55)
     p.add_argument("--imb-short", type=float, default=0.45)
     p.add_argument("--momentum-min-pct", type=float, default=0.01)
-    p.add_argument("--cooldown-sec", type=float, default=30.0)
+    p.add_argument("--cooldown-sec", type=float,
+                   default=_env_float("OB_MG_COOLDOWN_SEC", 3600.0),
+                   help="Seconds to wait after flat/cycle before re-arm (default 3600 = 1h)")
     p.add_argument("--sweep", action="store_true", default=_env_bool("OB_MG_SWEEP", False),
                    help="Re-place filled grid levels one step further")
     p.add_argument("--no-sweep", action="store_true", help="Disable sweep")

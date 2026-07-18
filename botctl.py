@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent
 RUN_DIR = ROOT / ".run" / "pids"
 LOG_DIR = ROOT / ".run" / "logs"
 GRID_SCRIPT = ROOT / "orderbook_dca_grid.py"
+FIB_SCRIPT = ROOT / "orderbook_micro_grid.py"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -125,6 +126,33 @@ def _pgrep_pids(symbol: str) -> list[int]:
     return sorted(set(pids))
 
 
+def _pgrep_fib_pids(symbol: str) -> list[int]:
+    """PIDs of fib / micro-grid bots for this symbol."""
+    sym = symbol.upper()
+    pids: list[int] = []
+    for pattern in (f"orderbook_micro_grid.py {sym}",):
+        try:
+            proc = subprocess.run(["pgrep", "-f", pattern], text=True, capture_output=True)
+        except FileNotFoundError:
+            continue
+        for line in proc.stdout.splitlines():
+            try:
+                pids.append(int(line.strip()))
+            except ValueError:
+                continue
+    return sorted(set(pids))
+
+
+def _fib_pid_path(symbol: str) -> Path:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    return RUN_DIR / f"fib-{symbol.upper()}.pid"
+
+
+def _fib_log_path(symbol: str) -> Path:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return LOG_DIR / f"fib-{symbol.upper()}.log"
+
+
 def _kill_pids(pids: list[int]) -> None:
     for pid in pids:
         try:
@@ -215,17 +243,60 @@ def is_running(symbol: str, backend: str | None = None) -> bool:
         return False
 
 
+def fib_is_running(symbol: str) -> bool:
+    sym = symbol.upper()
+    if _pgrep_fib_pids(sym):
+        return True
+    pid_file = _fib_pid_path(sym)
+    if not pid_file.exists():
+        return False
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (TypeError, ValueError, OSError):
+        return False
+    if _pid_alive(pid):
+        return True
+    pid_file.unlink(missing_ok=True)
+    return False
+
+
 def list_running(backend: str | None = None) -> list[str]:
     backend = backend or detect_backend()
+    out: list[str] = []
     if backend == "systemd":
         running = set(_list_systemd_running()) | set(_pgrep_supervisors())
-        return sorted(running)
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
-    out: list[str] = []
-    for path in RUN_DIR.glob("*.pid"):
-        sym = path.stem.upper()
-        if is_running(sym, "pidfile"):
-            out.append(sym)
+        out.extend(sorted(running))
+    else:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        for path in RUN_DIR.glob("*.pid"):
+            stem = path.stem.upper()
+            if stem.startswith("FIB-"):
+                continue
+            sym = stem
+            if is_running(sym, "pidfile"):
+                out.append(sym)
+    # Fib bots (any backend)
+    seen_fib: set[str] = set()
+    for path in RUN_DIR.glob("fib-*.pid"):
+        sym = path.stem[4:].upper()
+        if fib_is_running(sym):
+            seen_fib.add(sym)
+    try:
+        proc = subprocess.run(["pgrep", "-af", "orderbook_micro_grid.py"], text=True, capture_output=True)
+        for line in proc.stdout.splitlines():
+            parts = line.split()
+            for i, part in enumerate(parts):
+                if part.endswith("orderbook_micro_grid.py") and i + 1 < len(parts):
+                    sym = parts[i + 1].upper()
+                    if sym.isalnum() and sym.endswith("USDT"):
+                        seen_fib.add(sym)
+                    break
+    except FileNotFoundError:
+        pass
+    for sym in sorted(seen_fib):
+        tag = f"FIB:{sym}"
+        if tag not in out:
+            out.append(tag)
     return sorted(out)
 
 
@@ -299,18 +370,33 @@ def stop(symbol: str, backend: str | None = None) -> str:
     pids = _pgrep_pids(sym)
     if pids:
         _kill_pids(pids)
-        stopped.append(f"process(es) {', '.join(str(p) for p in pids)}")
+        stopped.append(f"DCA process(es) {', '.join(str(p) for p in pids)}")
 
     pid_file = _pid_path(sym)
     if pid_file.exists():
         pid_file.unlink(missing_ok=True)
 
+    fib_pids = _pgrep_fib_pids(sym)
+    if fib_pids:
+        _kill_pids(fib_pids)
+        stopped.append(f"FIB process(es) {', '.join(str(p) for p in fib_pids)}")
+    fib_pid_file = _fib_pid_path(sym)
+    if fib_pid_file.exists():
+        try:
+            pid = int(fib_pid_file.read_text().strip())
+            if _pid_alive(pid) and pid not in fib_pids:
+                _kill_pids([pid])
+                stopped.append(f"FIB pid {pid}")
+        except (TypeError, ValueError, OSError):
+            pass
+        fib_pid_file.unlink(missing_ok=True)
+
     if stopped:
         how = "; ".join(stopped)
-        return f"⏸ {sym} supervisor stopped ({how}). Position and orders unchanged on Binance."
+        return f"⏸ {sym} stopped ({how}). Position and orders unchanged on Binance."
 
     if backend == "pidfile":
-        return f"ℹ️ {sym} was not running."
+        return f"ℹ️ {sym} was not running (DCA or FIB)."
 
     # Supervisor not on this host — often Mac local bot + Telegram ctl on VPS.
     body = trading_status(sym)
@@ -323,6 +409,127 @@ def stop(symbol: str, backend: str | None = None) -> str:
             f"{body}"
         )
     return f"ℹ️ {sym} was not running."
+
+
+def fib_start(symbol: str, direction: str | None = None) -> str:
+    """Start fib micro-grid in background (pidfile)."""
+    sym = symbol.upper()
+    dir_arg = (direction or "").lower()
+    if dir_arg and dir_arg not in ("long", "short", "auto"):
+        dir_arg = ""
+    allow = allowed_symbols()
+    if allow is not None and sym not in allow:
+        return f"⛔ {sym} is not in FUTURES_PAIRS."
+
+    if fib_is_running(sym):
+        return f"ℹ️ {sym} FIB is already running."
+
+    if not FIB_SCRIPT.is_file():
+        return f"❌ Cannot find {FIB_SCRIPT.name}."
+
+    log = _fib_log_path(sym)
+    pid_file = _fib_pid_path(sym)
+    cmd = [
+        sys.executable, "-u", str(FIB_SCRIPT), sym,
+        "--recv-window", os.getenv("RECV_WINDOW", "15000"),
+    ]
+    if dir_arg:
+        cmd.extend(["--direction", dir_arg])
+
+    with open(log, "a", encoding="utf-8") as logfh:
+        logfh.write(f"\n--- fib start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdout=logfh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    pid_file.write_text(str(proc.pid), encoding="utf-8")
+    time.sleep(0.6)
+    if proc.poll() is not None:
+        pid_file.unlink(missing_ok=True)
+        return f"❌ {sym} FIB exited on start — check {log}"
+    dir_note = f" · {dir_arg}" if dir_arg else ""
+    return (
+        f"▶️ {sym} FIB started (pid {proc.pid}){dir_note}. "
+        f"Position/orders unchanged. Log: {log}"
+    )
+
+
+def fib_stop(symbol: str) -> str:
+    """Stop only the fib micro-grid for symbol (DCA left alone)."""
+    sym = symbol.upper()
+    stopped: list[str] = []
+    fib_pids = _pgrep_fib_pids(sym)
+    if fib_pids:
+        _kill_pids(fib_pids)
+        stopped.append(f"process(es) {', '.join(str(p) for p in fib_pids)}")
+    fib_pid_file = _fib_pid_path(sym)
+    if fib_pid_file.exists():
+        try:
+            pid = int(fib_pid_file.read_text().strip())
+            if _pid_alive(pid) and pid not in fib_pids:
+                _kill_pids([pid])
+                stopped.append(f"pid {pid}")
+        except (TypeError, ValueError, OSError):
+            pass
+        fib_pid_file.unlink(missing_ok=True)
+    if stopped:
+        return f"⏸ {sym} FIB stopped ({'; '.join(stopped)}). Position and orders unchanged."
+    return f"ℹ️ {sym} FIB was not running."
+
+
+def status(symbol: str, backend: str | None = None) -> str:
+    sym = symbol.upper()
+    backend = backend or detect_backend()
+    dca_on = is_running(sym, backend)
+    fib_on = fib_is_running(sym)
+    bits = []
+    if dca_on:
+        bits.append("DCA running")
+    if fib_on:
+        bits.append("FIB running")
+    if not bits:
+        bits.append("stopped")
+    head = f"{'▶️' if (dca_on or fib_on) else '⏸'} {sym} · {', '.join(bits)} ({backend})"
+    body = trading_status(sym)
+    return f"{head}\n{body}"
+
+
+def list_status(backend: str | None = None) -> str:
+    backend = backend or detect_backend()
+    running = list_running(backend)
+    if not running and backend == "systemd":
+        pgrep = _pgrep_supervisors()
+        if pgrep:
+            blocks = [f"▶️ {sym} · running (process, not visible via systemctl)\n{trading_status(sym)}"
+                      for sym in pgrep]
+            head = (
+                "⚠️ systemd list empty but supervisor processes found.\n"
+                "On the VPS run: python3 deploy/sync_pairs.py status\n"
+                "Or fix sudo for forge (see README).\n"
+            )
+            return head + "\n\n".join(blocks)
+    if not running:
+        return f"No supervisors running ({backend})."
+    blocks = []
+    for item in running:
+        if item.startswith("FIB:"):
+            sym = item.split(":", 1)[1]
+            blocks.append(status(sym, backend))
+        else:
+            blocks.append(status(item, backend))
+    # Dedupe by symbol
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for b in blocks:
+        key = b.split("\n", 1)[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(b)
+    return "\n\n".join(uniq)
 
 
 def cleanup(symbol: str) -> str:
@@ -453,39 +660,14 @@ def trading_status(symbol: str) -> str:
     return "\n".join(lines)
 
 
-def status(symbol: str, backend: str | None = None) -> str:
-    sym = symbol.upper()
-    backend = backend or detect_backend()
-    running = is_running(sym, backend)
-    head = f"{'▶️' if running else '⏸'} {sym} · {'running' if running else 'stopped'} ({backend})"
-    body = trading_status(sym)
-    return f"{head}\n{body}"
-
-
-def list_status(backend: str | None = None) -> str:
-    backend = backend or detect_backend()
-    running = list_running(backend)
-    if not running and backend == "systemd":
-        pgrep = _pgrep_supervisors()
-        if pgrep:
-            blocks = [f"▶️ {sym} · running (process, not visible via systemctl)\n{trading_status(sym)}"
-                      for sym in pgrep]
-            head = (
-                "⚠️ systemd list empty but supervisor processes found.\n"
-                "On the VPS run: python3 deploy/sync_pairs.py status\n"
-                "Or fix sudo for forge (see README).\n"
-            )
-            return head + "\n\n".join(blocks)
-    if not running:
-        return f"No supervisors running ({backend})."
-    blocks = [status(sym, backend) for sym in running]
-    return "\n\n".join(blocks)
-
-
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Control DCA supervisors per symbol (no position close on stop)")
-    p.add_argument("command", choices=["start", "stop", "status", "cleanup", "list", "running"])
+    p = argparse.ArgumentParser(description="Control DCA/FIB bots per symbol (no position close on stop)")
+    p.add_argument(
+        "command",
+        choices=["start", "stop", "status", "cleanup", "list", "running", "fib", "fib-stop"],
+    )
     p.add_argument("symbol", nargs="?", help="Symbol e.g. SXTUSDT")
+    p.add_argument("direction", nargs="?", help="For fib: long|short|auto")
     p.add_argument("--backend", choices=["auto", "systemd", "pidfile"], default="auto")
     return p.parse_args()
 
@@ -497,7 +679,7 @@ def main() -> None:
     args = parse_args()
     backend = detect_backend() if args.backend == "auto" else args.backend
 
-    if args.command in ("start", "stop", "status", "cleanup") and not args.symbol:
+    if args.command in ("start", "stop", "status", "cleanup", "fib", "fib-stop") and not args.symbol:
         print("Symbol required.", file=sys.stderr)
         sys.exit(1)
 
@@ -505,6 +687,10 @@ def main() -> None:
         print(start(args.symbol, backend))
     elif args.command == "stop":
         print(stop(args.symbol, backend))
+    elif args.command == "fib":
+        print(fib_start(args.symbol, args.direction))
+    elif args.command == "fib-stop":
+        print(fib_stop(args.symbol))
     elif args.command == "status":
         print(status(args.symbol, backend))
     elif args.command == "cleanup":

@@ -66,7 +66,7 @@ def _parse_message(text: str) -> tuple[str, list[str]]:
         return "", []
     parts = text.split()
     cmd = parts[0].split("@")[0].lower()
-    args = [p.strip().upper() for p in parts[1:] if p.strip()]
+    args = [p.strip() for p in parts[1:] if p.strip()]
     return cmd, args
 
 
@@ -75,24 +75,34 @@ def handle_command(cmd: str, args: list[str]) -> str:
 
     if cmd in ("/help", "/start_help"):
         return (
-            "DCA supervisor commands:\n"
-            "/start SYMBOL — start bot (position unchanged)\n"
-            "/stop SYMBOL — stop bot (orders & position stay on Binance)\n"
+            "Bot control commands:\n"
+            "/start SYMBOL — start DCA supervisor\n"
+            "/fib SYMBOL [long|short|auto] — start FIB micro-grid\n"
+            "/stop SYMBOL — stop DCA and/or FIB (orders & position stay)\n"
             "/status SYMBOL — process + trading state\n"
-            "/cleanup SYMBOL — cancel obstage* Stop/TP algos (position unchanged)\n"
-            "/review SYMBOL — DeepSeek situational review (position + market)\n"
-            "/list — all running supervisors\n"
+            "/cleanup SYMBOL — cancel obstage* Stop/TP algos\n"
+            "/review SYMBOL — DeepSeek situational review\n"
+            "/list — all running bots\n"
             f"Backend: {backend}"
         )
 
     if cmd == "/list":
         return botctl.list_status(backend)
 
+    if cmd == "/fib":
+        if not args:
+            return "Usage: /fib SYMBOL [long|short|auto]  (e.g. /fib LTCUSDT short)"
+        sym = args[0].upper()
+        direction = args[1].lower() if len(args) > 1 else None
+        if direction and direction not in ("long", "short", "auto"):
+            return "Direction must be long, short, or auto"
+        return botctl.fib_start(sym, direction)
+
     if cmd in ("/start", "/stop", "/status"):
         action = cmd.lstrip("/")
         if not args:
             return f"Usage: {cmd} SYMBOL  (e.g. {cmd} SXTUSDT)"
-        sym = args[0]
+        sym = args[0].upper()
         if action == "start":
             return botctl.start(sym, backend)
         if action == "stop":
@@ -104,14 +114,14 @@ def handle_command(cmd: str, args: list[str]) -> str:
             return "Usage: /review SYMBOL  (e.g. /review NEARUSDT)"
         try:
             from trade_review import review_symbol
-            return review_symbol(args[0])
+            return review_symbol(args[0].upper())
         except Exception as exc:
             return f"Review failed: {exc}"
 
     if cmd == "/cleanup":
         if not args:
             return "Usage: /cleanup SYMBOL  (e.g. /cleanup HEIUSDT)"
-        return botctl.cleanup(args[0])
+        return botctl.cleanup(args[0].upper())
 
     return "Unknown command. Try /help"
 
@@ -153,7 +163,7 @@ def run_daemon(poll_sec: float = 1.0) -> None:
 
     botctl.ROOT  # ensure import side ok
     backend = botctl.detect_backend()
-    send_reply(f"🤖 DCA control active ({backend}). /help for commands.")
+    send_reply(f"🤖 Bot control active ({backend}). /help · /fib · /stop")
     logger.info("Telegram botctl started (backend=%s)", backend)
 
     offset = _load_offset()
@@ -175,7 +185,7 @@ def run_daemon(poll_sec: float = 1.0) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Telegram start/stop/status for DCA supervisors")
+    p = argparse.ArgumentParser(description="Telegram start/stop/status for DCA + FIB bots")
     p.add_argument("--poll-sec", type=float, default=1.0)
     p.add_argument("--env-file", default=None)
     return p.parse_args()
