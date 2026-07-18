@@ -100,6 +100,31 @@ Stop: `Ctrl+C` (does **not** flatten; use `--flatten` to close)
 
 ---
 
+## Telegram
+
+Uses the same `.env` keys as DCA:
+
+```text
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+```
+
+If unset, alerts are skipped (bot still trades). When set, FIB sends:
+
+| Event | Tag |
+|-------|-----|
+| Bot start | FIB micro-grid started |
+| Grid armed | `#FIB Grid armed` |
+| First fill / open | `#FIB OPEN` |
+| Extra level fill | `#FIB FILL` |
+| Protect trailing | `#FIB TRAIL` |
+| Disarm (timeout/origin) | `#FIB DISARM` |
+| Adopt existing | `#FIB ADOPT` |
+| Position closed | `#FIB CLOSED` |
+| Errors | `FIB error` |
+
+---
+
 ## Optional environment variables
 
 ```text

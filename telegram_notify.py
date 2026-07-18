@@ -331,3 +331,147 @@ def notify_trail_started(
         f"Activate {activate:g} · callback {callback:g}%"
         f"{pnl_suffix(pnl_usdt, notional, leverage)}",
     )
+
+
+# ── Fib / micro-grid ─────────────────────────────────────────────────────────
+
+def notify_fib_started(symbol: str, *, direction: str = "auto", note: str = "") -> None:
+    extra = f"\n{note}" if note else ""
+    send_bot(f"{symbol.upper()} FIB micro-grid started\nDir: {direction.upper()}{extra}")
+
+
+def notify_fib_grid_armed(
+    symbol: str,
+    direction: str,
+    levels: int,
+    *,
+    wait_pullback: bool = True,
+    grid_vol_usdt: float | None = None,
+    mark: float | None = None,
+    leverage: float | int | None = None,
+) -> None:
+    kind = "LIMIT pullback" if wait_pullback else "MARKET + grid"
+    vol_line = ""
+    if grid_vol_usdt and grid_vol_usdt > 0:
+        vol_line = f"\n{fmt_vol_usdt(grid_vol_usdt, leverage)}"
+    mark_line = f"\nMark {mark:g}" if mark and mark > 0 else ""
+    send_grid(
+        f"{symbol.upper()} futures\n#FIB Grid armed · {direction.upper()}\n"
+        f"{kind} · {levels} level(s){mark_line}{vol_line}",
+    )
+
+
+def notify_fib_open(
+    symbol: str,
+    direction: str,
+    qty: float,
+    entry: float,
+    *,
+    tp: float | None = None,
+    sl: float | None = None,
+    vol_usdt: float | None = None,
+    leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
+) -> None:
+    notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(qty) * abs(entry)
+    exits = ""
+    if tp and tp > 0:
+        exits += f"\nTP {tp:g}"
+    if sl and sl > 0:
+        exits += f" · SL {sl:g}"
+    send_position(
+        direction,
+        f"{symbol.upper()} futures\n#FIB OPEN {direction.upper()}\n"
+        f"Qty {qty:g} @ {entry:g} · {fmt_vol_usdt(notional, leverage)}"
+        f"{exits}{pnl_suffix(pnl_usdt, notional, leverage)}",
+    )
+
+
+def notify_fib_fill(
+    symbol: str,
+    direction: str,
+    fill_qty: float,
+    fill_price: float,
+    pos_qty: float,
+    entry: float,
+    *,
+    vol_usdt: float | None = None,
+    leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
+) -> None:
+    notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(pos_qty) * abs(entry)
+    fill_vol = abs(fill_qty) * abs(fill_price)
+    send_position(
+        direction,
+        f"{symbol.upper()} futures\n#FIB FILL {direction.upper()}\n"
+        f"+{fill_qty:g} @ {fill_price:g} · Vol: {fill_vol:,.2f} USDT\n"
+        f"Position {pos_qty:g} @ {entry:g} · {fmt_vol_usdt(notional, leverage)}"
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}",
+    )
+
+
+def notify_fib_protect_trail(
+    symbol: str,
+    direction: str,
+    qty: float,
+    entry: float,
+    callback: float,
+    *,
+    profit_pct: float | None = None,
+    leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
+) -> None:
+    notional = abs(qty) * abs(entry)
+    profit = f"\nProfit {profit_pct:+.2f}%" if profit_pct is not None else ""
+    send_trailing(
+        f"{symbol.upper()} futures\n#FIB TRAIL {direction.upper()}\n"
+        f"Full grid filled · callback {callback:g}%{profit}\n"
+        f"Qty {qty:g} @ {entry:g} · {fmt_vol_usdt(notional, leverage)}"
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}",
+    )
+
+
+def notify_fib_disarm(symbol: str, direction: str, reason: str) -> None:
+    send_warn(
+        f"{symbol.upper()} futures\n#FIB DISARM {direction.upper()}\n"
+        f"Reason: {reason}",
+    )
+
+
+def notify_fib_adopt(
+    symbol: str,
+    direction: str,
+    qty: float,
+    entry: float,
+    *,
+    vol_usdt: float | None = None,
+    leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
+    trail: bool = False,
+) -> None:
+    notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(qty) * abs(entry)
+    trail_note = " · trail on" if trail else ""
+    send_bot(
+        f"{symbol.upper()} futures\n#FIB ADOPT {direction.upper()}{trail_note}\n"
+        f"Qty {qty:g} @ {entry:g} · {fmt_vol_usdt(notional, leverage)}"
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}",
+    )
+
+
+def notify_fib_closed(
+    symbol: str,
+    direction: str,
+    *,
+    vol_usdt: float | None = None,
+    leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
+) -> None:
+    vol = f" · {fmt_vol_usdt(vol_usdt, leverage)}" if vol_usdt and vol_usdt > 0 else ""
+    emoji = _close_emoji(pnl_usdt)
+    pnl_line = pnl_suffix(pnl_usdt, vol_usdt or 0.0, leverage) if pnl_usdt is not None else ""
+    _send_async(f"{emoji} {symbol.upper()} futures\n#FIB CLOSED {direction.upper()}{vol}{pnl_line}")
+
+
+def notify_fib_error(symbol: str, detail: str) -> None:
+    text = (detail or "")[:420]
+    send_warn(f"{symbol.upper()} FIB error\n{text}")

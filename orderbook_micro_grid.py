@@ -79,6 +79,17 @@ ENTRY_PREFIX = "obmgE"
 ALGO_PREFIX = "obmg"
 
 
+def _tg():
+    """Return telegram_notify if configured; else None (no-op)."""
+    try:
+        import telegram_notify as tg
+        if tg.is_configured():
+            return tg
+    except Exception:
+        pass
+    return None
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _env_float(name: str, default: float) -> float:
@@ -1544,6 +1555,12 @@ def maybe_arm_full_fill_trail(
         f"PROTECT_TRAIL cb={callback:g} profit={profit:.3f}% qty={qty:g} "
         f"entry={entry:.8g} mark={mark:.8g} upnl={upnl:.4f}",
     )
+    tg = _tg()
+    if tg is not None:
+        tg.notify_fib_protect_trail(
+            symbol, "LONG" if state.is_long else "SHORT",
+            qty, entry, callback, profit_pct=profit, pnl_usdt=upnl,
+        )
     return True
 
 
@@ -1651,6 +1668,17 @@ def adopt_existing_position(
         f"{' trail' if trail_armed else ''}",
     )
 
+    meta = get_position_meta(symbol, is_long, hedge, api, sec, recv)
+    upnl = float(meta.get("unrealized_pnl") or 0)
+    notional = float(meta.get("notional") or (qty * entry))
+    lev = int(meta.get("leverage") or 0)
+    tg = _tg()
+    if tg is not None:
+        tg.notify_fib_adopt(
+            symbol, side, qty, entry,
+            vol_usdt=notional, leverage=lev, pnl_usdt=upnl, trail=trail_armed,
+        )
+
     state = CycleState(
         active=True,
         pending=False,
@@ -1670,10 +1698,11 @@ def adopt_existing_position(
                 plan.swing.low if plan.swing else 0.0
             )
         ),
+        last_notional=notional,
+        last_upnl=upnl,
+        last_leverage=lev,
     )
     open_idxs, filled_idxs = sync_grid_level_status(symbol, state, api, sec, recv)
-    meta = get_position_meta(symbol, is_long, hedge, api, sec, recv)
-    upnl = float(meta.get("unrealized_pnl") or 0)
     print_live_table(
         state,
         render_live_table(
@@ -1787,6 +1816,9 @@ class CycleState:
     swing_high_anchor: float = 0.0  # last raised top (long) / bottom (short)
     ui_lines: int = 0  # live table rows currently on screen (for in-place refresh)
     ui_last_print: float = 0.0
+    last_notional: float = 0.0
+    last_upnl: float = 0.0
+    last_leverage: int = 0
 
 
 def arm_cycle(
@@ -1858,6 +1890,13 @@ def arm_cycle(
             ),
             force=True,
         )
+        tg = _tg()
+        if tg is not None:
+            grid_vol = sum(float(lv.size_usdt) for lv in plan.levels)
+            tg.notify_fib_grid_armed(
+                symbol, "LONG" if plan.is_long else "SHORT", n,
+                wait_pullback=True, grid_vol_usdt=grid_vol, mark=mark,
+            )
         return state
 
     # Legacy chase path: MARKET base then grid + exits
@@ -1885,6 +1924,16 @@ def arm_cycle(
         tp_target, plan.sl_price, filt, hedge, api, sec, recv,
     )
     append_journal(symbol, f"EXITS tp={tp:.8g} sl={sl:.8g} qty={qty:g} tp_mode={tp_mode}")
+    tg = _tg()
+    if tg is not None:
+        side = "LONG" if plan.is_long else "SHORT"
+        grid_vol = sum(float(lv.size_usdt) for lv in plan.levels) + float(plan.base_usdt)
+        tg.notify_fib_grid_armed(
+            symbol, side, n, wait_pullback=False, grid_vol_usdt=grid_vol, mark=mark,
+        )
+        tg.notify_fib_open(
+            symbol, side, qty, entry, tp=tp, sl=sl, vol_usdt=qty * entry,
+        )
     return CycleState(
         active=True,
         pending=False,
@@ -1897,6 +1946,7 @@ def arm_cycle(
         last_qty=qty,
         opened_at=time.time(),
         armed_at=time.time(),
+        last_notional=qty * entry,
     )
 
 
@@ -1915,9 +1965,15 @@ def disarm_pending(
     n_e = cancel_our_exits(symbol, api, sec, recv)
     print(f"{YELLOW}Disarm ({reason}) · cancelled grid={n_g} exits={n_e}{RESET}")
     append_journal(symbol, f"DISARM reason={reason} grid={n_g} exits={n_e}")
+    tg = _tg()
+    if tg is not None:
+        tg.notify_fib_disarm(
+            symbol, "LONG" if state.is_long else "SHORT", reason,
+        )
     state.pending = False
     state.active = False
     state.exits_armed = False
+    state.trail_armed = False
     state.plan = None
     state.last_qty = 0.0
     state.filled_levels.clear()
@@ -2142,9 +2198,18 @@ def tick_pending(
                 f"OPEN {'LONG' if state.is_long else 'SHORT'} qty={qty:g} "
                 f"entry={entry:.8g} tp={tp:.8g} sl={sl:.8g} tp_mode={tp_mode}",
             )
+            tg = _tg()
+            if tg is not None:
+                tg.notify_fib_open(
+                    symbol, "LONG" if state.is_long else "SHORT",
+                    qty, entry, tp=tp, sl=sl, vol_usdt=qty * entry,
+                )
         except Exception as exc:
             print(f"{RED}Exit arm failed after fill: {exc}{RESET}")
             append_journal(symbol, f"ERROR exits_after_fill {exc}")
+            tg = _tg()
+            if tg is not None:
+                tg.notify_fib_error(symbol, f"exits after fill: {exc}")
 
     state.active = True
     state.pending = False
@@ -2160,12 +2225,22 @@ def close_cycle_cleanup(symbol: str, state: CycleState, api: str, sec: str, recv
     if n_g or n_e:
         print(f"{DIM}Cleanup cancelled grid={n_g} exits={n_e}{RESET}")
     append_journal(symbol, f"FLAT cleanup grid={n_g} exits={n_e}")
+    tg = _tg()
+    if tg is not None and (state.last_qty > 0 or state.last_notional > 0):
+        tg.notify_fib_closed(
+            symbol, "LONG" if state.is_long else "SHORT",
+            vol_usdt=state.last_notional or None,
+            leverage=state.last_leverage or None,
+            pnl_usdt=state.last_upnl,
+        )
     state.active = False
     state.pending = False
     state.exits_armed = False
     state.trail_armed = False
     state.plan = None
     state.last_qty = 0.0
+    state.last_notional = 0.0
+    state.last_upnl = 0.0
     state.filled_levels.clear()
 
 
@@ -2194,7 +2269,16 @@ def refresh_exits_if_grown(
     grown = qty > state.last_qty * 1.02
     if grown:
         clear_live_table(state)
+        prev_qty = state.last_qty
         print(f"{CYAN}Position grew {state.last_qty:g} → {qty:g} — refreshing exits{RESET}")
+        meta = get_position_meta(symbol, state.is_long, hedge, api, sec, recv)
+        upnl = float(meta.get("unrealized_pnl") or 0)
+        notional = float(meta.get("notional") or (qty * entry))
+        lev = int(meta.get("leverage") or 0)
+        fill_qty = max(0.0, qty - prev_qty)
+        old_notional = float(state.last_notional or 0)
+        fill_notional = max(0.0, notional - old_notional)
+        fill_price = (fill_notional / fill_qty) if fill_qty > 0 else entry
         if state.trail_armed:
             callback = float(
                 getattr(args, "protect_trail_callback", state.trail_callback) or 0.2
@@ -2240,7 +2324,17 @@ def refresh_exits_if_grown(
                 )
             except Exception as exc:
                 print(f"{RED}Exit refresh failed: {exc}{RESET}")
+        tg = _tg()
+        if tg is not None and fill_qty > 0:
+            tg.notify_fib_fill(
+                symbol, "LONG" if state.is_long else "SHORT",
+                fill_qty, fill_price, qty, entry,
+                vol_usdt=notional, leverage=lev, pnl_usdt=upnl,
+            )
         state.last_qty = qty
+        state.last_notional = notional
+        state.last_upnl = upnl
+        state.last_leverage = lev
 
         if args.sweep:
             _sweep_missing_levels(symbol, state, filt, hedge, api, sec, recv, args)
@@ -2373,6 +2467,15 @@ def run(args: argparse.Namespace) -> int:
         f"START mode={args.grid_mode} bar={args.bar_sec} levels={args.levels} "
         f"execute={int(args.execute)} lev={lev} base={args.base_size:g}",
     )
+    tg = _tg()
+    if tg is not None and args.execute:
+        note = (
+            f"grid={args.grid_mode} · levels={args.levels} · "
+            f"arm≤{args.arm_max_fib:g} · wait_pullback={'ON' if args.wait_pullback else 'OFF'}"
+        )
+        tg.notify_fib_started(sym, direction=args.direction, note=note)
+    elif args.execute:
+        print(f"{DIM}Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID){RESET}")
 
     # If a same-side position is already open, adopt it and show the live table
     if args.execute:
@@ -2431,6 +2534,9 @@ def run(args: argparse.Namespace) -> int:
                     )
                     meta = get_position_meta(sym, state.is_long, hedge, api, sec, args.recv_window)
                     upnl = float(meta.get("unrealized_pnl") or 0)
+                    state.last_upnl = upnl
+                    state.last_notional = float(meta.get("notional") or (qty * entry))
+                    state.last_leverage = int(meta.get("leverage") or 0)
                     open_idxs, filled_idxs = sync_grid_level_status(
                         sym, state, api, sec, args.recv_window,
                     )
@@ -2531,6 +2637,9 @@ def run(args: argparse.Namespace) -> int:
                     except Exception as exc:
                         print(f"{RED}Arm cycle failed: {exc}{RESET}")
                         append_journal(sym, f"ERROR arm {exc}")
+                        tg = _tg()
+                        if tg is not None:
+                            tg.notify_fib_error(sym, f"arm: {exc}")
                         if args.execute:
                             cancel_our_grid(sym, api, sec, args.recv_window)
                             cancel_our_exits(sym, api, sec, args.recv_window)
@@ -2667,12 +2776,22 @@ def flatten_and_exit(args: argparse.Namespace) -> int:
     n_e = cancel_our_exits(sym, api, sec, args.recv_window)
     print(f"Cancelled grid={n_g} exits={n_e}")
     for is_long in (True, False):
-        qty, _ = get_position(sym, is_long, hedge, api, sec, args.recv_window)
+        qty, entry = get_position(sym, is_long, hedge, api, sec, args.recv_window)
         if qty > 0:
+            meta = get_position_meta(sym, is_long, hedge, api, sec, args.recv_window)
             filt = load_symbol_filters(sym)
             market_close_position(sym, is_long, qty, hedge, filt, api, sec, args.recv_window)
-            print(f"{GREEN}Flattened {'LONG' if is_long else 'SHORT'} {qty:g}{RESET}")
-            append_journal(sym, f"FLATTEN {'LONG' if is_long else 'SHORT'} qty={qty:g}")
+            side = "LONG" if is_long else "SHORT"
+            print(f"{GREEN}Flattened {side} {qty:g}{RESET}")
+            append_journal(sym, f"FLATTEN {side} qty={qty:g}")
+            tg = _tg()
+            if tg is not None:
+                tg.notify_fib_closed(
+                    sym, side,
+                    vol_usdt=float(meta.get("notional") or (qty * entry)),
+                    leverage=int(meta.get("leverage") or 0) or None,
+                    pnl_usdt=float(meta.get("unrealized_pnl") or 0),
+                )
     return 0
 
 
