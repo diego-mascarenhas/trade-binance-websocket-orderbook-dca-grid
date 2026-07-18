@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Short wrapper: fib SYMBOL [long|short|auto] [extra flags...]
+# Defaults = micro-grid fib (1m, arm 0–0.236, wait-pullback, protect-trail ON)
+set -euo pipefail
+
+# Resolve symlinks so PATH installs (e.g. ~/bin/fib → repo/fib) find the repo.
+_SRC="${BASH_SOURCE[0]}"
+while [[ -L "$_SRC" ]]; do
+  _DIR="$(cd "$(dirname "$_SRC")" && pwd)"
+  _SRC="$(readlink "$_SRC")"
+  [[ "$_SRC" != /* ]] && _SRC="$_DIR/$_SRC"
+done
+ROOT="$(cd "$(dirname "$_SRC")" && pwd)"
+cd "$ROOT"
+
+usage() {
+    echo "Usage: fib SYMBOL [long|short|auto] [flags...]"
+    echo "  fib LTCUSDT                 # AUTO (default micro-grid)"
+    echo "  fib SKLUSDT short           # fixed SHORT"
+    echo "  fib LDOUSDT long --entry-usdt 50"
+    echo "  fib LTCUSDT --dry-run"
+    echo "  fib LDOUSDT --flatten       # cancel grid/exits + close"
+    exit 1
+}
+
+[[ $# -lt 1 ]] && usage
+
+SYMBOL="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+shift
+
+DIRECTION=""
+if [[ $# -gt 0 ]]; then
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        long | short | auto)
+            DIRECTION="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+            shift
+            ;;
+    esac
+fi
+
+ARGS=("$SYMBOL")
+if [[ -n "$DIRECTION" ]]; then
+    ARGS+=(--direction "$DIRECTION")
+fi
+ARGS+=("$@")
+
+exec python3 -u "$ROOT/orderbook_micro_grid.py" "${ARGS[@]}"

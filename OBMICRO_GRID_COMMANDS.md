@@ -1,6 +1,9 @@
-# Micro-grid (`./obmicro-grid`) — cheat sheet
+# Micro-grid (`./fib` / `./obmicro-grid`) — cheat sheet
 
-Wrapper: `./obmicro-grid` → `orderbook_micro_grid.py`  
+Wrappers:
+- `./fib` → short alias (like `./dca`)
+- `./obmicro-grid` → same bot, all flags passed through
+
 Journal: `.run/logs/SYMBOL/micro_grid.log`  
 Stop: `Ctrl+C` (does **not** flatten; use `--flatten` to close)
 
@@ -9,13 +12,16 @@ Stop: `Ctrl+C` (does **not** flatten; use `--flatten` to close)
 ## Quick start
 
 ```bash
+./fib LDOUSDT
+./fib LDOUSDT long
+./fib SKLUSDT short
+./fib LDOUSDT --dry-run
+./fib LDOUSDT --entry-usdt 50
+./fib SKLUSDT short --no-wait-pullback --arm-max-fib 1
+./fib LDOUSDT --flatten
+
+# Equivalent long form:
 ./obmicro-grid LDOUSDT
-./obmicro-grid LDOUSDT --dry-run
-./obmicro-grid LDOUSDT --direction long
-./obmicro-grid LDOUSDT --direction short
-./obmicro-grid LDOUSDT --entry-usdt 50
-./obmicro-grid SKLUSDT --direction short --no-wait-pullback --arm-max-fib 1
-./obmicro-grid LDOUSDT --flatten
 ```
 
 ---

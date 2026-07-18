@@ -3,5 +3,12 @@
 #   ./obmicro-grid LDOUSDT
 # Paper:
 #   ./obmicro-grid LDOUSDT --dry-run
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks so PATH installs find the repo.
+_SRC="${BASH_SOURCE[0]}"
+while [[ -L "$_SRC" ]]; do
+  _DIR="$(cd "$(dirname "$_SRC")" && pwd)"
+  _SRC="$(readlink "$_SRC")"
+  [[ "$_SRC" != /* ]] && _SRC="$_DIR/$_SRC"
+done
+ROOT="$(cd "$(dirname "$_SRC")" && pwd)"
 exec python3 -u "$ROOT/orderbook_micro_grid.py" "$@"
