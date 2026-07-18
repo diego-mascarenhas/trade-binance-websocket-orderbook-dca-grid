@@ -56,8 +56,10 @@ from orderbook_dca_grid import (
     _round_to,
     _signed_request,
     fetch_depth,
+    get_max_leverage,
     get_position,
     get_position_meta,
+    get_symbol_leverage,
     load_env_file,
     load_keys,
     load_symbol_filters,
@@ -122,6 +124,69 @@ def qty_for_notional(notional: float, price: float, filt: dict[str, Decimal]) ->
     while qty_d * Decimal(str(price)) < filt["min_notional"]:
         qty_d += step
     return f"{qty_d:.{qty_dp}f}", float(qty_d)
+
+
+def ensure_symbol_leverage(
+    symbol: str,
+    api: str,
+    sec: str,
+    recv: int,
+    args: argparse.Namespace,
+) -> int:
+    """Set symbol leverage to max (default) or ``--set-leverage``. Returns lev used."""
+    target = 0
+    set_lev = int(getattr(args, "set_leverage", 0) or 0)
+    no_max = bool(getattr(args, "no_max_leverage", False))
+    if set_lev > 0:
+        target = set_lev
+    elif not no_max:
+        try:
+            target = int(get_max_leverage(symbol, api, sec, recv))
+        except Exception as exc:
+            print(f"{YELLOW}Could not read max leverage: {exc}{RESET}")
+            try:
+                return int(get_symbol_leverage(symbol, api, sec, recv))
+            except Exception:
+                return 0
+    if target <= 0:
+        try:
+            return int(get_symbol_leverage(symbol, api, sec, recv))
+        except Exception:
+            return 0
+    try:
+        _signed_request(
+            "POST",
+            "/fapi/v1/leverage",
+            {"symbol": symbol.upper(), "leverage": target},
+            api,
+            sec,
+            recv,
+        )
+        print(f"{DIM}Leverage set to {target}x (max for symbol){RESET}")
+        return target
+    except Exception as exc:
+        print(f"{YELLOW}Set leverage {target}x failed: {exc}{RESET}")
+        try:
+            return int(get_symbol_leverage(symbol, api, sec, recv))
+        except Exception:
+            return target
+
+
+def apply_entry_sizing(args: argparse.Namespace) -> None:
+    """Apply ``--entry-usdt`` as base notional; scale default level size with it."""
+    entry = float(getattr(args, "entry_usdt", 0) or 0)
+    if entry <= 0:
+        return
+    # Detect whether level-size is still the stock default (8) while base was 10
+    level_was_default = abs(float(args.level_size) - 8.0) < 1e-9
+    base_was_default = abs(float(args.base_size) - 10.0) < 1e-9
+    args.base_size = entry
+    if level_was_default and base_was_default:
+        args.level_size = entry * 0.8
+    print(
+        f"{DIM}Entry sizing: base {args.base_size:g}U · level {args.level_size:g}U "
+        f"(notional; margin ≈ notional ÷ leverage){RESET}"
+    )
 
 
 def grid_cid(symbol: str, idx: int) -> str:
@@ -821,7 +886,7 @@ def build_grid_plan(
     )
 
 
-def render_plan(symbol: str, plan: GridPlan) -> str:
+def render_plan(symbol: str, plan: GridPlan, *, include_ladder: bool = True) -> str:
     side = "LONG" if plan.is_long else "SHORT"
     color = GREEN if plan.is_long else RED
     mode = plan.mode.upper()
@@ -837,16 +902,17 @@ def render_plan(symbol: str, plan: GridPlan) -> str:
     lines.append(
         f"{DIM}TP: 1st fill @ swing max · later fills avg+tp% (or --tp-mode swing = always max){RESET}"
     )
-    lines.extend(
-        render_ladder_lines(
-            plan,
-            mark=plan.entry,
-            tp_price=plan.tp_price,
-            sl_price=plan.sl_price,
+    if include_ladder:
+        lines.extend(
+            render_ladder_lines(
+                plan,
+                mark=plan.entry,
+                tp_price=plan.tp_price,
+                sl_price=plan.sl_price,
+            )
         )
-    )
-    if plan.mode == "fib" and plan.swing is not None:
-        lines.append(f"{DIM}(LIMIT only on GRID rows · TP/SL armed after first fill){RESET}")
+        if plan.mode == "fib" and plan.swing is not None:
+            lines.append(f"{DIM}(LIMIT only on GRID rows · TP/SL armed after first fill){RESET}")
     return "\n".join(lines)
 
 
@@ -860,10 +926,14 @@ def render_ladder_lines(
     qty: float | None = None,
     upnl: float | None = None,
     status: str = "",
+    open_level_idxs: set[int] | None = None,
+    filled_level_idxs: set[int] | None = None,
 ) -> list[str]:
     """Fib/step ladder with MARK (and optional ENTRY) inserted in price order."""
     tp_px = float(tp_price if tp_price is not None else plan.tp_price)
     sl_px = float(sl_price if sl_price is not None else plan.sl_price)
+    open_idxs = open_level_idxs or set()
+    filled_idxs = filled_level_idxs or set()
 
     if plan.mode == "fib" and plan.swing is not None:
         swing = plan.swing
@@ -875,10 +945,10 @@ def render_ladder_lines(
         ladder_ratios = (0.0, *FIB_RETRACES)
         lines = [
             "",
-            f"{'LEVEL':<14} {'ROLE':<10} {'PRICE':>14} {'Δ mark':>9} {'LIMIT':>18}",
+            f"{'LEVEL':<14} {'ROLE':<10} {'PRICE':>14} {'Δ mark':>9} {'USDT':>18}",
             f"{DIM}{'-' * 70}{RESET}",
         ]
-        # (price, label, role, lim_text, kind) kind: level|mark|entry
+        # (price, label, role, lim_text, kind)
         rows_out: list[tuple[float, str, str, str, str]] = []
         for r in ladder_ratios:
             if plan.is_long:
@@ -893,11 +963,23 @@ def render_ladder_lines(
                 role, label = "GRID", f"Fib {r:.3f}"
             lv = limit_by_r.get(round(r, 3))
             if lv is not None:
-                lim = f"{lv.qty:g} / {lv.size_usdt:.2f}U"
-                role = "LIMIT"
+                usdt = f"{lv.size_usdt:.2f}U"
+                if lv.idx in filled_idxs:
+                    role = "FILLED"
+                    lim = f"{usdt} ✓"
+                    px = lv.price
+                elif lv.idx in open_idxs:
+                    role = "OPEN"
+                    lim = usdt
+                    px = lv.price
+                else:
+                    # Planned rung (not yet synced / not placed)
+                    role = "LIMIT"
+                    lim = usdt
+                    px = lv.price
             elif r <= 0.0:
                 lim = "algo"
-                px = tp_px  # live TP trigger (may equal swing high)
+                px = tp_px
             else:
                 lim = "—"
             rows_out.append((px, label, role, lim, "level"))
@@ -905,7 +987,10 @@ def render_ladder_lines(
         rows_out.append((sl_px, "SL", "SL", "algo", "level"))
 
         if entry is not None and entry > 0:
-            ent_lim = f"qty={qty:g}" if qty and qty > 0 else ""
+            if qty and qty > 0:
+                ent_lim = f"{qty * entry:.2f}U"
+            else:
+                ent_lim = ""
             rows_out.append((entry, "▶ ENTRY", "avg", ent_lim, "entry"))
 
         mark_lim = ""
@@ -930,9 +1015,18 @@ def render_ladder_lines(
                     f"{dist:>+8.2f}% {lim:>18}{RESET}"
                 )
             else:
-                role_c = GREEN if role == "TP" else RED if role == "SL" else (
-                    YELLOW if role == "LIMIT" else DIM
-                )
+                if role == "FILLED":
+                    role_c = GREEN
+                elif role == "OPEN":
+                    role_c = YELLOW
+                elif role == "TP":
+                    role_c = GREEN
+                elif role == "SL":
+                    role_c = RED
+                elif role == "LIMIT":
+                    role_c = YELLOW
+                else:
+                    role_c = DIM
                 lines.append(
                     f"{label:<14} {role_c}{role:<10}{RESET} {price_fmt(px):>14} "
                     f"{dist:>+8.2f}% {lim:>18}"
@@ -947,19 +1041,55 @@ def render_ladder_lines(
     # step mode
     lines = [
         "",
-        f"{'ORDER':<12} {'QTY':>12} {'PRICE':>14} {'Δ%':>8} {'USDT':>10}",
+        f"{'ORDER':<12} {'ROLE':>8} {'PRICE':>14} {'Δ%':>8} {'USDT':>10}",
         f"{DIM}{'-' * 60}{RESET}",
     ]
     for lv in plan.levels:
+        if lv.idx in filled_idxs:
+            role = "FILLED"
+        elif lv.idx in open_idxs:
+            role = "OPEN"
+        else:
+            role = "LIMIT"
         lines.append(
-            f"{lv.name:<12} {lv.qty:>12g} {price_fmt(lv.price):>14} "
-            f"{lv.dist_pct:>+7.2f}% {lv.size_usdt:>10.2f}"
+            f"{lv.name:<12} {role:>8} {price_fmt(lv.price):>14} "
+            f"{lv.dist_pct:>+7.2f}% {lv.size_usdt:>9.2f}U"
         )
     lines.append(
-        f"{CYAN}{'▶ MARK':<12} {'':>12} {price_fmt(mark):>14} "
+        f"{CYAN}{'▶ MARK':<12} {'live':>8} {price_fmt(mark):>14} "
         f"{'0.00':>+7}% {'':>10}{RESET}"
     )
     return lines
+
+
+def sync_grid_level_status(
+    symbol: str,
+    state: "CycleState",
+    api: str,
+    sec: str,
+    recv: int,
+) -> tuple[set[int], set[int]]:
+    """Return (open_idxs, filled_idxs) from live exchange open orders."""
+    if state.plan is None:
+        return set(), set()
+    open_cids = {
+        _order_cid(o)
+        for o in list_open_orders(symbol, api, sec, recv)
+        if _order_cid(o).startswith(GRID_PREFIX)
+    }
+    open_idxs: set[int] = set()
+    filled_idxs: set[int] = set()
+    for lv in state.plan.levels:
+        cid = grid_cid(symbol, lv.idx)
+        if cid in open_cids:
+            open_idxs.add(lv.idx)
+            state.filled_levels.discard(lv.idx)
+        else:
+            # Missing from book: filled (or cancelled). Treat as filled once armed/active.
+            if state.active or state.pending or lv.idx in state.filled_levels:
+                filled_idxs.add(lv.idx)
+                state.filled_levels.add(lv.idx)
+    return open_idxs, filled_idxs
 
 
 def render_live_table(
@@ -972,6 +1102,8 @@ def render_live_table(
     upnl: float | None = None,
     open_limits: int | None = None,
     age_sec: float | None = None,
+    open_level_idxs: set[int] | None = None,
+    filled_level_idxs: set[int] | None = None,
 ) -> list[str]:
     """Live ladder (same columns) with MARK/ENTRY in price order."""
     plan = state.plan
@@ -979,22 +1111,28 @@ def render_live_table(
         return []
     side = "LONG" if state.is_long else "SHORT"
     color = GREEN if state.is_long else RED
+    n_open = len(open_level_idxs) if open_level_idxs is not None else open_limits
+    n_fill = len(filled_level_idxs) if filled_level_idxs is not None else 0
     if state.pending:
         head = (
             f"{DIM}PENDING {color}{side}{RESET}{DIM} · {symbol.upper()} · "
-            f"mid {price_fmt(mark)} · limits={open_limits if open_limits is not None else '?'} · "
-            f"age={age_sec:.0f}s{RESET}" if age_sec is not None else
+            f"mid {price_fmt(mark)} · open={n_open if n_open is not None else '?'} "
+            f"filled={n_fill} · age={age_sec:.0f}s{RESET}"
+            if age_sec is not None else
             f"{DIM}PENDING {color}{side}{RESET}{DIM} · {symbol.upper()} · mid {price_fmt(mark)}{RESET}"
         )
-        status = f"lim={open_limits}" if open_limits is not None else "wait"
+        status = f"open={n_open}" if n_open is not None else "wait"
         body = render_ladder_lines(
             plan, mark=mark, tp_price=state.tp, sl_price=state.sl, status=status,
+            open_level_idxs=open_level_idxs, filled_level_idxs=filled_level_idxs,
         )
     else:
+        notional = (qty * entry) if qty > 0 and entry > 0 else 0.0
         head = (
-            f"{color}{side}{RESET} {symbol.upper()} · qty={qty:g} · "
+            f"{color}{side}{RESET} {symbol.upper()} · {notional:.2f}U · "
             f"entry {price_fmt(entry)} · mid {price_fmt(mark)}"
             + (f" · uPnL={upnl:+.4f}" if upnl is not None else "")
+            + (f" · filled={n_fill} open={n_open if n_open is not None else 0}" if plan.levels else "")
         )
         body = render_ladder_lines(
             plan,
@@ -1004,6 +1142,8 @@ def render_live_table(
             entry=entry if entry > 0 else None,
             qty=qty if qty > 0 else None,
             upnl=upnl,
+            open_level_idxs=open_level_idxs,
+            filled_level_idxs=filled_level_idxs,
         )
     return [head, *body]
 
@@ -1111,9 +1251,6 @@ def place_grid_limits(
             params["positionSide"] = "LONG" if plan.is_long else "SHORT"
         try:
             _signed_request("POST", "/fapi/v1/order", params, api, sec, recv)
-            print(
-                f"{GREEN}✓ {lv.name} LIMIT {side} {params['quantity']} @ {params['price']}{RESET}"
-            )
             placed += 1
         except Exception as exc:
             print(f"{RED}✗ {lv.name} failed: {exc}{RESET}")
@@ -1303,7 +1440,8 @@ def arm_cycle(
     args: argparse.Namespace | None = None,
 ) -> CycleState:
     """Arm full LIMIT grid (+ optional market base). TP/SL only after first fill when waiting."""
-    print(render_plan(symbol, plan))
+    # Wait-pullback: header only — live ladder is the single table (avoids duplicate).
+    print(render_plan(symbol, plan, include_ladder=not wait_pullback))
     append_journal(
         symbol,
         f"PLAN {plan.mode} {'LONG' if plan.is_long else 'SHORT'} mark={plan.entry:.8g} "
@@ -1324,14 +1462,11 @@ def arm_cycle(
     cancel_our_exits(symbol, api, sec, recv)
 
     if wait_pullback:
-        print(f"{BOLD}Arming pullback grid ({len(plan.levels)} LIMITs) — no MARKET…{RESET}")
         n = place_grid_limits(symbol, plan, filt, hedge, api, sec, recv)
         append_journal(symbol, f"ARM grid={n}/{len(plan.levels)} wait_pullback")
-        print(
-            f"{CYAN}Waiting for fill · 1st TP @ swing max {price_fmt(plan.tp_price)} "
-            f"· then avg±tp% · SL {price_fmt(plan.sl_price)}{RESET}"
-        )
-        return CycleState(
+        if n < len(plan.levels):
+            print(f"{YELLOW}Armed {n}/{len(plan.levels)} LIMITs (some failed){RESET}")
+        state = CycleState(
             active=False,
             pending=True,
             exits_armed=False,
@@ -1347,6 +1482,19 @@ def arm_cycle(
                 plan.swing.low if plan.swing else 0.0
             ),
         )
+        print_live_table(
+            state,
+            render_live_table(
+                symbol, state, mark,
+                open_limits=n, age_sec=0.0,
+                open_level_idxs=sync_grid_level_status(
+                    symbol, state, api, sec, recv,
+                )[0],
+                filled_level_idxs=set(),
+            ),
+            force=True,
+        )
+        return state
 
     # Legacy chase path: MARKET base then grid + exits
     qty_str, _ = qty_for_notional(plan.base_usdt, plan.entry, filt)
@@ -1591,16 +1739,15 @@ def tick_pending(
 
     if qty <= 0:
         try_raise_pending_top(symbol, state, mark, filt, hedge, api, sec, recv, args)
-        open_n = sum(
-            1 for o in list_open_orders(symbol, api, sec, recv)
-            if _order_cid(o).startswith(GRID_PREFIX)
-        )
+        open_idxs, filled_idxs = sync_grid_level_status(symbol, state, api, sec, recv)
         print_live_table(
             state,
             render_live_table(
                 symbol, state, mark,
-                open_limits=open_n,
+                open_limits=len(open_idxs),
                 age_sec=age,
+                open_level_idxs=open_idxs,
+                filled_level_idxs=filled_idxs,
             ),
         )
         return
@@ -1785,6 +1932,9 @@ def mid_from_depth(depth: dict) -> float:
 
 def run(args: argparse.Namespace) -> int:
     load_env_file(args.env_file)
+    if getattr(args, "dry_run", False):
+        args.execute = False
+    apply_entry_sizing(args)
     sym = args.symbol.upper()
     api, sec = load_keys(args.env_file)
     if args.execute and (not api or not sec):
@@ -1793,8 +1943,10 @@ def run(args: argparse.Namespace) -> int:
 
     filt = load_symbol_filters(sym)
     hedge = False
+    lev = 0
     if args.execute:
         hedge = _resolve_hedge(args, api, sec)
+        lev = ensure_symbol_leverage(sym, api, sec, args.recv_window, args)
 
     sig_cfg = SignalConfig(
         imb_long=args.imb_long,
@@ -1808,6 +1960,9 @@ def run(args: argparse.Namespace) -> int:
     cooldown_until = 0.0
 
     mode = f"{GREEN}EXECUTE{RESET}" if args.execute else f"{YELLOW}DRY-RUN{RESET}"
+    margin_hint = ""
+    if lev > 0 and args.base_size > 0:
+        margin_hint = f" · lev {lev}x · margin~{args.base_size / lev:.2f}U"
     print(
         f"{BOLD}{CYAN}Micro-grid{RESET} {sym}  {mode}\n"
         f"{DIM}grid={args.grid_mode} · fib {args.fib_interval} minΔ{args.fib_min_range:g}% · "
@@ -1817,7 +1972,8 @@ def run(args: argparse.Namespace) -> int:
         f"raise_top={'ON' if args.raise_top else 'OFF'} "
         f"arm≤{args.arm_timeout_sec:g}s · "
         f"bar {args.bar_sec:g}s · levels {args.levels} · "
-        f"base {args.base_size:g} · level {args.level_size:g} USDT · "
+        f"base {args.base_size:g} · level {args.level_size:g} USDT"
+        f"{margin_hint} · "
         f"TP={args.tp_mode}+{args.tp_pct:g}% · SL {args.sl_pct:g}% · "
         f"sweep={'ON' if args.sweep else 'OFF'} · "
         f"dir={args.direction}{RESET}\n"
@@ -1825,7 +1981,8 @@ def run(args: argparse.Namespace) -> int:
     )
     append_journal(
         sym,
-        f"START mode={args.grid_mode} bar={args.bar_sec} levels={args.levels} execute={int(args.execute)}",
+        f"START mode={args.grid_mode} bar={args.bar_sec} levels={args.levels} "
+        f"execute={int(args.execute)} lev={lev} base={args.base_size:g}",
     )
 
     builder.start_bar(time.time())
@@ -1863,11 +2020,16 @@ def run(args: argparse.Namespace) -> int:
                     )
                     meta = get_position_meta(sym, state.is_long, hedge, api, sec, args.recv_window)
                     upnl = float(meta.get("unrealized_pnl") or 0)
+                    open_idxs, filled_idxs = sync_grid_level_status(
+                        sym, state, api, sec, args.recv_window,
+                    )
                     print_live_table(
                         state,
                         render_live_table(
                             sym, state, mark,
                             qty=qty, entry=entry, upnl=upnl,
+                            open_level_idxs=open_idxs,
+                            filled_level_idxs=filled_idxs,
                         ),
                     )
 
@@ -1885,17 +2047,45 @@ def run(args: argparse.Namespace) -> int:
                     direction = entry_signal(bar, sig_cfg)
 
                 if direction:
-                    # Refuse if already exposed (other bot)
+                    is_long = direction == "long"
+                    # Refuse only if THIS side is already open.
+                    # In hedge mode the opposite side may stay open (inverse OK).
                     if args.execute:
-                        ql, _ = get_position(sym, True, hedge, api, sec, args.recv_window)
-                        qs, _ = get_position(sym, False, hedge, api, sec, args.recv_window)
-                        if ql > 0 or qs > 0:
-                            print(f"{YELLOW}Skip — existing position on {sym}{RESET}")
+                        q_same, _ = get_position(
+                            sym, is_long, hedge, api, sec, args.recv_window,
+                        )
+                        if q_same > 0:
+                            print(
+                                f"{YELLOW}Skip — existing "
+                                f"{'LONG' if is_long else 'SHORT'} on {sym}{RESET}"
+                            )
                             builder.reset_after_bar(time.time())
                             time.sleep(args.sample_sec)
                             continue
+                        if hedge:
+                            q_opp, _ = get_position(
+                                sym, not is_long, hedge, api, sec, args.recv_window,
+                            )
+                            if q_opp > 0:
+                                print(
+                                    f"{DIM}Hedge: opposite "
+                                    f"{'LONG' if not is_long else 'SHORT'} "
+                                    f"qty={q_opp:g} stays open{RESET}"
+                                )
+                        else:
+                            # One-way: any exposure on the other side still blocks
+                            q_opp, _ = get_position(
+                                sym, not is_long, hedge, api, sec, args.recv_window,
+                            )
+                            if q_opp > 0:
+                                print(
+                                    f"{YELLOW}Skip — existing position on {sym} "
+                                    f"(one-way){RESET}"
+                                )
+                                builder.reset_after_bar(time.time())
+                                time.sleep(args.sample_sec)
+                                continue
 
-                    is_long = direction == "long"
                     print(
                         f"\n{CYAN}Signal {direction.upper()} "
                         f"imb={bar.imbalance:.3f} Δ={bar.mid_change_pct():+.3f}%{RESET}"
@@ -1907,6 +2097,10 @@ def run(args: argparse.Namespace) -> int:
                         continue
                     wait = bool(args.wait_pullback) and plan.mode == "fib"
                     try:
+                        if args.execute:
+                            ensure_symbol_leverage(
+                                sym, api, sec, args.recv_window, args,
+                            )
                         state = arm_cycle(
                             sym, plan, mark, filt, hedge, api, sec, args.recv_window,
                             dry_run=not args.execute,
@@ -1990,8 +2184,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--levels", type=int, default=_env_int("OB_MG_LEVELS", 4))
     p.add_argument("--step-pct", type=float, default=_env_float("OB_MG_STEP_PCT", 0.08),
                    help="Only for --grid-mode step")
-    p.add_argument("--base-size", type=float, default=_env_float("OB_MG_BASE_SIZE", 10.0))
-    p.add_argument("--level-size", type=float, default=_env_float("OB_MG_LEVEL_SIZE", 8.0))
+    p.add_argument("--entry-usdt", type=float, default=_env_float("OB_MG_ENTRY_USDT", 0.0),
+                   help="Entry notional USDT (sets --base-size; uses max leverage by default)")
+    p.add_argument("--base-size", type=float, default=_env_float("OB_MG_BASE_SIZE", 10.0),
+                   help="First rung notional USDT (overridden by --entry-usdt)")
+    p.add_argument("--level-size", type=float, default=_env_float("OB_MG_LEVEL_SIZE", 8.0),
+                   help="Deeper rung notional USDT")
+    p.add_argument("--set-leverage", type=int, default=_env_int("OB_MG_SET_LEVERAGE", 0),
+                   help="Force leverage (0 = use symbol max)")
+    p.add_argument("--no-max-leverage", action="store_true",
+                   default=_env_bool("OB_MG_NO_MAX_LEVERAGE", False),
+                   help="Do not raise leverage to symbol max before arming")
     p.add_argument("--tp-mode", choices=("avg", "swing"),
                    default=(os.getenv("OB_MG_TP_MODE", TP_MODE_DEFAULT).strip().lower() or TP_MODE_DEFAULT),
                    help="TP: avg=1st fill @ swing max then avg+tp%% (default); swing=always impulse extreme")
