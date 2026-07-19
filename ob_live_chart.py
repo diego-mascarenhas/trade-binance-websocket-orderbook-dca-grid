@@ -192,12 +192,25 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       overflow: hidden;
     }
     #profile .ph {
-      padding: 8px 8px 4px;
+      padding: 8px 8px 2px;
       font-size: 0.65rem;
       letter-spacing: 0.08em;
       text-transform: uppercase;
       color: var(--muted);
       flex: 0 0 auto;
+    }
+    #profile .ph-book {
+      padding: 0 8px 6px;
+      font-size: 0.62rem;
+      letter-spacing: 0.02em;
+      text-transform: none;
+      color: var(--muted);
+      flex: 0 0 auto;
+      line-height: 1.3;
+      min-height: 1.1em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     #profileLadder {
       flex: 1 1 auto;
@@ -312,6 +325,53 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       line-height: 1.45;
     }
     .pos-box.empty { color: var(--muted); }
+    .pos-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .pos-head h2 { margin: 14px 0 8px; }
+    .btn-close {
+      margin-top: 6px;
+      padding: 4px 10px;
+      border: 1px solid #f8514988;
+      border-radius: 4px;
+      background: #2a1214;
+      color: var(--ask);
+      font: inherit;
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .btn-close:hover { border-color: #f85149; background: #3d1518; }
+    .btn-close:disabled { opacity: 0.45; cursor: wait; }
+    .btn-close[hidden] { display: none; }
+    .pos-actions { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+    .pos-actions .btn-close { margin-top: 0; }
+    .btn-live {
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #161b22;
+      color: var(--muted);
+      font: inherit;
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .btn-live:hover { border-color: #58a6ff88; }
+    .btn-live.on {
+      border-color: #f8514988;
+      background: #2a1214;
+      color: var(--ask);
+    }
+    .btn-live.on:hover { border-color: #f85149; background: #3d1518; }
+    .btn-live:disabled { opacity: 0.45; cursor: wait; }
     #trades td { font-size: 0.65rem; }
     .win { color: var(--bid); }
     .loss { color: var(--ask); }
@@ -339,13 +399,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div id="chart"></div>
     </div>
     <div id="profile">
-      <div class="ph">Depth · USDT <span id="bookPh" style="text-transform:none;letter-spacing:0"></span></div>
+      <div class="ph">Depth · USDT</div>
+      <div class="ph-book" id="bookPh">—</div>
       <div id="profileLadder"></div>
     </div>
     <aside>
       <h2>Session PnL (paper)</h2>
       <div class="pos-box empty" id="sessionBox">no closed trades yet</div>
-      <h2>Position</h2>
+      <div class="pos-head">
+        <h2>Position</h2>
+        <div class="pos-actions">
+          <button type="button" class="btn-live" id="btnLive" title="Toggle LIVE orders">LIVE</button>
+          <button type="button" class="btn-close" id="btnClose" hidden>Close</button>
+        </div>
+      </div>
       <div class="pos-box empty" id="paperPos">flat — waiting for wall bounce</div>
       <h2>Live position</h2>
       <div class="pos-box empty" id="livePos">—</div>
@@ -460,6 +527,66 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         console.warn("filter toggle failed", e);
       }
     }
+    let closing = false;
+    async function closePosition() {
+      const btn = document.getElementById("btnClose");
+      if (closing) return;
+      closing = true;
+      if (btn) btn.disabled = true;
+      try {
+        const r = await fetch("/api/close", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) throw new Error(data.error || ("HTTP " + r.status));
+      } catch (e) {
+        console.warn("close failed", e);
+        alert("Close failed: " + (e.message || e));
+      } finally {
+        closing = false;
+        if (btn) btn.disabled = false;
+      }
+    }
+    const btnCloseEl = document.getElementById("btnClose");
+    if (btnCloseEl) btnCloseEl.addEventListener("click", closePosition);
+    let togglingLive = false;
+    function syncLiveBtn(dryRun) {
+      const btn = document.getElementById("btnLive");
+      if (!btn || togglingLive) return;
+      const live = !dryRun;
+      btn.classList.toggle("on", live);
+      btn.textContent = live ? "LIVE" : "PAPER";
+      btn.title = live
+        ? "LIVE on — click for paper only"
+        : "Paper only — click to enable LIVE orders";
+    }
+    async function toggleLive() {
+      const btn = document.getElementById("btnLive");
+      if (togglingLive || !btn) return;
+      const nextLive = !btn.classList.contains("on");
+      togglingLive = true;
+      btn.disabled = true;
+      try {
+        const r = await fetch("/api/live", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: nextLive }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) throw new Error(data.error || ("HTTP " + r.status));
+        syncLiveBtn(!!data.dry_run);
+      } catch (e) {
+        console.warn("live toggle failed", e);
+        alert("LIVE toggle failed: " + (e.message || e));
+      } finally {
+        togglingLive = false;
+        btn.disabled = false;
+      }
+    }
+    const btnLiveEl = document.getElementById("btnLive");
+    if (btnLiveEl) btnLiveEl.addEventListener("click", toggleLive);
     const filterBarEl = document.getElementById("filterBar");
     if (filterBarEl) {
       filterBarEl.addEventListener("click", (ev) => {
@@ -557,9 +684,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         bookPill.title = (book.detail || "") + (book.trend ? (" · " + book.trend) : "");
         if (bookPh) {
           bookPh.textContent = bookLbl !== "—"
-            ? (" · " + bookLbl + " " + bp.toFixed(0) + "% bid  " + (book.trend || ""))
-            : "";
-          bookPh.className = bookLbl === "bid-heavy" ? "bid" : (bookLbl === "ask-heavy" ? "ask" : "meta");
+            ? (bookLbl + " " + bp.toFixed(0) + "% bid " + (book.trend || "")).trim()
+            : "—";
+          bookPh.className = "ph-book " + (
+            bookLbl === "bid-heavy" ? "bid" : (bookLbl === "ask-heavy" ? "ask" : "meta")
+          );
         }
 
         const conf = s.confidence || {};
@@ -614,6 +743,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           modeEl.className = "ask";
           modePill.className = "pill off";
         }
+        syncLiveBtn(!!s.dry_run);
         const sessBox = document.getElementById("sessionBox");
         const n = sess.trades || 0;
         const feeSrc = sess.fee_source === "binance"
@@ -647,6 +777,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         const paper = s.paper || {};
         const paperBox = document.getElementById("paperPos");
+        const btnClose = document.getElementById("btnClose");
+        if (btnClose && !closing) btnClose.hidden = !paper.side;
         if (paper.side) {
           const pnl = paper.pnl_pct;
           const pnlCls = pnl >= 0 ? "win" : "loss";
@@ -654,11 +786,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           const peak = paper.peak_pnl_pct != null ? paper.peak_pnl_pct : pnl;
           const beOn = !!paper.be_locked;
           const dcaN = paper.dca_count != null ? Number(paper.dca_count) : 0;
-          const feeRt = Number(s.session && s.session.fee_rt_pct != null ? s.session.fee_rt_pct : 0.1);
-          const needFee = feeRt * (2 + dcaN) / 2;
+          const beNeed = Number(paper.be_need_pct != null ? paper.be_need_pct : 0.04);
           const beLine = beOn
             ? `<span class="win">BE LOCKED</span> @ ${fmt(paper.entry, pd)}`
-            : `<span class="meta">BE pending</span> (need ~+${Math.max(0, needFee - pnl).toFixed(3)}% more / fees)`;
+            : `<span class="meta">BE pending</span> (need ~+${Math.max(0, beNeed - pnl).toFixed(3)}% more)`;
           const src = paper.source === "live" ? "LIVE" : "paper";
           const qtyBit = paper.qty ? ` · qty ${fmt(paper.qty, 4)}` : "";
           const dcaBit = dcaN > 0
@@ -1025,7 +1156,7 @@ class BookState:
         self.conf_filter = True
         self.ratio_filter = min_wall_ratio > 0
         self.dca_enabled = True
-        self.dca_max = 3
+        self.dca_max = 8
         self.dca_min_loss_pct = 0.05  # only DCA after this unrealized loss %%
         # When fee-covered: snap TP to nearest opposite OB and close on touch
         self.ob_tp_exit = True
@@ -1131,6 +1262,68 @@ class BookState:
             raise KeyError(f"unknown filter {fid}")
         setattr(self, key, bool(enabled))
         return self.filter_flags()
+
+    def manual_close(self) -> dict[str, Any]:
+        """Market-close open position from the UI (paper or LIVE)."""
+        if not self._paper:
+            return {"ok": False, "error": "no open position"}
+        mid = float((self._snapshot or {}).get("mid") or 0)
+        if mid <= 0 and self._trail:
+            mid = float(self._trail[-1]["mid"])
+        if mid <= 0:
+            mid = float(self._paper.get("entry") or 0)
+        if mid <= 0:
+            return {"ok": False, "error": "no mark price"}
+        now = time.time()
+        self._close_paper(mid, now, "manual")
+        if self._paper is not None:
+            return {
+                "ok": False,
+                "error": self._last_order_error or "close failed",
+            }
+        with self._lock:
+            self._snapshot["paper"] = {}
+            self._snapshot["trades"] = list(self._trades)
+            self._snapshot["markers"] = list(self._markers)
+            self._snapshot["session"] = self._session_view(0.0)
+            self._snapshot["signal"] = self._signal
+            self._snapshot["block_reason"] = self._block_reason
+        return {"ok": True, "why": "manual", "mark": mid}
+
+    def set_live(self, enabled: bool) -> dict[str, Any]:
+        """Toggle LIVE market orders vs paper-only. Blocked while in a position."""
+        if self._paper:
+            return {"ok": False, "error": "close position before switching mode"}
+        want_live = bool(enabled)
+        if want_live:
+            if not self.api_key or not self.api_secret:
+                return {"ok": False, "error": "API keys required for LIVE (.env)"}
+            if self.filt is None:
+                try:
+                    from orderbook_dca_grid import _resolve_hedge, load_symbol_filters
+
+                    self.filt = load_symbol_filters(self.symbol)
+                    ns = argparse.Namespace(
+                        position_mode="auto", recv_window=self.recv_window
+                    )
+                    self.hedge = _resolve_hedge(ns, self.api_key, self.api_secret)
+                except Exception as exc:  # noqa: BLE001
+                    return {"ok": False, "error": f"live setup failed: {exc}"}
+            self.dry_run = False
+            self.live_enabled = True
+            print(f"MODE → LIVE {self.symbol}", flush=True)
+        else:
+            self.dry_run = True
+            self.live_enabled = bool(self.api_key and self.api_secret)
+            print(f"MODE → PAPER {self.symbol}", flush=True)
+        with self._lock:
+            self._snapshot["dry_run"] = self.dry_run
+            self._snapshot["live_enabled"] = self.live_enabled
+        return {
+            "ok": True,
+            "live": not self.dry_run,
+            "dry_run": self.dry_run,
+        }
 
     def filter_flags(self) -> dict[str, bool]:
         return {
@@ -2003,13 +2196,17 @@ class BookState:
         if len(self._markers) > 80:
             self._markers = self._markers[-80:]
         self._paper = None
-        # Shorter pause after SL so the bot can re-arm; longer after wins
+        # After SL: longer cooldown + force PAPER (no auto LIVE re-entry)
         cd = self.cooldown_sec
         if why == "sl":
-            cd = max(cd, 12.0)  # after a stop, wait longer before re-entry
+            cd = max(cd, 12.0)
         self._cooldown_until = now + cd
         self._signal = "flat"
-        self._block_reason = f"cooldown {cd:g}s after {why}"
+        if why == "sl" and not self.dry_run:
+            self.set_live(False)
+            self._block_reason = f"cooldown {cd:g}s after sl · LIVE→PAPER"
+        else:
+            self._block_reason = f"cooldown {cd:g}s after {why}"
 
     def _next_dca_wall(
         self,
@@ -2233,13 +2430,14 @@ class BookState:
         min_sl = self._min_sl_dist_pct()
         be_buf = max(0.0, self.be_buffer_pct)
 
-        # Soft exits after fees (scale with DCA); BE needs extra cushion
+        # Soft exits wait for fees; BE locks early once slightly green (after grace)
         fee_need = self._fee_cover_need(pos)
         soft_arm_need = max(self.min_lock_pct, fee_need if self.net_exits else 0.0)
-        be_arm_need = soft_arm_need + be_buf + max(0.02, self.fee_rt_pct * 0.5)
+        be_arm_need = max(self.min_lock_pct, be_buf)
         if pnl >= soft_arm_need:
             pos["armed"] = True
         be_ready = (not in_grace) and pnl >= be_arm_need
+        pos["be_need_pct"] = be_arm_need
         pos["be_locked"] = False
         fee_covered = pnl >= fee_need
 
@@ -3068,6 +3266,31 @@ def make_handler(state: BookState, ui_poll_ms: int):
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
+            if path == "/api/close":
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    if n > 0:
+                        self.rfile.read(n)
+                    result = state.manual_close()
+                    self._json(200 if result.get("ok") else 400, result)
+                except Exception as exc:  # noqa: BLE001
+                    self._json(500, {"ok": False, "error": str(exc)})
+                return
+            if path == "/api/live":
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    raw = self.rfile.read(n) if n > 0 else b"{}"
+                    data = json.loads(raw.decode("utf-8") or "{}")
+                    if "enabled" not in data:
+                        self._json(400, {"ok": False, "error": "missing enabled"})
+                        return
+                    result = state.set_live(bool(data.get("enabled")))
+                    self._json(200 if result.get("ok") else 400, result)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._json(400, {"ok": False, "error": str(exc)})
+                except Exception as exc:  # noqa: BLE001
+                    self._json(500, {"ok": False, "error": str(exc)})
+                return
             if path != "/api/filter":
                 self.send_response(404)
                 self.end_headers()
@@ -3133,7 +3356,7 @@ def main() -> None:
                    help="extra %% beyond fees preferred for opposite wall TP")
     p.add_argument("--min-hold-sec", type=float, default=3.0,
                    help="min seconds in trade before soft exits (flip/rev/give)")
-    p.add_argument("--require-bounce", action=argparse.BooleanOptionalAction, default=False,
+    p.add_argument("--require-bounce", action=argparse.BooleanOptionalAction, default=True,
                    help="enter only after micro-bounce/rejection off the wall")
     p.add_argument("--mom-max-against", type=float, default=0.06,
                    help="block entry if short-term mid mom %% is against side by more than this")
@@ -3141,7 +3364,7 @@ def main() -> None:
                    help="use depth-ladder pressure as micro-trend (block strong opposite stack)")
     p.add_argument("--dca", action=argparse.BooleanOptionalAction, default=True,
                    help="add size on adverse OB walls while in loss; rebase avg + TP/SL")
-    p.add_argument("--dca-max", type=int, default=3, help="max DCA adds per position")
+    p.add_argument("--dca-max", type=int, default=8, help="max DCA adds per position")
     p.add_argument("--dca-min-loss", type=float, default=0.05,
                    help="min unrealized loss %% before first DCA")
     p.add_argument("--ob-tp", action=argparse.BooleanOptionalAction, default=True,
@@ -3149,11 +3372,11 @@ def main() -> None:
     p.add_argument("--net-exits", action=argparse.BooleanOptionalAction, default=True,
                    help="only soft-exit when gross pnl covers fee estimate")
     p.add_argument("--protect-be", action=argparse.BooleanOptionalAction, default=True,
-                   help="once in fee-covered profit, move SL to breakeven")
+                   help="once slightly green (after grace), move SL to breakeven ± buffer")
     p.add_argument("--protect-trail", action=argparse.BooleanOptionalAction, default=True,
                    help="once armed, trail SL under/over peak by --rev-pct")
-    p.add_argument("--ema-filter", action=argparse.BooleanOptionalAction, default=False,
-                   help="hard filter: only long in bullish EMA / short in bearish (off=scalp)")
+    p.add_argument("--ema-filter", action=argparse.BooleanOptionalAction, default=True,
+                   help="hard filter: only long in bullish EMA / short in bearish")
     p.add_argument("--ema-interval", default="1m", help="EMA kline interval")
     p.add_argument("--ema-fast", type=int, default=7)
     p.add_argument("--ema-slow", type=int, default=25)
