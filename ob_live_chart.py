@@ -95,9 +95,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .entry { color: var(--entry); }
     .wrap {
       display: grid;
-      grid-template-columns: 1fr 168px 280px;
+      grid-template-columns: 1fr 168px 380px;
       gap: 0;
       min-height: calc(100vh - 70px);
+    }
+    @media (max-width: 1280px) {
+      .wrap { grid-template-columns: 1fr 150px 320px; }
     }
     @media (max-width: 1100px) {
       .wrap { grid-template-columns: 1fr 150px; }
@@ -182,9 +185,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .pv-row.bid .pv-fill { background: linear-gradient(90deg, #1f6feb, #58a6ff); }
     .pv-row.wall .pv-fill { box-shadow: 0 0 0 1px rgba(255,255,255,0.25) inset; }
     aside {
-      padding: 10px 14px 20px;
+      padding: 10px 16px 20px;
       overflow: auto;
       background: rgba(22, 27, 34, 0.65);
+      min-width: 0;
+    }
+    aside .pos-box {
+      word-break: break-word;
+      line-height: 1.45;
     }
     h2 {
       margin: 14px 0 8px;
@@ -249,6 +257,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <span class="pill"><span class="meta">spread</span> <span id="spread">—</span></span>
     <span class="pill"><span class="meta">imb</span> <span id="imb">—</span></span>
     <span class="pill" id="regimePill"><span class="meta">regime</span> <span id="regime">—</span></span>
+    <span class="pill" id="trendPill"><span class="meta">trend</span> <span id="trend">—</span></span>
+    <span class="pill" id="confPill"><span class="meta">conf</span> <span id="conf">—</span></span>
     <span class="pill" id="sigPill"><span class="meta">signal</span> <span id="signal">FLAT</span></span>
     <span class="pill" id="sessPill"><span class="meta">session</span> <span id="sessNet">—</span></span>
     <span class="pill" id="modePill"><span class="meta">mode</span> <span id="modeLabel">—</span></span>
@@ -268,12 +278,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="pos-box empty" id="paperPos">flat — waiting for wall bounce</div>
       <h2>Live position</h2>
       <div class="pos-box empty" id="livePos">—</div>
+      <h2>Confidence</h2>
+      <div class="pos-box empty" id="confBox">—</div>
       <h2>Imbalance (band)</h2>
       <div class="bar-wrap"><div class="bar-bid" id="imbBid"></div><div class="bar-ask" id="imbAsk"></div></div>
       <div class="meta" style="margin-top:6px" id="imbDetail">—</div>
-      <h2>Recent paper trades</h2>
+      <h2>Recent trades <span class="meta" id="tradesCount"></span></h2>
       <table>
-        <thead><tr><th>side</th><th>exit</th><th>why</th><th>pnl%</th></tr></thead>
+        <thead><tr><th>side</th><th>qty</th><th>exit</th><th>why</th><th>pnl%</th></tr></thead>
         <tbody id="trades"></tbody>
       </table>
     </aside>
@@ -399,6 +411,35 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         regimeEl.textContent = regime.label || "—";
         regimePill.className = "pill " + (regime.tradeable ? "on" : "off");
 
+        const trend = s.trend || {};
+        const trendEl = document.getElementById("trend");
+        const trendPill = document.getElementById("trendPill");
+        trendEl.textContent = trend.label || "—";
+        trendEl.className = trend.label === "bullish" ? "bid" : (trend.label === "bearish" ? "ask" : "");
+        trendPill.className = "pill " + (trend.label === "bullish" || trend.label === "bearish" ? "on" : "");
+        trendPill.title = trend.detail || "";
+
+        const conf = s.confidence || {};
+        const confScore = conf.score != null ? Number(conf.score) : 0;
+        const confMin = conf.min != null ? Number(conf.min) : 0;
+        const confEl = document.getElementById("conf");
+        const confPill = document.getElementById("confPill");
+        confEl.textContent = confScore.toFixed(0) + "/" + confMin.toFixed(0);
+        confEl.className = confScore >= confMin ? "win" : "loss";
+        confPill.className = "pill " + (confScore >= confMin ? "on" : "off");
+        const confBox = document.getElementById("confBox");
+        const parts = conf.parts || {};
+        confBox.className = "pos-box";
+        confBox.innerHTML =
+          `score <strong class="${confScore >= confMin ? "win" : "loss"}">${confScore.toFixed(0)}</strong>` +
+          ` / min ${confMin.toFixed(0)} · side ${conf.side || "—"}<br>` +
+          `<span class="meta">imb ${parts.imb||0} · wall ${parts.wall||0}` +
+          ` · ratio ${parts.ratio||0} · bb ${parts.bb||0}` +
+          ` · ema ${parts.ema||0} · mom ${parts.mom||0} · tp ${parts.tp||0}</span>` +
+          (conf.wall_ratio != null
+            ? `<br><span class="meta">wall× ${Number(conf.wall_ratio).toFixed(2)} · mom ${Number(conf.mom_pct||0).toFixed(3)}%</span>`
+            : "");
+
         const sig = (s.signal || "flat").toUpperCase();
         const sigEl = document.getElementById("signal");
         const sigPill = document.getElementById("sigPill");
@@ -435,16 +476,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const feeSrc = sess.fee_source === "binance"
           ? `Binance ${sess.fee_mode || "taker"} (m ${(Number(sess.maker_pct||0)).toFixed(4)}% · t ${(Number(sess.taker_pct||0)).toFixed(4)}%)`
           : `fallback (no API keys)`;
-        if (n === 0 && !(s.paper && s.paper.side)) {
+        const openN = (s.paper && s.paper.side) ? 1 : 0;
+        const tradesCountEl = document.getElementById("tradesCount");
+        if (tradesCountEl) {
+          tradesCountEl.textContent = n ? `(${n})` : "";
+        }
+        if (n === 0 && !openN) {
           sessBox.className = "pos-box empty";
           sessBox.innerHTML =
-            `no closed trades yet<br><span class="meta">fees ${Number(sess.fee_rt_pct||0).toFixed(4)}%/RT · ${feeSrc}</span>`;
+            `trades <strong>0</strong><br><span class="meta">fees ${Number(sess.fee_rt_pct||0).toFixed(4)}%/RT · ${feeSrc}</span>`;
         } else {
           sessBox.className = "pos-box";
           const u = sess.unrealized_pct || 0;
           const uCls = u >= 0 ? "win" : "loss";
           sessBox.innerHTML =
-            `closed <strong>${n}</strong> · W/L ${sess.wins || 0}/${sess.losses || 0}<br>` +
+            `trades <strong>${n}</strong> closed` +
+            (openN ? ` · <span class="entry">1 open</span>` : "") +
+            ` · W/L ${sess.wins || 0}/${sess.losses || 0}<br>` +
             `gross <span class="${(sess.gross_pct||0) >= 0 ? "win" : "loss"}">${(sess.gross_pct||0) >= 0 ? "+" : ""}${Number(sess.gross_pct||0).toFixed(3)}%</span>` +
             ` · fees −${Number(sess.fees_pct||0).toFixed(3)}%<br>` +
             `net <span class="${sessNet >= 0 ? "win" : "loss"}"><strong>${sessNet >= 0 ? "+" : ""}${Number(sessNet).toFixed(3)}%</strong></span>` +
@@ -506,9 +554,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const trades = s.trades || [];
         document.getElementById("trades").innerHTML = trades.slice().reverse().slice(0, 12).map(t => {
           const net = t.net_pct != null ? t.net_pct : t.pnl_pct;
+          const qty = t.qty != null && t.qty > 0 ? fmt(t.qty, 4) : "—";
           return `
           <tr>
             <td class="${t.side === "long" ? "bid" : "ask"}">${t.side}</td>
+            <td>${qty}</td>
             <td>${fmt(t.exit, pd)}</td>
             <td>${t.why || "—"}</td>
             <td class="${net >= 0 ? "win" : "loss"}">${net >= 0 ? "+" : ""}${Number(net).toFixed(3)}</td>
@@ -717,6 +767,7 @@ class BookState:
         sample_sec: float,
         tp_pct: float,
         sl_pct: float,
+        min_sl_pct: float,
         touch_pct: float,
         min_wall_usdt: float,
         imb_long: float,
@@ -750,6 +801,18 @@ class BookState:
         fee_mode: str,
         protect_be: bool,
         protect_trail: bool,
+        be_buffer_pct: float,
+        sl_grace_sec: float,
+        ema_filter: bool,
+        ema_interval: str,
+        ema_fast: int,
+        ema_slow: int,
+        ema_slope_min: float,
+        min_confidence: float,
+        min_wall_ratio: float,
+        mom_max_against: float,
+        require_bounce: bool,
+        bb_strict: bool,
     ) -> None:
         self.symbol = symbol.upper()
         self.limit = limit
@@ -759,6 +822,7 @@ class BookState:
         self.sample_sec = sample_sec
         self.tp_pct = tp_pct
         self.sl_pct = sl_pct
+        self.min_sl_pct = min_sl_pct
         self.touch_pct = touch_pct
         self.min_wall_usdt = min_wall_usdt
         self.imb_long = imb_long
@@ -794,6 +858,18 @@ class BookState:
         self.net_exits = net_exits  # skip soft exits unless gross covers fees
         self.protect_be = protect_be
         self.protect_trail = protect_trail
+        self.be_buffer_pct = be_buffer_pct
+        self.sl_grace_sec = sl_grace_sec
+        self.ema_filter = ema_filter
+        self.ema_interval = ema_interval
+        self.ema_fast = ema_fast
+        self.ema_slow = ema_slow
+        self.ema_slope_min = ema_slope_min
+        self.min_confidence = min_confidence
+        self.min_wall_ratio = min_wall_ratio
+        self.mom_max_against = mom_max_against
+        self.require_bounce = require_bounce
+        self.bb_strict = bb_strict
 
         self._lock = threading.Lock()
         self._trail: deque[dict[str, float]] = deque()
@@ -819,10 +895,19 @@ class BookState:
         self._paper: dict[str, Any] | None = None
         self._live: dict[str, Any] = {}
         self._bb: dict[str, Any] = {"label": "n/a", "tradeable": True}
+        self._trend: dict[str, Any] = {"label": "n/a", "detail": ""}
+        self._confidence: dict[str, Any] = {
+            "score": 0.0,
+            "min": min_confidence,
+            "side": None,
+            "parts": {},
+        }
+        self._ema_snap: Any = None
         self._signal = "flat"
         self._block_reason = "starting…"
         self._cooldown_until = 0.0
         self._bb_next = 0.0
+        self._ema_next = 0.0
         self._live_next = 0.0
         self._fee_next = 0.0
         self._closes: list[float] = []
@@ -846,6 +931,8 @@ class BookState:
             "signal": "flat",
             "block_reason": "starting…",
             "dry_run": self.dry_run,
+            "trend": dict(self._trend),
+            "confidence": dict(self._confidence),
             "paper": {},
             "live": {},
             "live_enabled": self.live_enabled,
@@ -887,6 +974,147 @@ class BookState:
             **self._session,
             "unrealized_pct": unrealized_pct,
             "total_pct": net + unrealized_pct,
+        }
+
+    def _refresh_ema(self, now: float) -> None:
+        if now < self._ema_next:
+            return
+        self._ema_next = now + 10.0
+        try:
+            from ob_ema import fetch_ema_snapshot
+
+            snap = fetch_ema_snapshot(
+                self.symbol,
+                interval=self.ema_interval,
+                fast=self.ema_fast,
+                slow=self.ema_slow,
+                slope_min_pct=self.ema_slope_min,
+            )
+            self._ema_snap = snap
+            if snap is None:
+                self._trend = {"label": "warmup", "detail": "ema warmup"}
+                return
+            gate = "on" if self.ema_filter else "off"
+            self._trend = {
+                "label": snap.trend,
+                "detail": (
+                    f"ema{snap.fast_period}/{snap.slow_period} {self.ema_interval} "
+                    f"slope {snap.slope_pct:+.3f}%  "
+                    f"allow L={snap.allow_long} S={snap.allow_short}  "
+                    f"filter={gate}"
+                ),
+                "slope_pct": snap.slope_pct,
+                "allow_long": snap.allow_long,
+                "allow_short": snap.allow_short,
+            }
+        except Exception as exc:  # noqa: BLE001
+            self._ema_snap = None
+            self._trend = {"label": "ema-err", "detail": str(exc)}
+
+    def _recent_mom_pct(self) -> float:
+        """Short-horizon mid momentum %% from the live trail (~last few samples)."""
+        trail = list(self._trail)
+        if len(trail) < 3:
+            return 0.0
+        a = float(trail[-3]["mid"])
+        b = float(trail[-1]["mid"])
+        if a <= 0:
+            return 0.0
+        return (b - a) / a * 100
+
+    def _score_confidence(
+        self,
+        side: str,
+        *,
+        mid: float,
+        imb: float,
+        entry_wall: dict[str, float],
+        opp_wall: dict[str, float] | None,
+        tp_wall: dict[str, float] | None,
+        spread: float,
+        mom_pct: float,
+    ) -> dict[str, Any]:
+        """0–100 confidence for a candidate entry."""
+        parts: dict[str, float] = {}
+
+        # Imbalance strength beyond threshold (0–22)
+        if side == "long":
+            excess = max(0.0, imb - self.imb_long)
+            span = max(1e-6, 1.0 - self.imb_long)
+        else:
+            excess = max(0.0, self.imb_short - imb)
+            span = max(1e-6, self.imb_short)
+        parts["imb"] = min(22.0, (excess / span) * 22.0)
+
+        # Entry wall size vs min (0–18)
+        wall_n = float(entry_wall.get("notional") or 0)
+        parts["wall"] = min(18.0, (wall_n / max(self.min_wall_usdt, 1.0)) * 9.0)
+
+        # Wall dominance vs opposite (0–15)
+        opp_n = float((opp_wall or {}).get("notional") or 0)
+        ratio = wall_n / opp_n if opp_n > 0 else 0.0
+        if ratio >= self.min_wall_ratio * 1.5:
+            parts["ratio"] = 15.0
+        elif ratio >= self.min_wall_ratio:
+            parts["ratio"] = 10.0
+        elif ratio >= 1.0:
+            parts["ratio"] = 4.0
+        else:
+            parts["ratio"] = 0.0
+
+        # BB regime (0–15) — prefer clean range
+        label = str(self._bb.get("label") or "")
+        parts["bb"] = {"range": 15.0, "wide": 12.0, "near-bb": 3.0}.get(label, 0.0)
+
+        # EMA alignment (0–18)
+        snap = self._ema_snap
+        if snap is None:
+            parts["ema"] = 8.0 if not self.ema_filter else 0.0
+        elif side == "long" and snap.allow_long:
+            parts["ema"] = 18.0
+        elif side == "short" and snap.allow_short:
+            parts["ema"] = 18.0
+        elif snap.trend == "flat":
+            parts["ema"] = 2.0
+        else:
+            parts["ema"] = 0.0  # counter-trend
+
+        # Momentum aligned with side (0–12)
+        if side == "long":
+            if mom_pct >= 0.01:
+                parts["mom"] = min(12.0, 6.0 + mom_pct * 80)
+            elif mom_pct >= -self.mom_max_against:
+                parts["mom"] = 4.0
+            else:
+                parts["mom"] = 0.0
+        else:
+            if mom_pct <= -0.01:
+                parts["mom"] = min(12.0, 6.0 + abs(mom_pct) * 80)
+            elif mom_pct <= self.mom_max_against:
+                parts["mom"] = 4.0
+            else:
+                parts["mom"] = 0.0
+
+        # TP room beyond fee+edge (0–10)
+        need = self._min_tp_dist_pct()
+        if tp_wall and mid > 0:
+            dist = abs(float(tp_wall["price"]) - mid) / mid * 100
+            parts["tp"] = min(10.0, max(0.0, (dist - need) / max(need, 0.01) * 5.0 + 5.0))
+        else:
+            parts["tp"] = 0.0
+
+        spread_pct = (spread / mid * 100) if mid > 0 else 0.0
+        if spread_pct > 0.05:
+            parts["tp"] = max(0.0, parts["tp"] - 3.0)
+
+        score = sum(parts.values())
+        return {
+            "score": round(score, 1),
+            "min": self.min_confidence,
+            "side": side,
+            "parts": {k: round(v, 1) for k, v in parts.items()},
+            "wall_ratio": round(ratio, 2),
+            "mom_pct": round(mom_pct, 4),
         }
 
     def _refresh_fees(self, now: float) -> None:
@@ -1003,8 +1231,8 @@ class BookState:
             label = "near-bb"
         else:
             label = "breakout"
-        # Trade when inside OR slightly outside (pad). Hard breakout still blocked.
-        tradeable = near
+        # Strict: only inside BB. Loose: inside or pad (near-bb).
+        tradeable = inside if self.bb_strict else near
         return {
             **self._bb,
             "label": label,
@@ -1102,12 +1330,17 @@ class BookState:
     def _covers_fees(self, gross_pct: float) -> bool:
         return gross_pct >= self.fee_rt_pct
 
+    def _min_sl_dist_pct(self) -> float:
+        """Min adverse SL distance from entry (noise room; covers a bounce)."""
+        return max(self.sl_pct, self.min_sl_pct)
+
     def _pct_tp_sl(self, side: str, entry: float) -> tuple[float, float]:
         # Prefer fee-aware distance over tiny legacy tp_pct
         tp_d = max(self.tp_pct, self._min_tp_dist_pct())
+        sl_d = self._min_sl_dist_pct()
         if side == "long":
-            return entry * (1 + tp_d / 100), entry * (1 - self.sl_pct / 100)
-        return entry * (1 - tp_d / 100), entry * (1 + self.sl_pct / 100)
+            return entry * (1 + tp_d / 100), entry * (1 - sl_d / 100)
+        return entry * (1 - tp_d / 100), entry * (1 + sl_d / 100)
 
     def _reward_wall(
         self,
@@ -1133,6 +1366,32 @@ class BookState:
             return None
         return min(cands, key=lambda w: abs(w["price"] - mid))
 
+    def _stop_wall(
+        self,
+        walls: list[dict[str, float]],
+        *,
+        above: bool,
+        entry: float,
+        min_dist_pct: float,
+    ) -> dict[str, float] | None:
+        """Nearest significant wall at least min_dist_pct beyond entry (SL side)."""
+        if entry <= 0:
+            return None
+        cands: list[dict[str, float]] = []
+        for w in walls:
+            if w["notional"] < self.min_wall_usdt:
+                continue
+            if above and w["price"] <= entry:
+                continue
+            if not above and w["price"] >= entry:
+                continue
+            dist = abs(w["price"] - entry) / entry * 100
+            if dist >= min_dist_pct:
+                cands.append(w)
+        if not cands:
+            return None
+        return min(cands, key=lambda w: abs(w["price"] - entry))
+
     def _wall_tp_sl(
         self,
         side: str,
@@ -1143,17 +1402,17 @@ class BookState:
         best_bid: float | None,
         best_ask: float | None,
     ) -> tuple[float, float, str]:
-        """Dynamic TP/SL: TP = opposite wall far enough to cover fees; SL = support."""
+        """Dynamic TP/SL: TP = opposite wall for fees; SL = structure beyond min room."""
         fallback_tp, fallback_sl = self._pct_tp_sl(side, entry)
         buf = self.sl_buffer_pct / 100
         need = self._min_tp_dist_pct()
+        min_sl = self._min_sl_dist_pct()
         note = "wall"
 
         if side == "long":
             ask_w = self._reward_wall(ask_walls, above=True, mid=mid, min_dist_pct=need)
             if ask_w is None:
                 ask_w = self._nearest_wall(ask_walls, below=False, mid=mid)
-            bid_w = self._nearest_wall(bid_walls, below=True, mid=min(mid, entry))
             if ask_w:
                 tp = ask_w["price"]
                 dist = abs(tp - entry) / entry * 100
@@ -1172,21 +1431,24 @@ class BookState:
             if tp <= mid:
                 tp = max(fallback_tp, mid * (1 + need / 200))
 
+            # SL below entry by ≥ min_sl — never glue to best bid / mid
+            bid_w = self._stop_wall(
+                bid_walls, above=False, entry=entry, min_dist_pct=min_sl
+            )
+            floor_sl = entry * (1 - min_sl / 100)
             if bid_w:
                 sl = bid_w["price"] * (1 - buf)
-            elif best_bid:
-                sl = best_bid * (1 - buf)
-                note = note if "pct" in note else "wall+bbo"
+                note = note if "pct" in note else "wall+sl"
             else:
                 sl = fallback_sl
-            sl = min(sl, mid * (1 - buf))
+                note = note if "pct" in note else "wall→sl-pct"
+            sl = min(sl, floor_sl)
             return tp, sl, note
 
         # short
         bid_w = self._reward_wall(bid_walls, above=False, mid=mid, min_dist_pct=need)
         if bid_w is None:
             bid_w = self._nearest_wall(bid_walls, below=True, mid=mid)
-        ask_w = self._nearest_wall(ask_walls, below=False, mid=max(mid, entry))
         if bid_w:
             tp = bid_w["price"]
             dist = abs(entry - tp) / entry * 100
@@ -1205,14 +1467,18 @@ class BookState:
         if tp >= mid:
             tp = min(fallback_tp, mid * (1 - need / 200))
 
+        # SL above entry by ≥ min_sl — skip the ask wall used for entry
+        ask_w = self._stop_wall(
+            ask_walls, above=True, entry=entry, min_dist_pct=min_sl
+        )
+        ceil_sl = entry * (1 + min_sl / 100)
         if ask_w:
             sl = ask_w["price"] * (1 + buf)
-        elif best_ask:
-            sl = best_ask * (1 + buf)
-            note = note if "pct" in note else "wall+bbo"
+            note = note if "pct" in note else "wall+sl"
         else:
             sl = fallback_sl
-        sl = max(sl, mid * (1 + buf))
+            note = note if "pct" in note else "wall→sl-pct"
+        sl = max(sl, ceil_sl)
         return tp, sl, note
 
     def _open_paper(
@@ -1286,6 +1552,9 @@ class BookState:
                 self._last_order_error = str(exc)
                 print(f"LIVE OPEN FAILED: {exc}", flush=True)
                 return
+        elif self.notional > 0 and fill_entry > 0:
+            qty = self.notional / fill_entry
+            qty_str = f"{qty:.6g}"
 
         if self.exits == "wall":
             tp, sl, exits_note = self._wall_tp_sl(
@@ -1375,6 +1644,7 @@ class BookState:
             "side": side,
             "entry": pos["entry"],
             "exit": mark,
+            "qty": float(pos.get("qty") or 0),
             "pnl_pct": gross,
             "fee_pct": fee,
             "net_pct": net,
@@ -1408,7 +1678,7 @@ class BookState:
         # Shorter pause after SL so the bot can re-arm; longer after wins
         cd = self.cooldown_sec
         if why == "sl":
-            cd = min(cd, 5.0)
+            cd = max(cd, 12.0)  # after a stop, wait longer before re-entry
         self._cooldown_until = now + cd
         self._signal = "flat"
         self._block_reason = f"cooldown {cd:g}s after {why}"
@@ -1430,18 +1700,6 @@ class BookState:
         side = pos["side"]
         entry = float(pos["entry"])
 
-        # Refresh TP/SL from live book each tick (ratchet SL in favor only)
-        if self.exits == "wall":
-            tp, sl, note = self._wall_tp_sl(
-                side, entry, mid, bid_walls, ask_walls, best_bid, best_ask
-            )
-            pos["tp"] = tp
-            pos["exits"] = note
-            if side == "long":
-                pos["sl"] = max(float(pos["sl"]), sl)  # trail up only
-            else:
-                pos["sl"] = min(float(pos["sl"]), sl)  # trail down only
-
         pnl = self._pnl_pct(entry, mid, side)
         pos["pnl_pct"] = pnl
         if pnl > float(pos.get("peak_pnl_pct", 0.0)):
@@ -1450,50 +1708,84 @@ class BookState:
             pos["peak_mid"] = max(float(pos.get("peak_mid", mid)), mid)
         else:
             pos["peak_mid"] = min(float(pos.get("peak_mid", mid)), mid)
-        # Soft-exit arm: need fee-covered profit. BE arm: earlier (min_lock).
+
+        held = now - float(pos.get("opened_at", now))
+        in_grace = held < self.sl_grace_sec
+        min_sl = self._min_sl_dist_pct()
+        be_buf = max(0.0, self.be_buffer_pct)
+
+        # Soft exits after fees; BE needs extra cushion so entry-retest noise doesn't stop out
         soft_arm_need = max(self.min_lock_pct, self.fee_rt_pct if self.net_exits else 0.0)
-        be_arm_need = self.min_lock_pct
+        be_arm_need = soft_arm_need + be_buf + max(0.02, self.fee_rt_pct * 0.5)
         if pnl >= soft_arm_need:
             pos["armed"] = True
-        be_ready = pnl >= be_arm_need
+        be_ready = (not in_grace) and pnl >= be_arm_need
         pos["be_locked"] = False
 
-        # Protect: BE as soon as slightly green; trail once fee-covered (armed)
+        # Refresh TP always; freeze SL ratchets during grace (keeps initial room)
+        if self.exits == "wall":
+            tp, sl, note = self._wall_tp_sl(
+                side, entry, mid, bid_walls, ask_walls, best_bid, best_ask
+            )
+            pos["tp"] = tp
+            pos["exits"] = note
+            if not in_grace:
+                old_sl = float(pos["sl"])
+                if side == "long":
+                    floor_sl = entry * (1 - min_sl / 100)
+                    cand = max(old_sl, sl)
+                    if not pos.get("armed"):
+                        cand = min(cand, floor_sl)
+                    pos["sl"] = cand
+                else:
+                    ceil_sl = entry * (1 + min_sl / 100)
+                    cand = min(old_sl, sl)
+                    if not pos.get("armed"):
+                        cand = max(cand, ceil_sl)
+                    pos["sl"] = cand
+
+        # BE locks *beyond* entry by be_buffer (short: above, long: below)
         protect_note = []
         if self.protect_be and be_ready:
             if side == "long":
-                if float(pos["sl"]) < entry:
-                    pos["sl"] = entry
+                be_sl = entry * (1 - be_buf / 100)
+                if float(pos["sl"]) < be_sl:
+                    pos["sl"] = be_sl
                 protect_note.append("BE")
                 pos["be_locked"] = True
             else:
-                if float(pos["sl"]) > entry:
-                    pos["sl"] = entry
+                be_sl = entry * (1 + be_buf / 100)
+                if float(pos["sl"]) > be_sl:
+                    pos["sl"] = be_sl
                 protect_note.append("BE")
                 pos["be_locked"] = True
-        if self.protect_trail and pos.get("armed"):
+        if self.protect_trail and pos.get("armed") and not in_grace:
             peak_mid = float(pos["peak_mid"])
             if side == "long":
                 trail_sl = peak_mid * (1 - self.rev_pct / 100)
-                if trail_sl > entry:
+                be_floor = entry * (1 - be_buf / 100)
+                if trail_sl > be_floor:
                     pos["sl"] = max(float(pos["sl"]), trail_sl)
                     protect_note.append("trail")
             else:
                 trail_sl = peak_mid * (1 + self.rev_pct / 100)
-                if trail_sl < entry:
+                be_ceil = entry * (1 + be_buf / 100)
+                if trail_sl < be_ceil:
                     pos["sl"] = min(float(pos["sl"]), trail_sl)
                     protect_note.append("trail")
         if protect_note:
             base = str(pos.get("exits") or "wall").split("+")[0]
             pos["exits"] = base + "+" + "+".join(protect_note)
 
-        held = now - float(pos.get("opened_at", now))
         soft_ok = held >= self.min_hold_sec
-        # Soft exits only if net would be >= 0 (covers fee estimate)
-        can_soft = soft_ok and (not self.net_exits or self._covers_fees(pnl))
+        # Soft exits need a real cushion (fees + half edge) — avoid scratch flips
+        soft_need = self.fee_rt_pct + max(0.0, self.min_edge_pct) * 0.5
+        can_soft = soft_ok and (
+            not self.net_exits or pnl >= soft_need
+        )
 
         # Proactive: lock green when sense flips or price reverses from peak
-        if pos.get("armed") and pnl > 0 and can_soft:
+        if pos.get("armed") and pnl > 0 and can_soft and not in_grace:
             if self.flip_exit:
                 if side == "long" and imb < 0.5:
                     self._close_paper(mid, now, "flip")
@@ -1514,21 +1806,31 @@ class BookState:
                         self._close_paper(mid, now, "rev")
                         return
 
-        # Was green (fee-covered), price crossed back through entry
-        if self.giveback_exit and pos.get("armed") and pnl <= 0 and soft_ok:
-            self._close_paper(mid, now, "give")
-            return
+        # Giveback only after a clear break through entry (+ buffer), not a touch
+        if self.giveback_exit and pos.get("armed") and soft_ok and not in_grace:
+            if side == "long" and mid < entry * (1 - be_buf / 100) and pnl < 0:
+                self._close_paper(mid, now, "give")
+                return
+            if side == "short" and mid > entry * (1 + be_buf / 100) and pnl < 0:
+                self._close_paper(mid, now, "give")
+                return
 
+        # Hard exits — during grace, ignore SL unless adverse move is clearly wrong
+        emergency = min_sl * 1.75
         if side == "long":
             if mid >= pos["tp"]:
                 self._close_paper(mid, now, "tp")
             elif mid <= pos["sl"]:
-                self._close_paper(mid, now, "sl")
+                adverse = (entry - mid) / entry * 100 if entry else 0.0
+                if (not in_grace) or adverse >= emergency:
+                    self._close_paper(mid, now, "sl")
         else:
             if mid <= pos["tp"]:
                 self._close_paper(mid, now, "tp")
             elif mid >= pos["sl"]:
-                self._close_paper(mid, now, "sl")
+                adverse = (mid - entry) / entry * 100 if entry else 0.0
+                if (not in_grace) or adverse >= emergency:
+                    self._close_paper(mid, now, "sl")
 
     def _nearest_wall(
         self, walls: list[dict[str, float]], *, below: bool, mid: float
@@ -1571,12 +1873,18 @@ class BookState:
         *,
         all_bids: list[dict[str, float]] | None = None,
         all_asks: list[dict[str, float]] | None = None,
+        spread: float = 0.0,
     ) -> str:
+        from ob_ema import ema_allows
+
         bids = all_bids if all_bids is not None else bid_walls
         asks = all_asks if all_asks is not None else ask_walls
 
         if not self.paper_enabled:
             self._block_reason = "paper off"
+            self._confidence = {
+                "score": 0.0, "min": self.min_confidence, "side": None, "parts": {},
+            }
             return "flat"
         if self._paper:
             self._block_reason = "in position"
@@ -1603,23 +1911,86 @@ class BookState:
 
         near_bid = bid_w and abs(bid_w["dist_pct"]) <= self.touch_pct
         near_ask = ask_w and abs(ask_w["dist_pct"]) <= self.touch_pct
+        mom = self._recent_mom_pct()
+
+        def _conf(side: str, wall: dict[str, float] | None) -> dict[str, Any]:
+            return self._score_confidence(
+                side,
+                mid=mid,
+                imb=imb,
+                entry_wall=wall or {"notional": 0},
+                opp_wall=ask_w if side == "long" else bid_w,
+                tp_wall=long_tp if side == "long" else short_tp,
+                spread=spread,
+                mom_pct=mom,
+            )
+
+        # Live confidence for the most relevant candidate side
+        if near_bid or (imb >= self.imb_long and bid_w):
+            self._confidence = _conf("long", bid_w)
+        elif near_ask or (imb <= self.imb_short and ask_w):
+            self._confidence = _conf("short", ask_w)
+        else:
+            side = "long" if imb >= 0.5 else "short"
+            self._confidence = _conf(side, bid_w if side == "long" else ask_w)
+
+        def _try_open(side: str, wall: dict[str, float], why: str) -> bool:
+            conf = _conf(side, wall)
+            self._confidence = conf
+            if self.bb_strict and str(self._bb.get("label")) == "near-bb":
+                self._block_reason = "bb near-edge (strict)"
+                return False
+            if self.ema_filter and not ema_allows(side, self._ema_snap):
+                trend = (self._trend or {}).get("label", "?")
+                self._block_reason = f"ema {trend} blocks {side}"
+                return False
+            # Reject chasing into adverse micro-momentum
+            if side == "long" and mom < -self.mom_max_against:
+                self._block_reason = f"mom {mom:+.3f}% still dumping"
+                return False
+            if side == "short" and mom > self.mom_max_against:
+                self._block_reason = f"mom {mom:+.3f}% still pumping"
+                return False
+            # Prefer bounce off the wall, not a breakdown through it
+            if self.require_bounce:
+                if side == "long" and mom < 0.005:
+                    self._block_reason = "wait bounce off bid wall"
+                    return False
+                if side == "short" and mom > -0.005:
+                    self._block_reason = "wait rejection off ask wall"
+                    return False
+            wall_n = float(wall.get("notional") or 0)
+            opp = ask_w if side == "long" else bid_w
+            opp_n = float((opp or {}).get("notional") or 0)
+            ratio = wall_n / opp_n if opp_n > 0 else 0.0
+            if opp_n > 0 and ratio < self.min_wall_ratio:
+                self._block_reason = (
+                    f"wall ratio {ratio:.2f} < {self.min_wall_ratio:g}"
+                )
+                return False
+            if conf["score"] < self.min_confidence:
+                self._block_reason = (
+                    f"conf {conf['score']:.0f} < min {self.min_confidence:.0f}"
+                )
+                return False
+            self._open_paper(
+                side, mid, wall["price"], now, why,
+                bid_walls=bids, ask_walls=asks,
+                best_bid=best_bid, best_ask=best_ask,
+            )
+            self._block_reason = ""
+            return True
 
         if near_bid and imb >= self.imb_long and long_tp is not None:
-            self._open_paper(
-                "long", mid, bid_w["price"], now, "bid-wall+imb",
-                bid_walls=bids, ask_walls=asks,
-                best_bid=best_bid, best_ask=best_ask,
-            )
-            self._block_reason = ""
-            return "long"
+            if _try_open("long", bid_w, "bid-wall+imb"):
+                return "long"
+            if self._block_reason:
+                return "flat"
         if near_ask and imb <= self.imb_short and short_tp is not None:
-            self._open_paper(
-                "short", mid, ask_w["price"], now, "ask-wall+imb",
-                bid_walls=bids, ask_walls=asks,
-                best_bid=best_bid, best_ask=best_ask,
-            )
-            self._block_reason = ""
-            return "short"
+            if _try_open("short", ask_w, "ask-wall+imb"):
+                return "short"
+            if self._block_reason:
+                return "flat"
 
         # Explain why flat (first matching reason)
         reasons = []
@@ -1633,6 +2004,14 @@ class BookState:
             reasons.append(f"no ask TP ≥{need:g}% away")
         if near_ask and short_tp is None:
             reasons.append(f"no bid TP ≥{need:g}% away")
+        if self.ema_filter and self._ema_snap is not None:
+            if near_bid and imb >= self.imb_long and not self._ema_snap.allow_long:
+                reasons.append(f"ema {self._trend.get('label')}≠bull")
+            if near_ask and imb <= self.imb_short and not self._ema_snap.allow_short:
+                reasons.append(f"ema {self._trend.get('label')}≠bear")
+        score = float(self._confidence.get("score") or 0)
+        if score < self.min_confidence and (near_bid or near_ask):
+            reasons.append(f"conf {score:.0f}<{self.min_confidence:.0f}")
         if not reasons:
             reasons.append("filters not met")
         self._block_reason = " · ".join(reasons)
@@ -1683,6 +2062,7 @@ class BookState:
                 now = float(snap["ts"])
                 self._refresh_fees(now)
                 self._refresh_bb(now, mid)
+                self._refresh_ema(now)
                 self._refresh_live(now)
                 imb = float(snap["imbalance"])
                 self._manage_paper(
@@ -1702,6 +2082,7 @@ class BookState:
                     now,
                     all_bids=snap["all_bids"],
                     all_asks=snap["all_asks"],
+                    spread=float(snap.get("spread") or 0),
                 )
                 unreal = 0.0
                 if self._paper:
@@ -1739,6 +2120,8 @@ class BookState:
                         "block_reason": self._block_reason,
                         "dry_run": self.dry_run,
                         "order_error": self._last_order_error,
+                        "trend": dict(self._trend),
+                        "confidence": dict(self._confidence),
                         "paper": dict(self._paper) if self._paper else {},
                         "live": dict(self._live),
                         "live_enabled": self.live_enabled,
@@ -1804,33 +2187,56 @@ def main() -> None:
     p.add_argument("--exits", choices=("wall", "pct"), default="wall",
                    help="TP/SL mode: wall=dynamic bid/ask walls (default), pct=fixed %%")
     p.add_argument("--tp-pct", type=float, default=0.08, help="fallback / pct-mode TP %%")
-    p.add_argument("--sl-pct", type=float, default=0.06, help="fallback / pct-mode SL %%")
+    p.add_argument("--sl-pct", type=float, default=0.22, help="fallback / pct-mode SL %%")
+    p.add_argument("--min-sl-pct", type=float, default=0.22,
+                   help="min SL distance from entry %% (stops glued-to-mid noise exits)")
     p.add_argument("--max-tp-pct", type=float, default=0.25,
                    help="cap dynamic TP distance from entry %%")
-    p.add_argument("--sl-buffer-pct", type=float, default=0.005,
+    p.add_argument("--sl-buffer-pct", type=float, default=0.03,
                    help="place SL this %% beyond the support/resistance wall")
-    p.add_argument("--touch-pct", type=float, default=0.08, help="max dist %% to wall for entry")
-    p.add_argument("--min-wall-usdt", type=float, default=40_000.0, help="min wall notional")
-    p.add_argument("--imb-long", type=float, default=0.55, help="min bid imbalance for long")
-    p.add_argument("--imb-short", type=float, default=0.45, help="max bid imbalance for short")
+    p.add_argument("--sl-grace-sec", type=float, default=6.0,
+                   help="after entry, ignore noise SL hits (unless adverse ≥1.75× min-sl)")
+    p.add_argument("--be-buffer-pct", type=float, default=0.04,
+                   help="BE lock places SL this %% beyond entry (survives entry retest)")
+    p.add_argument("--touch-pct", type=float, default=0.05, help="max dist %% to wall for entry")
+    p.add_argument("--min-wall-usdt", type=float, default=60_000.0, help="min wall notional")
+    p.add_argument("--min-wall-ratio", type=float, default=1.4,
+                   help="entry wall must be this × opposite nearest wall")
+    p.add_argument("--imb-long", type=float, default=0.58, help="min bid imbalance for long")
+    p.add_argument("--imb-short", type=float, default=0.42, help="max bid imbalance for short")
     p.add_argument("--bb-period", type=int, default=20)
     p.add_argument("--bb-std", type=float, default=2.0)
     p.add_argument("--bb-interval", default="5m",
                    help="BB regime timeframe (5m = fewer choppy entries than 1m)")
-    p.add_argument("--bb-pad-pct", type=float, default=0.20,
-                   help="allow entries this %% outside BB bands (re-entry after stop)")
-    p.add_argument("--cooldown-sec", type=float, default=8.0,
-                   help="pause after close (SL uses min(this, 5s))")
-    p.add_argument("--min-edge-pct", type=float, default=0.04,
+    p.add_argument("--bb-pad-pct", type=float, default=0.08,
+                   help="allow entries this %% outside BB bands (only if --no-bb-strict)")
+    p.add_argument("--bb-strict", action=argparse.BooleanOptionalAction, default=True,
+                   help="only enter inside BB (reject near-bb edge)")
+    p.add_argument("--cooldown-sec", type=float, default=12.0,
+                   help="pause after close (SL forces at least 12s)")
+    p.add_argument("--min-edge-pct", type=float, default=0.08,
                    help="extra %% beyond fees required to opposite wall before entry")
-    p.add_argument("--min-hold-sec", type=float, default=3.0,
+    p.add_argument("--min-hold-sec", type=float, default=4.0,
                    help="min seconds in trade before soft exits (flip/rev/give)")
+    p.add_argument("--require-bounce", action=argparse.BooleanOptionalAction, default=True,
+                   help="enter only after micro-bounce/rejection off the wall")
+    p.add_argument("--mom-max-against", type=float, default=0.03,
+                   help="block entry if short-term mid mom %% is against side by more than this")
     p.add_argument("--net-exits", action=argparse.BooleanOptionalAction, default=True,
                    help="only soft-exit when gross pnl covers fee estimate")
     p.add_argument("--protect-be", action=argparse.BooleanOptionalAction, default=True,
                    help="once in fee-covered profit, move SL to breakeven")
     p.add_argument("--protect-trail", action=argparse.BooleanOptionalAction, default=True,
                    help="once armed, trail SL under/over peak by --rev-pct")
+    p.add_argument("--ema-filter", action=argparse.BooleanOptionalAction, default=True,
+                   help="only long in bullish EMA / short in bearish EMA")
+    p.add_argument("--ema-interval", default="1m", help="EMA kline interval")
+    p.add_argument("--ema-fast", type=int, default=7)
+    p.add_argument("--ema-slow", type=int, default=25)
+    p.add_argument("--ema-slope-min", type=float, default=0.05,
+                   help="min |EMA fast slope| %% over ~5 bars to count as trend")
+    p.add_argument("--min-confidence", type=float, default=60.0,
+                   help="min 0–100 setup score (imb+wall+ratio+BB+EMA+mom+TP) to enter")
     p.add_argument("--min-lock-pct", type=float, default=0.01,
                    help="min paper profit %% before proactive exits arm")
     p.add_argument("--rev-pct", type=float, default=0.02,
@@ -1893,6 +2299,7 @@ def main() -> None:
         sample_sec=args.sample_sec,
         tp_pct=args.tp_pct,
         sl_pct=args.sl_pct,
+        min_sl_pct=args.min_sl_pct,
         touch_pct=args.touch_pct,
         min_wall_usdt=args.min_wall_usdt,
         imb_long=args.imb_long,
@@ -1926,6 +2333,18 @@ def main() -> None:
         fee_mode=args.fee_mode,
         protect_be=args.protect_be,
         protect_trail=args.protect_trail,
+        be_buffer_pct=args.be_buffer_pct,
+        sl_grace_sec=args.sl_grace_sec,
+        ema_filter=args.ema_filter,
+        ema_interval=args.ema_interval,
+        ema_fast=args.ema_fast,
+        ema_slow=args.ema_slow,
+        ema_slope_min=args.ema_slope_min,
+        min_confidence=args.min_confidence,
+        min_wall_ratio=args.min_wall_ratio,
+        mom_max_against=args.mom_max_against,
+        require_bounce=args.require_bounce,
+        bb_strict=args.bb_strict,
     )
     # Pull Binance commission rates immediately (needs API keys in .env)
     state._refresh_fees(0.0)
@@ -1948,9 +2367,10 @@ def main() -> None:
             size_txt = "exchange minimum (minQty / minNotional)"
         print(f"*** size {size_txt} per entry  hedge={hedge} ***")
     print(
-        f"exits={args.exits}  TP% {args.tp_pct:g}  SL% {args.sl_pct:g}  "
-        f"max-tp {args.max_tp_pct:g}%  touch {args.touch_pct:g}%  "
-        f"min-wall {args.min_wall_usdt:,.0f} USDT"
+        f"exits={args.exits}  TP% {args.tp_pct:g}  "
+        f"SL≥{max(args.sl_pct, args.min_sl_pct):g}%  "
+        f"sl-buf {args.sl_buffer_pct:g}%  max-tp {args.max_tp_pct:g}%  "
+        f"touch {args.touch_pct:g}%  min-wall {args.min_wall_usdt:,.0f} USDT"
     )
     print(
         f"proactive: flip={args.flip_exit} rev={args.rev_exit} "
@@ -1958,7 +2378,7 @@ def main() -> None:
     )
     print(
         f"protect: BE={args.protect_be} trail={args.protect_trail} "
-        f"(arms when pnl covers fees)"
+        f"be-buf={args.be_buffer_pct:g}%  sl-grace={args.sl_grace_sec:g}s"
     )
     fee_src = state._session.get("fee_source", "fallback")
     print(
@@ -1975,6 +2395,17 @@ def main() -> None:
     print(
         f"fee recover: min TP wall {need:g}%  bb={args.bb_interval}  "
         f"net-exits={args.net_exits}  min-hold={args.min_hold_sec:g}s"
+    )
+    print(
+        f"trend: ema-filter={args.ema_filter}  "
+        f"{args.ema_fast}/{args.ema_slow} {args.ema_interval}  "
+        f"slope≥{args.ema_slope_min:g}%  min-conf={args.min_confidence:g}"
+    )
+    print(
+        f"entries: imb {args.imb_long:g}/{args.imb_short:g}  "
+        f"wall≥{args.min_wall_usdt:,.0f}  ratio≥{args.min_wall_ratio:g}  "
+        f"bounce={args.require_bounce}  bb-strict={args.bb_strict}  "
+        f"mom-against≤{args.mom_max_against:g}%"
     )
     if dry_run:
         print("Dry-run: no real orders. Ctrl+C to stop.")
