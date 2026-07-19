@@ -377,10 +377,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       timeScale: { borderVisible: false, timeVisible: true, secondsVisible: true },
       crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     });
-    const series = chart.addAreaSeries({
-      lineColor: "#58a6ff",
-      topColor: "rgba(88,166,255,0.28)",
-      bottomColor: "rgba(88,166,255,0.02)",
+    const series = chart.addLineSeries({
+      color: "#58a6ff",
       lineWidth: 2,
       priceLineVisible: false,
       lastValueVisible: true,
@@ -747,10 +745,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         }
         if (paper.side) {
           addLine(paper.entry, "#d2a8ff", "E", 1);
+          // BE line only when actually locked
           if (paper.be_locked) {
             addLine(paper.entry, "#e3b341", "BE", 1, LightweightCharts.LineStyle.Solid);
-          } else {
-            addLine(paper.entry, "rgba(227,179,65,0.45)", "BE", 1, LightweightCharts.LineStyle.SparseDotted);
           }
           addLine(paper.tp, "#3fb950", "TP", 1, LightweightCharts.LineStyle.Dashed);
           const slLabel = paper.be_locked && Math.abs(paper.sl - paper.entry) / paper.entry < 1e-8
