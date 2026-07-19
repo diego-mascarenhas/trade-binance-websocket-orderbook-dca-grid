@@ -559,13 +559,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       btn.classList.toggle("on", live);
       btn.textContent = live ? "LIVE" : "PAPER";
       btn.title = live
-        ? "LIVE on — click for paper only"
-        : "Paper only — click to enable LIVE orders";
+        ? "LIVE on — click for PAPER (closes open position)"
+        : "PAPER — click for LIVE (closes open paper position)";
     }
     async function toggleLive() {
       const btn = document.getElementById("btnLive");
       if (togglingLive || !btn) return;
       const nextLive = !btn.classList.contains("on");
+      const paper = (window.__lastState && window.__lastState.paper) || {};
+      if (paper.side) {
+        const msg = nextLive
+          ? "Open position will be closed (paper) before enabling LIVE. Continue?"
+          : "Open position will be closed before switching to PAPER. Continue?";
+        if (!confirm(msg)) return;
+      }
       togglingLive = true;
       btn.disabled = true;
       try {
@@ -626,6 +633,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const r = await fetch("/api/state", { cache: "no-store" });
         if (!r.ok) throw new Error("HTTP " + r.status);
         const s = await r.json();
+        window.__lastState = s;
         renderFilters(s.filters || []);
         document.getElementById("err").hidden = true;
         if (s.error) {
@@ -1158,6 +1166,9 @@ class BookState:
         self.dca_enabled = True
         self.dca_max = 8
         self.dca_min_loss_pct = 0.05  # only DCA after this unrealized loss %%
+        # Treat walls within this %% as the same OB (0.02%% was too tight → stacked DCAs)
+        self.dca_space_pct = 0.10
+        self.dca_cooldown_sec = 12.0
         # When fee-covered: snap TP to nearest opposite OB and close on touch
         self.ob_tp_exit = True
 
@@ -1291,10 +1302,35 @@ class BookState:
         return {"ok": True, "why": "manual", "mark": mid}
 
     def set_live(self, enabled: bool) -> dict[str, Any]:
-        """Toggle LIVE market orders vs paper-only. Blocked while in a position."""
-        if self._paper:
-            return {"ok": False, "error": "close position before switching mode"}
+        """Toggle LIVE vs PAPER. Flattens any open position first (paper local / LIVE market)."""
         want_live = bool(enabled)
+        closed_for_mode = False
+        if self._paper:
+            mid = float((self._snapshot or {}).get("mid") or 0)
+            if mid <= 0 and self._trail:
+                mid = float(self._trail[-1]["mid"])
+            if mid <= 0:
+                mid = float(self._paper.get("entry") or 0)
+            if mid <= 0:
+                return {"ok": False, "error": "no mark price to flatten before mode switch"}
+            src = str(self._paper.get("source") or "paper")
+            live_pos = (src == "live") or (not self.dry_run)
+            if live_pos:
+                # Real position: market-close before leaving/entering cleanly
+                self._close_paper(mid, time.time(), "mode")
+                if self._paper is not None:
+                    return {
+                        "ok": False,
+                        "error": self._last_order_error
+                        or "close LIVE position first",
+                    }
+            else:
+                # Paper-only: drop local position (never hit the exchange)
+                prev = self.dry_run
+                self.dry_run = True
+                self._close_paper(mid, time.time(), "mode")
+                self.dry_run = prev
+            closed_for_mode = True
         if want_live:
             if not self.api_key or not self.api_secret:
                 return {"ok": False, "error": "API keys required for LIVE (.env)"}
@@ -1319,10 +1355,17 @@ class BookState:
         with self._lock:
             self._snapshot["dry_run"] = self.dry_run
             self._snapshot["live_enabled"] = self.live_enabled
+            self._snapshot["paper"] = dict(self._paper) if self._paper else {}
+            self._snapshot["trades"] = list(self._trades)
+            self._snapshot["markers"] = list(self._markers)
+            self._snapshot["session"] = self._session_view(0.0)
+            self._snapshot["signal"] = self._signal
+            self._snapshot["block_reason"] = self._block_reason
         return {
             "ok": True,
             "live": not self.dry_run,
             "dry_run": self.dry_run,
+            "closed": closed_for_mode,
         }
 
     def filter_flags(self) -> dict[str, bool]:
@@ -2098,6 +2141,7 @@ class BookState:
             "armed": False,
             "dca_count": 0,
             "dca_walls": [float(wall_price)],
+            "adverse_mid": fill_entry,  # worst mid since entry (for DCA direction)
         }
         self._last_order_error = None
         if qty > 0 and fill_entry > 0:
@@ -2208,6 +2252,55 @@ class BookState:
         else:
             self._block_reason = f"cooldown {cd:g}s after {why}"
 
+    def _dca_space(self) -> float:
+        return max(0.08, float(self.dca_space_pct), float(self.touch_pct) * 0.5)
+
+    def _unused_adverse_walls(
+        self,
+        side: str,
+        entry: float,
+        walls: list[dict[str, float]],
+        used: list[float],
+    ) -> list[dict[str, float]]:
+        space = self._dca_space()
+        out: list[dict[str, float]] = []
+        for w in walls:
+            if w["notional"] < self.min_wall_usdt:
+                continue
+            px = float(w["price"])
+            if side == "long":
+                if px >= entry:
+                    continue
+            else:
+                if px <= entry:
+                    continue
+            if any(u > 0 and abs(px - u) / u * 100 < space for u in used):
+                continue
+            out.append(w)
+        return out
+
+    def _further_adverse_wall(
+        self,
+        side: str,
+        cand_px: float,
+        walls: list[dict[str, float]],
+    ) -> dict[str, float] | None:
+        """Unused adverse wall further against the position than cand_px."""
+        space = self._dca_space()
+        further: list[dict[str, float]] = []
+        for w in walls:
+            px = float(w["price"])
+            if side == "long" and px < cand_px * (1 - space / 100):
+                further.append(w)
+            if side == "short" and px > cand_px * (1 + space / 100):
+                further.append(w)
+        if not further:
+            return None
+        # Furthest against us
+        if side == "long":
+            return min(further, key=lambda w: float(w["price"]))
+        return max(further, key=lambda w: float(w["price"]))
+
     def _next_dca_wall(
         self,
         side: str,
@@ -2216,28 +2309,41 @@ class BookState:
         walls: list[dict[str, float]],
         used: list[float],
     ) -> dict[str, float] | None:
-        """Nearest unused adverse OB wall (below avg for long / above for short)."""
-        cands: list[dict[str, float]] = []
-        for w in walls:
-            if w["notional"] < self.min_wall_usdt:
-                continue
-            px = float(w["price"])
-            if mid <= 0:
-                continue
-            if abs(px - mid) / mid * 100 > self.touch_pct:
-                continue
-            if side == "long":
-                if px >= entry:
-                    continue
-            else:
-                if px <= entry:
-                    continue
-            if any(u > 0 and abs(px - u) / u * 100 < 0.02 for u in used):
-                continue
-            cands.append(w)
+        """Nearest unused adverse OB wall in touch — only while still extending."""
+        if mid <= 0:
+            return None
+        cands = [
+            w
+            for w in self._unused_adverse_walls(side, entry, walls, used)
+            if abs(float(w["price"]) - mid) / mid * 100 <= self.touch_pct
+        ]
         if not cands:
             return None
-        return min(cands, key=lambda w: abs(w["price"] - mid))
+        return min(cands, key=lambda w: abs(float(w["price"]) - mid))
+
+    def _dca_still_adverse(self, side: str, mid: float, pos: dict[str, Any]) -> bool:
+        """True only while price is still extending against us (retracement), not recovering."""
+        adv = float(pos.get("adverse_mid") or mid)
+        if side == "long":
+            pos["adverse_mid"] = min(adv, mid)
+        else:
+            pos["adverse_mid"] = max(adv, mid)
+        adv = float(pos["adverse_mid"])
+        if adv <= 0 or mid <= 0:
+            return False
+        # Recovered from worst print by more than a tick of noise
+        recover_pct = max(0.02, float(self.dca_space_pct) * 0.25)
+        if side == "long" and mid > adv * (1 + recover_pct / 100):
+            return False
+        if side == "short" and mid < adv * (1 - recover_pct / 100):
+            return False
+        mom = self._recent_mom_pct()
+        # Momentum must still be adverse (or flat); block bounce recovery
+        if side == "long" and mom > 0.01:
+            return False
+        if side == "short" and mom < -0.01:
+            return False
+        return True
 
     def _add_dca(
         self,
@@ -2322,6 +2428,7 @@ class BookState:
         used = list(pos.get("dca_walls") or [])
         used.append(float(wall["price"]))
         pos["dca_walls"] = used
+        pos["last_dca_at"] = now
         pos["wall_price"] = float(wall["price"])
         pos["armed"] = False
         pos["be_locked"] = False
@@ -2376,13 +2483,31 @@ class BookState:
             return False
         if int(pos.get("dca_count") or 0) >= self.dca_max:
             return False
+        last_dca = float(pos.get("last_dca_at") or 0)
+        if last_dca > 0 and (now - last_dca) < self.dca_cooldown_sec:
+            return False
         side = pos["side"]
         entry = float(pos["entry"])
+        # Only DCA on adverse extension — never while recovering toward entry
+        if not self._dca_still_adverse(side, mid, pos):
+            return False
         used = [float(x) for x in (pos.get("dca_walls") or [])]
         walls = bid_walls if side == "long" else ask_walls
+        unused = self._unused_adverse_walls(side, entry, walls, used)
         wall = self._next_dca_wall(side, entry, mid, walls, used)
         if wall is None:
             return False
+        # Already extended past this wall toward a deeper OB → don't refill
+        # the nearer one on the way back (wait for that deeper wall, or new lows/highs)
+        cpx = float(wall["price"])
+        further = self._further_adverse_wall(side, cpx, unused)
+        if further is not None:
+            space = self._dca_space()
+            adv = float(pos.get("adverse_mid") or mid)
+            if side == "short" and adv > cpx * (1 + space / 100):
+                return False
+            if side == "long" and adv < cpx * (1 - space / 100):
+                return False
         return self._add_dca(
             mid, wall, now,
             bid_walls=bid_walls, ask_walls=ask_walls,
@@ -2412,8 +2537,10 @@ class BookState:
             pos["peak_pnl_pct"] = pnl
         if side == "long":
             pos["peak_mid"] = max(float(pos.get("peak_mid", mid)), mid)
+            pos["adverse_mid"] = min(float(pos.get("adverse_mid", mid)), mid)
         else:
             pos["peak_mid"] = min(float(pos.get("peak_mid", mid)), mid)
+            pos["adverse_mid"] = max(float(pos.get("adverse_mid", mid)), mid)
 
         # DCA on adverse OB walls while underwater — rebase avg + TP/SL
         if self._maybe_dca(
@@ -3367,6 +3494,10 @@ def main() -> None:
     p.add_argument("--dca-max", type=int, default=8, help="max DCA adds per position")
     p.add_argument("--dca-min-loss", type=float, default=0.05,
                    help="min unrealized loss %% before first DCA")
+    p.add_argument("--dca-space-pct", type=float, default=0.10,
+                   help="min %% between DCA walls (same OB zone = skipped)")
+    p.add_argument("--dca-cooldown-sec", type=float, default=12.0,
+                   help="min seconds between DCA adds")
     p.add_argument("--ob-tp", action=argparse.BooleanOptionalAction, default=True,
                    help="when fees covered, snap TP to opposite OB and close on touch")
     p.add_argument("--net-exits", action=argparse.BooleanOptionalAction, default=True,
@@ -3497,6 +3628,8 @@ def main() -> None:
     state.dca_enabled = bool(args.dca)
     state.dca_max = max(0, int(args.dca_max))
     state.dca_min_loss_pct = float(args.dca_min_loss)
+    state.dca_space_pct = max(0.02, float(args.dca_space_pct))
+    state.dca_cooldown_sec = max(0.0, float(args.dca_cooldown_sec))
     state.ob_tp_exit = bool(args.ob_tp)
     # Pull Binance commission rates immediately (needs API keys in .env)
     state._refresh_fees(0.0)
