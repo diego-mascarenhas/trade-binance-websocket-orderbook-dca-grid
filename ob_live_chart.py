@@ -402,9 +402,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     function addLine(price, color, title, width, style) {
       priceLines.push(series.createPriceLine({
-        price, color, title, lineWidth: width || 1,
+        price, color, title: title || "",
+        lineWidth: width != null ? width : 1,
         lineStyle: style != null ? style : LightweightCharts.LineStyle.Solid,
-        axisLabelVisible: true,
+        axisLabelVisible: !!title,
       }));
     }
     function fmt(n, d) {
@@ -736,28 +737,28 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           ...(s.ask_walls || []).map(w => w.notional),
         );
         for (const w of (s.bid_walls || []).slice(0, 4)) {
-          addLine(w.price, `rgba(63,185,80,${0.35 + 0.55 * (w.notional / maxN)})`,
-            "B " + Math.round(w.notional / 1000) + "k", w.notional / maxN > 0.6 ? 2 : 1);
+          const a = 0.22 + 0.35 * (w.notional / maxN);
+          // Lines only — no axis labels / size numbers
+          addLine(w.price, `rgba(63,185,80,${a})`, "", 1, LightweightCharts.LineStyle.Dotted);
         }
         for (const w of (s.ask_walls || []).slice(0, 4)) {
-          addLine(w.price, `rgba(248,81,73,${0.35 + 0.55 * (w.notional / maxN)})`,
-            "A " + Math.round(w.notional / 1000) + "k", w.notional / maxN > 0.6 ? 2 : 1);
+          const a = 0.22 + 0.35 * (w.notional / maxN);
+          addLine(w.price, `rgba(248,81,73,${a})`, "", 1, LightweightCharts.LineStyle.Dotted);
         }
         if (paper.side) {
-          addLine(paper.entry, "#d2a8ff", "ENTRY", 2);
-          // Always show BE target at entry; solid gold when locked
+          addLine(paper.entry, "#d2a8ff", "E", 1);
           if (paper.be_locked) {
-            addLine(paper.entry, "#e3b341", "BE ✓", 2, LightweightCharts.LineStyle.Solid);
+            addLine(paper.entry, "#e3b341", "BE", 1, LightweightCharts.LineStyle.Solid);
           } else {
-            addLine(paper.entry, "rgba(227,179,65,0.55)", "BE", 1, LightweightCharts.LineStyle.SparseDotted);
+            addLine(paper.entry, "rgba(227,179,65,0.45)", "BE", 1, LightweightCharts.LineStyle.SparseDotted);
           }
           addLine(paper.tp, "#3fb950", "TP", 1, LightweightCharts.LineStyle.Dashed);
           const slLabel = paper.be_locked && Math.abs(paper.sl - paper.entry) / paper.entry < 1e-8
-            ? "SL=BE" : "SL";
+            ? "BE" : "SL";
           addLine(paper.sl, "#f85149", slLabel, 1, LightweightCharts.LineStyle.Dashed);
         }
         if (live.side && live.entry) {
-          addLine(live.entry, "#ffa657", "LIVE", 2, LightweightCharts.LineStyle.SparseDotted);
+          addLine(live.entry, "#ffa657", "L", 1, LightweightCharts.LineStyle.SparseDotted);
         }
 
         const markers = (s.markers || []).map(m => ({
