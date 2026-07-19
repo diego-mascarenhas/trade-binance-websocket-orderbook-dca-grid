@@ -559,20 +559,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       btn.classList.toggle("on", live);
       btn.textContent = live ? "LIVE" : "PAPER";
       btn.title = live
-        ? "LIVE on — click for PAPER (closes open position)"
-        : "PAPER — click for LIVE (closes open paper position)";
+        ? "LIVE on — adopts/manages exchange position; click for PAPER (no new live entries)"
+        : "PAPER — click to go LIVE (adopts open exchange position if any)";
     }
     async function toggleLive() {
       const btn = document.getElementById("btnLive");
       if (togglingLive || !btn) return;
       const nextLive = !btn.classList.contains("on");
-      const paper = (window.__lastState && window.__lastState.paper) || {};
-      if (paper.side) {
-        const msg = nextLive
-          ? "Open position will be closed (paper) before enabling LIVE. Continue?"
-          : "Open position will be closed before switching to PAPER. Continue?";
-        if (!confirm(msg)) return;
-      }
       togglingLive = true;
       btn.disabled = true;
       try {
@@ -584,6 +577,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const data = await r.json().catch(() => ({}));
         if (!r.ok || !data.ok) throw new Error(data.error || ("HTTP " + r.status));
         syncLiveBtn(!!data.dry_run);
+        if (data.adopted && data.adopt) {
+          const a = data.adopt;
+          console.info("adopted", a);
+        }
       } catch (e) {
         console.warn("live toggle failed", e);
         alert("LIVE toggle failed: " + (e.message || e));
@@ -1301,36 +1298,127 @@ class BookState:
             self._snapshot["block_reason"] = self._block_reason
         return {"ok": True, "why": "manual", "mark": mid}
 
+    def _pos_is_live(self, pos: dict[str, Any] | None = None) -> bool:
+        p = pos if pos is not None else self._paper
+        return bool(p) and str(p.get("source") or "") == "live"
+
+    def _fetch_exchange_position(self) -> dict[str, Any] | None:
+        """Open Binance Futures position for this symbol, if any."""
+        if not self.api_key or not self.api_secret:
+            return None
+        from orderbook_dca_grid import get_position_meta
+
+        long_m = get_position_meta(
+            self.symbol, True, self.hedge, self.api_key, self.api_secret, self.recv_window
+        )
+        short_m = get_position_meta(
+            self.symbol, False, self.hedge, self.api_key, self.api_secret, self.recv_window
+        )
+        if float(long_m["qty"]) > 0:
+            return {
+                "side": "long",
+                "qty": float(long_m["qty"]),
+                "entry": float(long_m["entry"]),
+                "upnl": float(long_m["unrealized_pnl"]),
+            }
+        if float(short_m["qty"]) > 0:
+            return {
+                "side": "short",
+                "qty": float(short_m["qty"]),
+                "entry": float(short_m["entry"]),
+                "upnl": float(short_m["unrealized_pnl"]),
+            }
+        return None
+
+    def _adopt_exchange_position(self, now: float) -> dict[str, Any] | None:
+        """Bind bot management to an already-open exchange position."""
+        ex = self._fetch_exchange_position()
+        if not ex:
+            return None
+        side = str(ex["side"])
+        entry = float(ex["entry"])
+        qty = float(ex["qty"])
+        if entry <= 0 or qty <= 0:
+            return None
+        mid = float((self._snapshot or {}).get("mid") or entry)
+        bid_walls: list[dict[str, float]] = []
+        ask_walls: list[dict[str, float]] = []
+        best_bid = best_ask = None
+        try:
+            book = self._fetch_book()
+            mid = float(book.get("mid") or mid)
+            bid_walls = list(book.get("bid_walls") or [])
+            ask_walls = list(book.get("ask_walls") or [])
+            best_bid = book.get("best_bid")
+            best_ask = book.get("best_ask")
+        except Exception:  # noqa: BLE001
+            pass
+        wall_price = entry
+        if side == "long" and bid_walls:
+            wall_price = float(bid_walls[0]["price"])
+        elif side == "short" and ask_walls:
+            wall_price = float(ask_walls[0]["price"])
+        if self.exits == "wall":
+            tp, sl, exits_note = self._wall_tp_sl(
+                side, entry, mid, bid_walls, ask_walls, best_bid, best_ask
+            )
+        else:
+            tp, sl = self._pct_tp_sl(side, entry)
+            exits_note = "pct"
+        self._paper = {
+            "side": side,
+            "entry": entry,
+            "tp": tp,
+            "sl": sl,
+            "wall_price": wall_price,
+            "opened_at": now,
+            "source": "live",
+            "reason": "adopt",
+            "exits": f"adopt+{exits_note}",
+            "qty": qty,
+            "base_qty": qty,
+            "qty_str": f"{qty:.6g}",
+            "order_id": "",
+            "pnl_pct": self._pnl_pct(entry, mid, side),
+            "peak_pnl_pct": 0.0,
+            "peak_mid": mid,
+            "armed": False,
+            "dca_count": 0,
+            "dca_walls": [float(wall_price)],
+            "adverse_mid": mid,
+            "be_locked": False,
+        }
+        self._last_order_error = None
+        self._session["notional"] = qty * entry
+        self._markers.append(
+            {
+                "t": int(now),
+                "side": side,
+                "kind": "entry",
+                "label": "A",
+                "win": True,
+            }
+        )
+        if len(self._markers) > 80:
+            self._markers = self._markers[-80:]
+        print(
+            f"ADOPT {side.upper()} {self.symbol} qty={qty:g} @ {entry:g} "
+            f"TP {tp:g} SL {sl:g}",
+            flush=True,
+        )
+        return {
+            "side": side,
+            "qty": qty,
+            "entry": entry,
+            "tp": tp,
+            "sl": sl,
+        }
+
     def set_live(self, enabled: bool) -> dict[str, Any]:
-        """Toggle LIVE vs PAPER. Flattens any open position first (paper local / LIVE market)."""
+        """Toggle LIVE vs PAPER without closing. LIVE adopts an exchange position if open."""
         want_live = bool(enabled)
-        closed_for_mode = False
-        if self._paper:
-            mid = float((self._snapshot or {}).get("mid") or 0)
-            if mid <= 0 and self._trail:
-                mid = float(self._trail[-1]["mid"])
-            if mid <= 0:
-                mid = float(self._paper.get("entry") or 0)
-            if mid <= 0:
-                return {"ok": False, "error": "no mark price to flatten before mode switch"}
-            src = str(self._paper.get("source") or "paper")
-            live_pos = (src == "live") or (not self.dry_run)
-            if live_pos:
-                # Real position: market-close before leaving/entering cleanly
-                self._close_paper(mid, time.time(), "mode")
-                if self._paper is not None:
-                    return {
-                        "ok": False,
-                        "error": self._last_order_error
-                        or "close LIVE position first",
-                    }
-            else:
-                # Paper-only: drop local position (never hit the exchange)
-                prev = self.dry_run
-                self.dry_run = True
-                self._close_paper(mid, time.time(), "mode")
-                self.dry_run = prev
-            closed_for_mode = True
+        adopted: dict[str, Any] | None = None
+        note = ""
         if want_live:
             if not self.api_key or not self.api_secret:
                 return {"ok": False, "error": "API keys required for LIVE (.env)"}
@@ -1347,25 +1435,59 @@ class BookState:
                     return {"ok": False, "error": f"live setup failed: {exc}"}
             self.dry_run = False
             self.live_enabled = True
-            print(f"MODE → LIVE {self.symbol}", flush=True)
+            now = time.time()
+            try:
+                ex = self._fetch_exchange_position()
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": f"position check failed: {exc}"}
+            if ex:
+                local = self._paper
+                same = (
+                    local
+                    and str(local.get("side")) == ex["side"]
+                    and self._pos_is_live(local)
+                )
+                if same:
+                    # Refresh qty/avg from exchange; keep TP/SL management
+                    local["qty"] = float(ex["qty"])
+                    local["entry"] = float(ex["entry"])
+                    local["base_qty"] = float(local.get("base_qty") or ex["qty"])
+                    note = "synced live position"
+                else:
+                    adopted = self._adopt_exchange_position(now)
+                    note = "adopted exchange position" if adopted else "adopt failed"
+            elif self._paper and not self._pos_is_live(self._paper):
+                note = "kept paper position; new entries LIVE"
+            else:
+                note = "LIVE armed (flat)"
+            print(f"MODE → LIVE {self.symbol} · {note}", flush=True)
         else:
             self.dry_run = True
             self.live_enabled = bool(self.api_key and self.api_secret)
-            print(f"MODE → PAPER {self.symbol}", flush=True)
+            if self._pos_is_live():
+                note = "PAPER mode; still managing open LIVE position until flat"
+            elif self._paper:
+                note = "PAPER mode; managing paper position"
+            else:
+                note = "PAPER armed (flat)"
+            print(f"MODE → PAPER {self.symbol} · {note}", flush=True)
         with self._lock:
             self._snapshot["dry_run"] = self.dry_run
             self._snapshot["live_enabled"] = self.live_enabled
             self._snapshot["paper"] = dict(self._paper) if self._paper else {}
             self._snapshot["trades"] = list(self._trades)
             self._snapshot["markers"] = list(self._markers)
-            self._snapshot["session"] = self._session_view(0.0)
+            unreal = float((self._paper or {}).get("pnl_pct") or 0)
+            self._snapshot["session"] = self._session_view(unreal)
             self._snapshot["signal"] = self._signal
             self._snapshot["block_reason"] = self._block_reason
         return {
             "ok": True,
             "live": not self.dry_run,
             "dry_run": self.dry_run,
-            "closed": closed_for_mode,
+            "adopted": adopted is not None,
+            "adopt": adopted,
+            "note": note,
         }
 
     def filter_flags(self) -> dict[str, bool]:
@@ -2163,7 +2285,8 @@ class BookState:
         if not pos:
             return
         side = pos["side"]
-        if not self.dry_run and self.api_key and self.filt:
+        # Exit on exchange only for adopted/opened LIVE legs (mode toggle must not orphan)
+        if self._pos_is_live(pos) and self.api_key and self.filt:
             try:
                 from orderbook_dca_grid import get_position_meta, market_close_position
 
@@ -2369,7 +2492,7 @@ class BookState:
 
         fill_px = fill
         use_exchange_avg = False
-        if not self.dry_run:
+        if self._pos_is_live(pos):
             if not self.api_key or not self.api_secret or not self.filt:
                 return False
             try:
