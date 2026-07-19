@@ -521,10 +521,12 @@ def detect_swing_impulse(
     bear = (best_bear or best_bear_any)
     bull_s = bull[1] if bull else None
     bear_s = bear[1] if bear else None
+    # Never fall back to the opposite impulse — LONG needs a bull swing (low→high),
+    # SHORT needs a bear swing (high→low). Wrong side inverts Fib 0/1.
     if prefer_long is True:
-        return bull_s or bear_s
+        return bull_s
     if prefer_long is False:
-        return bear_s or bull_s
+        return bear_s
     if bull and bear:
         return bull_s if bull[0] >= bear[0] else bear_s
     return bull_s or bear_s
@@ -842,10 +844,10 @@ def build_grid_plan(
 
         if swing.is_long != is_long:
             print(
-                f"{YELLOW}Swing is {'bull' if swing.is_long else 'bear'} "
-                f"but signal is {'LONG' if is_long else 'SHORT'} — "
-                f"still anchoring Fib to that swing{RESET}"
+                f"{YELLOW}No {'bull' if is_long else 'bear'} swing for "
+                f"{'LONG' if is_long else 'SHORT'} on {args.fib_interval} — skip{RESET}"
             )
+            return None
 
         # Arm only while mark is between Fib 0.000 and Fib arm_max (default 0.236)
         if not ignore_arm_window:
@@ -992,7 +994,13 @@ def render_ladder_lines(
     trail_armed: bool = False,
     trail_callback: float = 0.2,
 ) -> list[str]:
-    """Fib/step ladder with MARK (and optional ENTRY) inserted in price order."""
+    """Fib/step ladder with MARK (and optional ENTRY) inserted in price order.
+
+    Fib convention (grid): 0.000 = impulse extreme (LONG high / SHORT low),
+    1.000 = impulse origin (LONG low / SHORT high). Retraces toward origin.
+    Classic TradingView draw low→high labels the opposite ends as 0/1; prices
+    of 0.5/0.618 map to mirrored ratios here. TP algo is a separate row.
+    """
     tp_px = float(tp_price if tp_price is not None else plan.tp_price)
     sl_px = float(sl_price if sl_price is not None else plan.sl_price)
     open_idxs = open_level_idxs or set()
@@ -1019,11 +1027,18 @@ def render_ladder_lines(
             else:
                 px = swing.low + swing.span * r
             if r <= 0.0:
-                role, label = "TP", "Fib 0.000"
+                # Impulse extreme (LONG=high / SHORT=low). Never overwrite with TP algo.
+                role = "HIGH" if plan.is_long else "LOW"
+                label = "Fib 0.000"
+                lim = "extreme"
             elif r >= 1.0:
-                role, label = "ORIGIN", "Fib 1.000"
+                # Impulse origin (LONG=low / SHORT=high)
+                role = "LOW" if plan.is_long else "HIGH"
+                label = "Fib 1.000"
+                lim = "origin"
             else:
                 role, label = "GRID", f"Fib {r:.3f}"
+                lim = "—"
             lv = limit_by_r.get(round(r, 3))
             if lv is not None:
                 usdt = f"{lv.size_usdt:.2f}U"
@@ -1036,16 +1051,13 @@ def render_ladder_lines(
                     lim = usdt
                     px = lv.price
                 else:
-                    # Planned rung (not yet synced / not placed)
                     role = "LIMIT"
                     lim = usdt
                     px = lv.price
-            elif r <= 0.0:
-                lim = "algo"
-                px = tp_px
-            else:
-                lim = "—"
             rows_out.append((px, label, role, lim, "level"))
+
+        # TP is avg±% (separate from Fib 0.000 extreme)
+        rows_out.append((tp_px, "TP", "TP", "algo", "level"))
 
         if trail_armed:
             # Show trail at entry (BE floor); Binance trails from mark extreme.
@@ -1095,6 +1107,8 @@ def render_ladder_lines(
                     role_c = RED
                 elif role == "TRAIL":
                     role_c = CYAN
+                elif role in ("HIGH", "LOW"):
+                    role_c = DIM
                 elif role == "LIMIT":
                     role_c = YELLOW
                 else:
@@ -1164,6 +1178,18 @@ def sync_grid_level_status(
     return open_idxs, filled_idxs
 
 
+def _fmt_elapsed(sec: float) -> str:
+    """Human trade age: 45s · 12m 03s · 1h 05m."""
+    s = max(0, int(sec))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+
 def render_live_table(
     symbol: str,
     state: "CycleState",
@@ -1199,29 +1225,45 @@ def render_live_table(
             open_level_idxs=open_level_idxs, filled_level_idxs=filled_level_idxs,
             trail_armed=state.trail_armed,
         )
+        return [head, *body]
+
+    notional = (qty * entry) if qty > 0 and entry > 0 else 0.0
+    opened = float(getattr(state, "opened_at", 0.0) or 0.0)
+    if opened > 0:
+        entry_clock = time.strftime("%H:%M:%S", time.localtime(opened))
+        elapsed = _fmt_elapsed(time.time() - opened)
     else:
-        notional = (qty * entry) if qty > 0 and entry > 0 else 0.0
-        head = (
-            f"{color}{side}{RESET} {symbol.upper()} · {notional:.2f}U · "
-            f"entry {price_fmt(entry)} · mid {price_fmt(mark)}"
-            + (f" · uPnL={upnl:+.4f}" if upnl is not None else "")
-            + (f" · filled={n_fill} open={n_open if n_open is not None else 0}" if plan.levels else "")
-            + (f" · {CYAN}TRAIL{RESET}" if state.trail_armed else "")
-        )
-        body = render_ladder_lines(
-            plan,
-            mark=mark,
-            tp_price=state.tp or plan.tp_price,
-            sl_price=state.sl or plan.sl_price,
-            entry=entry if entry > 0 else None,
-            qty=qty if qty > 0 else None,
-            upnl=upnl,
-            open_level_idxs=open_level_idxs,
-            filled_level_idxs=filled_level_idxs,
-            trail_armed=state.trail_armed,
-            trail_callback=float(state.trail_callback or 0.2),
-        )
-    return [head, *body]
+        entry_clock = "--:--:--"
+        elapsed = "—"
+    entry_px = price_fmt(entry) if entry > 0 else "—"
+    # Line 1: identity + entry clock/price + age
+    head = (
+        f"{BOLD}{symbol.upper()}{RESET} {color}{side}{RESET} · "
+        f"in {entry_clock} @ {entry_px} · "
+        f"t={elapsed}"
+    )
+    # Line 2: size / live / fills
+    meta = (
+        f"{DIM}{notional:.2f}U · mid {price_fmt(mark)}"
+        + (f" · uPnL={upnl:+.4f}" if upnl is not None else "")
+        + (f" · filled={n_fill} open={n_open if n_open is not None else 0}" if plan.levels else "")
+        + (f" · TRAIL" if state.trail_armed else "")
+        + f"{RESET}"
+    )
+    body = render_ladder_lines(
+        plan,
+        mark=mark,
+        tp_price=state.tp or plan.tp_price,
+        sl_price=state.sl or plan.sl_price,
+        entry=entry if entry > 0 else None,
+        qty=qty if qty > 0 else None,
+        upnl=upnl,
+        open_level_idxs=open_level_idxs,
+        filled_level_idxs=filled_level_idxs,
+        trail_armed=state.trail_armed,
+        trail_callback=float(state.trail_callback or 0.2),
+    )
+    return [head, meta, *body]
 
 
 def print_live_table(state: "CycleState", lines: list[str], *, force: bool = False) -> None:
@@ -1645,7 +1687,10 @@ def adopt_existing_position(
     recv: int,
     args: argparse.Namespace,
 ) -> CycleState | None:
-    """Rebuild cycle state + live table from an already-open same-side position."""
+    """Rebuild cycle state + live table from an already-open same-side position.
+
+    Requires a same-side Fib swing (no step-grid fallback).
+    """
     qty, entry = get_position(symbol, is_long, hedge, api, sec, recv)
     if qty <= 0 or entry <= 0:
         return None
@@ -1653,17 +1698,42 @@ def adopt_existing_position(
     plan = build_grid_plan(
         symbol, mark, is_long, args, filt, ignore_arm_window=True,
     )
-    if plan is None:
-        plan = build_step_grid(
-            entry,
+    if plan is None or plan.swing is None:
+        # Retry once with looser range (still same-side swing only)
+        loose = float(getattr(args, "fib_min_range", 0.40)) * 0.5
+        try:
+            swing = detect_swing_impulse(
+                symbol,
+                prefer_long=is_long,
+                interval=args.fib_interval,
+                lookback=max(int(args.fib_lookback), 60),
+                min_range_pct=max(0.15, loose),
+                max_span_bars=max(int(args.fib_max_span), 20),
+                mark=None,
+                min_fib_room=0,
+            )
+        except Exception:
+            swing = None
+        if swing is None or swing.is_long != is_long:
+            print(
+                f"{YELLOW}Adopt: no {'bull' if is_long else 'bear'} Fib swing — "
+                f"keeping position, no ladder (swing required){RESET}"
+            )
+            append_journal(symbol, "ADOPT_SKIP no_swing")
+            return None
+        plan = build_fib_grid(
+            mark or entry,
             is_long,
-            levels=max(1, int(args.levels)),
-            step_pct=args.step_pct,
+            swing,
+            levels=args.levels,
             base_usdt=args.base_size,
             level_usdt=args.level_size,
             tp_pct=args.tp_pct,
             sl_pct=args.sl_pct,
             filt=filt,
+            tp_ext=args.fib_tp_ext,
+            sl_buf_pct=args.fib_sl_buf,
+            fvg=None,
         )
     plan.note = ((plan.note + " · ") if plan.note else "") + "adopted"
 

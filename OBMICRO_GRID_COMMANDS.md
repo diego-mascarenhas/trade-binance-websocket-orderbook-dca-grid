@@ -191,7 +191,7 @@ fib LTCUSDT --cooldown-sec 300
 ## Behavior (lifecycle)
 
 1. **Signal** — 15s OB bar (`auto`) or fixed `--direction`.
-2. **Fib plan** — detect swing on `--fib-interval`; arm only if mark is in Fib **0.000 … `--arm-max-fib`**.
+2. **Fib plan** — **same-side swing required** (LONG→bull low→high, SHORT→bear high→low). No opposite-swing fallback, no step-grid substitute. Arm only if mark is in Fib **0.000 … `--arm-max-fib`**.
 3. **Arm** — place LIMIT grid (default) or MARKET+grid (`--no-wait-pullback`).
 4. **First fill** — arm exchange **TP + SL** (`TP = avg ± (0.30% net + 0.08% fees)`, no Fib cap).
 5. **More fills (DCA)** — recompute TP from new average (~0.38% gross) and refresh exchange exits; optional Telegram `#FIB FILL`.
