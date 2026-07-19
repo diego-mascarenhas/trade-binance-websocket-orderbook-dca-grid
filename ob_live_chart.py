@@ -152,7 +152,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       display: flex;
       flex-direction: column;
       gap: 2px;
-      min-width: 72px;
+      min-width: 88px;
       padding: 5px 8px;
       border: 1px solid var(--line);
       border-radius: 4px;
@@ -165,7 +165,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       line-height: 1.25;
     }
     .filter-btn:hover { border-color: #58a6ff88; }
-    .filter-btn .fk { color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.62rem; }
+    .filter-btn .fk { color: var(--muted); letter-spacing: 0.02em; font-size: 0.62rem; }
     .filter-btn .fv { font-weight: 600; }
     .filter-btn .fs { color: var(--muted); font-size: 0.6rem; }
     .filter-btn.on.ok { border-color: #3fb95088; background: #12261a; }
@@ -653,16 +653,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           paperBox.className = "pos-box";
           const peak = paper.peak_pnl_pct != null ? paper.peak_pnl_pct : pnl;
           const beOn = !!paper.be_locked;
-          const needFee = Number(s.session && s.session.fee_rt_pct != null ? s.session.fee_rt_pct : 0.1);
+          const dcaN = paper.dca_count != null ? Number(paper.dca_count) : 0;
+          const feeRt = Number(s.session && s.session.fee_rt_pct != null ? s.session.fee_rt_pct : 0.1);
+          const needFee = feeRt * (2 + dcaN) / 2;
           const beLine = beOn
             ? `<span class="win">BE LOCKED</span> @ ${fmt(paper.entry, pd)}`
             : `<span class="meta">BE pending</span> (need ~+${Math.max(0, needFee - pnl).toFixed(3)}% more / fees)`;
           const src = paper.source === "live" ? "LIVE" : "paper";
           const qtyBit = paper.qty ? ` · qty ${fmt(paper.qty, 4)}` : "";
+          const dcaBit = dcaN > 0
+            ? ` · <span class="entry">DCA×${dcaN}</span>`
+            : "";
           paperBox.innerHTML =
             `<span class="${paper.side === "long" ? "bid" : "ask"}">${paper.side.toUpperCase()}</span>` +
-            ` @ <span class="entry">${fmt(paper.entry, pd)}</span>` +
-            ` <span class="meta">[${src}]</span>${qtyBit}<br>` +
+            ` avg <span class="entry">${fmt(paper.entry, pd)}</span>` +
+            ` <span class="meta">[${src}]</span>${qtyBit}${dcaBit}<br>` +
             `TP ${fmt(paper.tp, pd)} · SL ${fmt(paper.sl, pd)}` +
             ` <span class="meta">(${paper.exits || "wall"})</span><br>` +
             `${beLine}<br>` +
@@ -1019,6 +1024,11 @@ class BookState:
         self.mom_filter = True
         self.conf_filter = True
         self.ratio_filter = min_wall_ratio > 0
+        self.dca_enabled = True
+        self.dca_max = 3
+        self.dca_min_loss_pct = 0.05  # only DCA after this unrealized loss %%
+        # When fee-covered: snap TP to nearest opposite OB and close on touch
+        self.ob_tp_exit = True
 
         self._lock = threading.Lock()
         self._trail: deque[dict[str, float]] = deque()
@@ -1114,6 +1124,8 @@ class BookState:
             "ratio": "ratio_filter",
             "conf": "conf_filter",
             "bb_strict": "bb_strict",
+            "dca": "dca_enabled",
+            "obtp": "ob_tp_exit",
         }.get(fid)
         if key is None:
             raise KeyError(f"unknown filter {fid}")
@@ -1130,7 +1142,45 @@ class BookState:
             "ratio": bool(self.ratio_filter),
             "conf": bool(self.conf_filter),
             "bb_strict": bool(self.bb_strict),
+            "dca": bool(self.dca_enabled),
+            "obtp": bool(self.ob_tp_exit),
         }
+
+    def _fee_cover_need(self, pos: dict[str, Any] | None = None) -> float:
+        """Gross %% needed to cover estimated fees (scales with DCA legs)."""
+        dca_n = int((pos or self._paper or {}).get("dca_count") or 0)
+        return self.fee_rt_pct * (2 + dca_n) / 2.0
+
+    def _nearest_reward_ob(
+        self,
+        side: str,
+        entry: float,
+        mid: float,
+        bid_walls: list[dict[str, float]],
+        ask_walls: list[dict[str, float]],
+    ) -> dict[str, float] | None:
+        """Nearest significant opposite OB wall still in profit direction from avg."""
+        walls = ask_walls if side == "long" else bid_walls
+        cands: list[dict[str, float]] = []
+        for w in walls:
+            if w["notional"] < self.min_wall_usdt:
+                continue
+            px = float(w["price"])
+            if side == "long" and px <= entry:
+                continue
+            if side == "short" and px >= entry:
+                continue
+            cands.append(w)
+        if not cands:
+            return None
+        # Prefer walls near current mid (where price actually is)
+        near = [
+            w
+            for w in cands
+            if mid > 0 and abs(float(w["price"]) - mid) / mid * 100 <= max(self.touch_pct * 2, 0.15)
+        ]
+        pool = near if near else cands
+        return min(pool, key=lambda w: abs(float(w["price"]) - mid))
 
     def _exchange_flat(self) -> bool:
         if self.dry_run or not self.api_key:
@@ -1823,6 +1873,10 @@ class BookState:
         elif self.notional > 0 and fill_entry > 0:
             qty = self.notional / fill_entry
             qty_str = f"{qty:.6g}"
+        if qty <= 0 and fill_entry > 0:
+            # Paper unit size so DCA averaging works in dry-run
+            qty = 1.0
+            qty_str = "1"
 
         if self.exits == "wall":
             tp, sl, exits_note = self._wall_tp_sl(
@@ -1842,12 +1896,15 @@ class BookState:
             "reason": reason,
             "exits": exits_note,
             "qty": qty,
+            "base_qty": qty,
             "qty_str": qty_str,
             "order_id": order_id,
             "pnl_pct": 0.0,
             "peak_pnl_pct": 0.0,
             "peak_mid": fill_entry,
             "armed": False,
+            "dca_count": 0,
+            "dca_walls": [float(wall_price)],
         }
         self._last_order_error = None
         if qty > 0 and fill_entry > 0:
@@ -1906,7 +1963,9 @@ class BookState:
                 return
 
         gross = self._pnl_pct(pos["entry"], mark, side)
-        fee = self.fee_rt_pct
+        # N entry legs + 1 exit ≈ fee_rt * (entries + 1) / 2
+        dca_n = int(pos.get("dca_count") or 0)
+        fee = self.fee_rt_pct * (2 + dca_n) / 2.0
         net = gross - fee
         trade = {
             "side": side,
@@ -1917,6 +1976,7 @@ class BookState:
             "fee_pct": fee,
             "net_pct": net,
             "why": why,
+            "dca": dca_n,
             "source": pos.get("source", "paper"),
             "t": int(now),
         }
@@ -1951,6 +2011,187 @@ class BookState:
         self._signal = "flat"
         self._block_reason = f"cooldown {cd:g}s after {why}"
 
+    def _next_dca_wall(
+        self,
+        side: str,
+        entry: float,
+        mid: float,
+        walls: list[dict[str, float]],
+        used: list[float],
+    ) -> dict[str, float] | None:
+        """Nearest unused adverse OB wall (below avg for long / above for short)."""
+        cands: list[dict[str, float]] = []
+        for w in walls:
+            if w["notional"] < self.min_wall_usdt:
+                continue
+            px = float(w["price"])
+            if mid <= 0:
+                continue
+            if abs(px - mid) / mid * 100 > self.touch_pct:
+                continue
+            if side == "long":
+                if px >= entry:
+                    continue
+            else:
+                if px <= entry:
+                    continue
+            if any(u > 0 and abs(px - u) / u * 100 < 0.02 for u in used):
+                continue
+            cands.append(w)
+        if not cands:
+            return None
+        return min(cands, key=lambda w: abs(w["price"] - mid))
+
+    def _add_dca(
+        self,
+        fill: float,
+        wall: dict[str, float],
+        now: float,
+        *,
+        bid_walls: list[dict[str, float]],
+        ask_walls: list[dict[str, float]],
+        best_bid: float | None,
+        best_ask: float | None,
+    ) -> bool:
+        """Add size at wall, rebase avg entry, recalculate TP/SL."""
+        pos = self._paper
+        if not pos:
+            return False
+        side = pos["side"]
+        old_entry = float(pos["entry"])
+        old_qty = float(pos.get("qty") or 0)
+        add_qty = float(pos.get("base_qty") or old_qty or 0)
+        if add_qty <= 0:
+            add_qty = 1.0
+
+        fill_px = fill
+        use_exchange_avg = False
+        if not self.dry_run:
+            if not self.api_key or not self.api_secret or not self.filt:
+                return False
+            try:
+                qty_str, add_qty = self._size_order(fill)
+                cid = _cid("obdca", self.symbol, side)
+                resp = market_open(
+                    self.symbol,
+                    side == "long",
+                    qty_str,
+                    self.hedge,
+                    self.api_key,
+                    self.api_secret,
+                    self.recv_window,
+                    cid=cid,
+                )
+                avg = float(resp.get("avgPrice", 0) or 0)
+                if avg > 0:
+                    fill_px = avg
+                from orderbook_dca_grid import get_position_meta
+
+                meta = get_position_meta(
+                    self.symbol,
+                    side == "long",
+                    self.hedge,
+                    self.api_key,
+                    self.api_secret,
+                    self.recv_window,
+                )
+                if float(meta["entry"]) > 0 and float(meta["qty"]) > 0:
+                    pos["entry"] = float(meta["entry"])
+                    pos["qty"] = float(meta["qty"])
+                    use_exchange_avg = True
+                print(
+                    f"LIVE DCA {side.upper()} {self.symbol} +{add_qty:g} "
+                    f"@ ~{fill_px:g}",
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._last_order_error = f"dca failed: {exc}"
+                print(f"LIVE DCA FAILED: {exc}", flush=True)
+                return False
+
+        if not use_exchange_avg:
+            new_qty = old_qty + add_qty
+            new_avg = (
+                (old_entry * old_qty + fill_px * add_qty) / new_qty
+                if new_qty > 0
+                else fill_px
+            )
+            pos["entry"] = new_avg
+            pos["qty"] = new_qty
+        new_avg = float(pos["entry"])
+        new_qty = float(pos["qty"])
+
+        pos["dca_count"] = int(pos.get("dca_count") or 0) + 1
+        used = list(pos.get("dca_walls") or [])
+        used.append(float(wall["price"]))
+        pos["dca_walls"] = used
+        pos["wall_price"] = float(wall["price"])
+        pos["armed"] = False
+        pos["be_locked"] = False
+        pos["peak_pnl_pct"] = 0.0
+        pos["peak_mid"] = new_avg
+
+        if self.exits == "wall":
+            tp, sl, note = self._wall_tp_sl(
+                side, new_avg, fill_px, bid_walls, ask_walls, best_bid, best_ask
+            )
+        else:
+            tp, sl = self._pct_tp_sl(side, new_avg)
+            note = "pct"
+        pos["tp"] = tp
+        pos["sl"] = sl  # full reset after DCA (not ratchet-tight)
+        pos["exits"] = f"dca{pos['dca_count']}+{note}"
+        if new_qty > 0 and new_avg > 0:
+            self._session["notional"] = new_qty * new_avg
+        self._markers.append(
+            {
+                "t": int(now),
+                "side": side,
+                "kind": "entry",
+                "label": "D",
+                "win": True,
+            }
+        )
+        if len(self._markers) > 80:
+            self._markers = self._markers[-80:]
+        print(
+            f"DCA #{pos['dca_count']} {side} +{add_qty:g} @ {fill_px:g} → "
+            f"avg {new_avg:g}  TP {tp:g}  SL {sl:g}",
+            flush=True,
+        )
+        return True
+
+    def _maybe_dca(
+        self,
+        mid: float,
+        now: float,
+        pnl: float,
+        *,
+        bid_walls: list[dict[str, float]],
+        ask_walls: list[dict[str, float]],
+        best_bid: float | None,
+        best_ask: float | None,
+    ) -> bool:
+        pos = self._paper
+        if not pos or not self.dca_enabled:
+            return False
+        if pnl >= -self.dca_min_loss_pct:
+            return False
+        if int(pos.get("dca_count") or 0) >= self.dca_max:
+            return False
+        side = pos["side"]
+        entry = float(pos["entry"])
+        used = [float(x) for x in (pos.get("dca_walls") or [])]
+        walls = bid_walls if side == "long" else ask_walls
+        wall = self._next_dca_wall(side, entry, mid, walls, used)
+        if wall is None:
+            return False
+        return self._add_dca(
+            mid, wall, now,
+            bid_walls=bid_walls, ask_walls=ask_walls,
+            best_bid=best_bid, best_ask=best_ask,
+        )
+
     def _manage_paper(
         self,
         mid: float,
@@ -1977,26 +2218,55 @@ class BookState:
         else:
             pos["peak_mid"] = min(float(pos.get("peak_mid", mid)), mid)
 
+        # DCA on adverse OB walls while underwater — rebase avg + TP/SL
+        if self._maybe_dca(
+            mid, now, pnl,
+            bid_walls=bid_walls, ask_walls=ask_walls,
+            best_bid=best_bid, best_ask=best_ask,
+        ):
+            entry = float(pos["entry"])
+            pnl = self._pnl_pct(entry, mid, side)
+            pos["pnl_pct"] = pnl
+
         held = now - float(pos.get("opened_at", now))
         in_grace = held < self.sl_grace_sec
         min_sl = self._min_sl_dist_pct()
         be_buf = max(0.0, self.be_buffer_pct)
 
-        # Soft exits after fees; BE needs extra cushion so entry-retest noise doesn't stop out
-        soft_arm_need = max(self.min_lock_pct, self.fee_rt_pct if self.net_exits else 0.0)
+        # Soft exits after fees (scale with DCA); BE needs extra cushion
+        fee_need = self._fee_cover_need(pos)
+        soft_arm_need = max(self.min_lock_pct, fee_need if self.net_exits else 0.0)
         be_arm_need = soft_arm_need + be_buf + max(0.02, self.fee_rt_pct * 0.5)
         if pnl >= soft_arm_need:
             pos["armed"] = True
         be_ready = (not in_grace) and pnl >= be_arm_need
         pos["be_locked"] = False
+        fee_covered = pnl >= fee_need
 
-        # Refresh TP always; freeze SL ratchets during grace (keeps initial room)
+        # Refresh TP/SL from book; when fee-covered, snap TP to nearest opposite OB
         if self.exits == "wall":
             tp, sl, note = self._wall_tp_sl(
                 side, entry, mid, bid_walls, ask_walls, best_bid, best_ask
             )
+            ob_w = None
+            if self.ob_tp_exit and fee_covered:
+                ob_w = self._nearest_reward_ob(
+                    side, entry, mid, bid_walls, ask_walls
+                )
+                if ob_w is not None:
+                    # Pull TP to opposite OB (closer lock-in once fees are paid)
+                    if side == "long":
+                        tp = min(tp, float(ob_w["price"]))
+                        if tp <= entry:
+                            tp = float(ob_w["price"])
+                    else:
+                        tp = max(tp, float(ob_w["price"]))
+                        if tp >= entry:
+                            tp = float(ob_w["price"])
+                    note = "ob-tp"
             pos["tp"] = tp
-            pos["exits"] = note
+            dca_n = int(pos.get("dca_count") or 0)
+            pos["exits"] = (f"dca{dca_n}+" if dca_n else "") + note
             if not in_grace:
                 old_sl = float(pos["sl"])
                 if side == "long":
@@ -2042,15 +2312,54 @@ class BookState:
                     pos["sl"] = min(float(pos["sl"]), trail_sl)
                     protect_note.append("trail")
         if protect_note:
-            base = str(pos.get("exits") or "wall").split("+")[0]
+            base = str(pos.get("exits") or "wall")
             pos["exits"] = base + "+" + "+".join(protect_note)
 
         soft_ok = held >= self.min_hold_sec
-        # Soft exits need a real cushion (fees + half edge) — avoid scratch flips
-        soft_need = self.fee_rt_pct + max(0.0, self.min_edge_pct) * 0.5
+        soft_need = fee_need + max(0.0, self.min_edge_pct) * 0.5
         can_soft = soft_ok and (
             not self.net_exits or pnl >= soft_need
         )
+
+        # Fee-covered @ opposite OB: touch / through wall, OR book/imb turns against
+        if (
+            self.ob_tp_exit
+            and fee_covered
+            and soft_ok
+            and not in_grace
+            and mid > 0
+        ):
+            ob_w = self._nearest_reward_ob(
+                side, entry, mid, bid_walls, ask_walls
+            )
+            if ob_w is not None:
+                ob_px = float(ob_w["price"])
+                dist = abs(ob_px - mid) / mid * 100
+                zone = max(self.touch_pct * 2.5, 0.15)
+                near_ob = dist <= zone
+                # Price reached/through the wall in profit direction
+                through = (
+                    (side == "long" and mid >= ob_px)
+                    or (side == "short" and mid <= ob_px)
+                )
+                touch = dist <= self.touch_pct
+                # Bid/ask (imbalance) turns against the position near the OB
+                imb_against = (
+                    (side == "long" and imb < 0.48)
+                    or (side == "short" and imb > 0.52)
+                )
+                bp = float(self._book.get("pressure") or 0.5)
+                btr = str(self._book.get("trend") or "")
+                book_against = (
+                    (side == "long" and (bp <= 0.45 or btr == "building-ask"))
+                    or (side == "short" and (bp >= 0.55 or btr == "building-bid"))
+                )
+                if through or touch:
+                    self._close_paper(mid, now, "ob")
+                    return
+                if near_ob and (imb_against or book_against):
+                    self._close_paper(mid, now, "ob-rev")
+                    return
 
         # Proactive: lock green when sense flips or price reverses from peak
         if pos.get("armed") and pnl > 0 and can_soft and not in_grace:
@@ -2156,56 +2465,52 @@ class BookState:
         flags = self.filter_flags()
         return [
             self._filter_chip(
-                fid="wall", label="WALL", value="—", enabled=True,
+                fid="wall", label="Wall", value="—", enabled=True,
                 state="wait", status=why, toggle=False,
             ),
             self._filter_chip(
-                fid="imb", label="IMB", value="—", enabled=True,
+                fid="imb", label="Imbalance", value="—", enabled=True,
                 state="wait", status=why, toggle=False,
             ),
             self._filter_chip(
-                fid="bb", label="BB", value=str(self._bb.get("label") or "—"),
+                fid="bb", label="Bollinger", value=str(self._bb.get("label") or "—"),
                 enabled=flags["bb"],
                 state="off" if not flags["bb"] else ("ok" if self._bb.get("tradeable") else "block"),
                 status="regime filter",
             ),
             self._filter_chip(
-                fid="ema", label="EMA", value=str(self._trend.get("label") or "—"),
+                fid="ema", label="EMA trend", value=str(self._trend.get("label") or "—"),
                 enabled=flags["ema"],
                 state="off" if not flags["ema"] else "wait",
                 status="trend filter",
             ),
             self._filter_chip(
-                fid="book", label="BOOK", value=str(self._book.get("label") or "—"),
+                fid="book", label="Book", value=str(self._book.get("label") or "—"),
                 enabled=flags["book"],
                 state="off" if not flags["book"] else "wait",
                 status=str(self._book.get("trend") or ""),
             ),
             self._filter_chip(
-                fid="mom", label="MOM", value="—",
+                fid="mom", label="Momentum", value="—",
                 enabled=flags["mom"],
                 state="off" if not flags["mom"] else "wait",
                 status="micro mom",
             ),
             self._filter_chip(
-                fid="bounce", label="BOUNCE", value="off" if not flags["bounce"] else "on",
+                fid="bounce", label="Bounce", value="off" if not flags["bounce"] else "on",
                 enabled=flags["bounce"],
                 state="off" if not flags["bounce"] else "wait",
                 status="need bounce/reject",
             ),
             self._filter_chip(
-                fid="ratio", label="RATIO", value="—",
+                fid="ratio", label="Ratio", value="—",
                 enabled=flags["ratio"],
                 state="off" if not flags["ratio"] else "wait",
                 status=f"min {self.min_wall_ratio:g}×",
             ),
-            self._filter_chip(
-                fid="conf", label="CONF",
-                value=f"{float(self._confidence.get('score') or 0):.0f}/{self.min_confidence:.0f}",
-                enabled=flags["conf"],
-                state="off" if not flags["conf"] else "wait",
-                status="setup score",
-            ),
+            self._conf_filter_chip(),
+            self._dca_filter_chip(),
+            self._obtp_filter_chip(),
         ]
 
     def _build_filter_bar(
@@ -2233,12 +2538,17 @@ class BookState:
             wall_val = "ask"
         else:
             wall_val = "none"
-        wall_state = "ok" if near else "block"
-        wall_st = (
-            f"{abs(float(wall['dist_pct'])):.3f}% · {float(wall['notional'])/1000:.0f}k"
-            if wall and near
-            else f"need ≤{self.touch_pct:g}%"
-        )
+        # ok = ready, wait = not yet, block = actively failing a ready setup
+        wall_state = "ok" if near else "wait"
+        if wall and not near:
+            wall_st = f"{abs(float(wall['dist_pct'])):.3f}% away"
+        elif wall and near:
+            wall_st = (
+                f"{abs(float(wall['dist_pct'])):.3f}% · "
+                f"{float(wall['notional'])/1000:.0f}k"
+            )
+        else:
+            wall_st = f"need ≤{self.touch_pct:g}%"
 
         if cand_side == "long":
             imb_ok = imb >= self.imb_long
@@ -2246,7 +2556,7 @@ class BookState:
         else:
             imb_ok = imb <= self.imb_short
             imb_st = f"≤{self.imb_short*100:.0f}%"
-        imb_state = "ok" if imb_ok else ("wait" if near else "block")
+        imb_state = "ok" if imb_ok else ("block" if near else "wait")
 
         bb_lab = str(self._bb.get("label") or "—")
         bb_ok = bool(self._bb.get("tradeable", True))
@@ -2289,57 +2599,126 @@ class BookState:
         ratio_ok = (not flags["ratio"]) or self.min_wall_ratio <= 0 or opp_n <= 0 or ratio >= self.min_wall_ratio
         ratio_state = "off" if not flags["ratio"] else ("ok" if ratio_ok else "block")
 
-        score = float(conf.get("score") or 0)
-        conf_ok = score >= self.min_confidence
-        conf_state = "off" if not flags["conf"] else ("ok" if conf_ok else "block")
-
         return [
             self._filter_chip(
-                fid="wall", label="WALL", value=wall_val, enabled=True,
+                fid="wall", label="Wall", value=wall_val, enabled=True,
                 state=wall_state, status=wall_st, toggle=False,
             ),
             self._filter_chip(
-                fid="imb", label="IMB", value=f"{imb*100:.1f}%", enabled=True,
+                fid="imb", label="Imbalance", value=f"{imb*100:.1f}%", enabled=True,
                 state=imb_state, status=f"{cand_side} {imb_st}", toggle=False,
             ),
             self._filter_chip(
-                fid="bb", label="BB", value=bb_lab, enabled=flags["bb"],
+                fid="bb", label="Bollinger", value=bb_lab, enabled=flags["bb"],
                 state=bb_state, status="strict" if flags["bb_strict"] else "regime",
             ),
             self._filter_chip(
-                fid="ema", label="EMA", value=ema_lab, enabled=flags["ema"],
+                fid="ema", label="EMA trend", value=ema_lab, enabled=flags["ema"],
                 state=ema_state, status=f"allow {cand_side}" if ema_ok else f"blocks {cand_side}",
             ),
             self._filter_chip(
-                fid="book", label="BOOK",
+                fid="book", label="Book",
                 value=f"{str(self._book.get('label') or '—')[:9]} {bp*100:.0f}%",
                 enabled=flags["book"],
                 state=book_state, status=btr or "ladder",
             ),
             self._filter_chip(
-                fid="mom", label="MOM", value=f"{mom:+.3f}%",
+                fid="mom", label="Momentum", value=f"{mom:+.3f}%",
                 enabled=flags["mom"],
                 state=mom_state, status=f"max against {self.mom_max_against:g}%",
             ),
             self._filter_chip(
-                fid="bounce", label="BOUNCE",
+                fid="bounce", label="Bounce",
                 value=("up" if mom > 0 else ("dn" if mom < 0 else "flat")),
                 enabled=flags["bounce"],
                 state=bounce_state, status="off=ignore" if not flags["bounce"] else "need align",
             ),
             self._filter_chip(
-                fid="ratio", label="RATIO",
+                fid="ratio", label="Ratio",
                 value=("∞" if opp_n <= 0 else f"{ratio:.2f}×"),
                 enabled=flags["ratio"],
                 state=ratio_state, status=f"min {self.min_wall_ratio:g}×",
             ),
-            self._filter_chip(
-                fid="conf", label="CONF",
-                value=f"{score:.0f}/{self.min_confidence:.0f}",
-                enabled=flags["conf"],
-                state=conf_state, status=f"side {cand_side}",
-            ),
+            self._conf_filter_chip(conf),
+            self._dca_filter_chip(),
+            self._obtp_filter_chip(),
         ]
+
+    def _conf_filter_chip(self, conf: dict[str, Any] | None = None) -> dict[str, Any]:
+        flags = self.filter_flags()
+        c = conf if conf is not None else (self._confidence or {})
+        score = float(c.get("score") or 0)
+        val = f"{score:.0f}/{self.min_confidence:.0f}"
+        if not flags["conf"]:
+            return self._filter_chip(
+                fid="conf", label="Confidence", value=val, enabled=False,
+                state="off", status="disabled",
+            )
+        if score >= self.min_confidence:
+            return self._filter_chip(
+                fid="conf", label="Confidence", value=val, enabled=True,
+                state="ok", status="setup score",
+            )
+        if score <= 0:
+            return self._filter_chip(
+                fid="conf", label="Confidence", value=val, enabled=True,
+                state="wait", status="no setup yet",
+            )
+        return self._filter_chip(
+            fid="conf", label="Confidence", value=val, enabled=True,
+            state="block", status=f"need ≥{self.min_confidence:.0f}",
+        )
+
+    def _dca_filter_chip(self) -> dict[str, Any]:
+        flags = self.filter_flags()
+        pos = self._paper
+        n = int((pos or {}).get("dca_count") or 0)
+        val = f"{n}/{self.dca_max}"
+        if not flags["dca"]:
+            state = "off"
+            status = "disabled"
+        elif pos and float(pos.get("pnl_pct") or 0) < -self.dca_min_loss_pct:
+            if n >= self.dca_max:
+                state = "block"
+                status = "max DCA"
+            else:
+                state = "wait"
+                status = "armed @ next OB"
+        elif pos:
+            state = "ok"
+            status = "only in loss"
+        else:
+            state = "wait"
+            status = f"loss≥{self.dca_min_loss_pct:g}% @ OB"
+        return self._filter_chip(
+            fid="dca", label="DCA", value=val,
+            enabled=flags["dca"], state=state, status=status,
+        )
+
+    def _obtp_filter_chip(self) -> dict[str, Any]:
+        flags = self.filter_flags()
+        pos = self._paper
+        if not flags["obtp"]:
+            return self._filter_chip(
+                fid="obtp", label="OB take-profit", value="off", enabled=False,
+                state="off", status="disabled",
+            )
+        if not pos:
+            return self._filter_chip(
+                fid="obtp", label="OB take-profit", value="on", enabled=True,
+                state="wait", status="touch/through OB or bid/ask against",
+            )
+        fee_need = self._fee_cover_need(pos)
+        pnl = float(pos.get("pnl_pct") or 0)
+        if pnl >= fee_need:
+            return self._filter_chip(
+                fid="obtp", label="OB take-profit", value="armed", enabled=True,
+                state="ok", status="fees ok · exit on OB/reject",
+            )
+        return self._filter_chip(
+            fid="obtp", label="OB take-profit", value=f"+{max(0, fee_need - pnl):.3f}%",
+            enabled=True, state="wait", status="need fee cover",
+        )
 
     def _eval_signal(
         self,
@@ -2358,37 +2737,17 @@ class BookState:
         bids = all_bids if all_bids is not None else bid_walls
         asks = all_asks if all_asks is not None else ask_walls
 
-        if not self.paper_enabled:
-            self._block_reason = "paper off"
-            self._confidence = {
-                "score": 0.0, "min": self.min_confidence, "side": None, "parts": {},
-            }
-            self._filters = self._filter_bar_idle("paper off")
-            return "flat"
-        if self._paper:
-            self._block_reason = "in position"
-            self._filters = self._filter_bar_idle("in position")
-            return self._paper["side"]
-        if now < self._cooldown_until:
-            left = max(0.0, self._cooldown_until - now)
-            self._block_reason = f"cooldown {left:.1f}s left"
-            self._filters = self._filter_bar_idle(f"cooldown {left:.0f}s")
-            return "flat"
-
-        # Re-evaluate BB vs *current* mid each tick (avoids stale breakout lock)
+        # Always compute live chips (even in position / cooldown) so they are not stuck amber
         self._bb = self._bb_regime_for_mid(mid)
-
         bid_w = self._nearest_wall(bids, below=True, mid=mid)
         ask_w = self._nearest_wall(asks, below=False, mid=mid)
         need = self._min_tp_dist_pct()
         long_tp = self._reward_wall(asks, above=True, mid=mid, min_dist_pct=need)
         short_tp = self._reward_wall(bids, above=False, mid=mid, min_dist_pct=need)
-
         best_bid = max((w["price"] for w in bids), default=None)
         best_ask = min((w["price"] for w in asks), default=None)
-
-        near_bid = bid_w and abs(bid_w["dist_pct"]) <= self.touch_pct
-        near_ask = ask_w and abs(ask_w["dist_pct"]) <= self.touch_pct
+        near_bid = bool(bid_w and abs(bid_w["dist_pct"]) <= self.touch_pct)
+        near_ask = bool(ask_w and abs(ask_w["dist_pct"]) <= self.touch_pct)
         mom = self._recent_mom_pct()
 
         def _conf(side: str, wall: dict[str, float] | None) -> dict[str, Any]:
@@ -2403,7 +2762,10 @@ class BookState:
                 mom_pct=mom,
             )
 
-        if near_bid or (imb >= self.imb_long and bid_w):
+        if self._paper:
+            cand_side = str(self._paper["side"])
+            cand_wall = bid_w if cand_side == "long" else ask_w
+        elif near_bid or (imb >= self.imb_long and bid_w):
             cand_side, cand_wall = "long", bid_w
         elif near_ask or (imb <= self.imb_short and ask_w):
             cand_side, cand_wall = "short", ask_w
@@ -2411,18 +2773,27 @@ class BookState:
             cand_side = "long" if imb >= 0.5 else "short"
             cand_wall = bid_w if cand_side == "long" else ask_w
         self._confidence = _conf(cand_side, cand_wall)
-
-        # Live filter chip statuses (what blocks / allows the candidate)
         self._filters = self._build_filter_bar(
             cand_side=cand_side,
             imb=imb,
             mom=mom,
-            near_bid=bool(near_bid),
-            near_ask=bool(near_ask),
+            near_bid=near_bid,
+            near_ask=near_ask,
             bid_w=bid_w,
             ask_w=ask_w,
             conf=self._confidence,
         )
+
+        if not self.paper_enabled:
+            self._block_reason = "paper off"
+            return "flat"
+        if self._paper:
+            self._block_reason = "in position"
+            return self._paper["side"]
+        if now < self._cooldown_until:
+            left = max(0.0, self._cooldown_until - now)
+            self._block_reason = f"cooldown {left:.1f}s left"
+            return "flat"
 
         if self.bb_filter and not self._bb.get("tradeable", True):
             self._block_reason = f"regime {self._bb.get('label', '?')} (need inside/near BB)"
@@ -2768,6 +3139,13 @@ def main() -> None:
                    help="block entry if short-term mid mom %% is against side by more than this")
     p.add_argument("--book-filter", action=argparse.BooleanOptionalAction, default=True,
                    help="use depth-ladder pressure as micro-trend (block strong opposite stack)")
+    p.add_argument("--dca", action=argparse.BooleanOptionalAction, default=True,
+                   help="add size on adverse OB walls while in loss; rebase avg + TP/SL")
+    p.add_argument("--dca-max", type=int, default=3, help="max DCA adds per position")
+    p.add_argument("--dca-min-loss", type=float, default=0.05,
+                   help="min unrealized loss %% before first DCA")
+    p.add_argument("--ob-tp", action=argparse.BooleanOptionalAction, default=True,
+                   help="when fees covered, snap TP to opposite OB and close on touch")
     p.add_argument("--net-exits", action=argparse.BooleanOptionalAction, default=True,
                    help="only soft-exit when gross pnl covers fee estimate")
     p.add_argument("--protect-be", action=argparse.BooleanOptionalAction, default=True,
@@ -2893,6 +3271,10 @@ def main() -> None:
         bb_strict=args.bb_strict,
         book_filter=args.book_filter,
     )
+    state.dca_enabled = bool(args.dca)
+    state.dca_max = max(0, int(args.dca_max))
+    state.dca_min_loss_pct = float(args.dca_min_loss)
+    state.ob_tp_exit = bool(args.ob_tp)
     # Pull Binance commission rates immediately (needs API keys in .env)
     state._refresh_fees(0.0)
 
@@ -2960,7 +3342,8 @@ def main() -> None:
         f"wall≥{args.min_wall_usdt:,.0f}  ratio≥{args.min_wall_ratio:g}  "
         f"bounce={args.require_bounce}  bb-strict={args.bb_strict}  "
         f"book-filter={args.book_filter}  "
-        f"mom-against≤{args.mom_max_against:g}%"
+        f"mom-against≤{args.mom_max_against:g}%  "
+        f"dca={args.dca} max={args.dca_max} loss≥{args.dca_min_loss:g}%"
     )
     if dry_run:
         print("Dry-run: no real orders. Ctrl+C to stop.")
