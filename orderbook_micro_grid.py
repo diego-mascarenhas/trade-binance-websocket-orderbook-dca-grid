@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """15s micro-grid scalp: place FULL grid + exchange TP/SL at open.
 
-Default grid mode is **Fibonacci** (1m swing impulse → retrace levels).
+Default grid mode is **Fibonacci** (5m swing impulse → retrace levels).
 Geometric ``--grid-mode step`` remains available as fallback.
 
 Fib entry (default):
-  1. Detect swing on fib TF (default 1m)
+  1. Detect swing on fib TF (default 5m)
   2. Arm only while mark is between Fib 0.000 (extreme) and Fib 0.236
   3. Place FULL LIMIT grid on retraces toward ORIGIN (no chase / no ext past 1.0)
-  4. On first fill → arm TP at swing extreme + SL beyond origin
+  4. On first fill → arm TP at avg ± (0.30% net + fees) + SL beyond origin
   5. If no fill before timeout / through origin → disarm and wait
   6. When all ``--levels`` are filled and position is in profit → replace SL
      with TRAILING_STOP_MARKET (default on) so a pullback does not exit at a loss
@@ -20,10 +20,10 @@ Usage:
   fib LDOUSDT
   fib LDOUSDT short --entry-usdt 50
   ./obmicro-grid LDOUSDT --dry-run
-  ./obmicro-grid LDOUSDT --direction long --fib-interval 5m
+  ./obmicro-grid LDOUSDT --direction long --fib-interval 1m
 
 Env (optional):
-  OB_MG_GRID_MODE=fib  OB_MG_FIB_INTERVAL=1m  OB_MG_FIB_MIN_RANGE=0.40
+  OB_MG_GRID_MODE=fib  OB_MG_FIB_INTERVAL=5m  OB_MG_FIB_MIN_RANGE=0.40
   OB_MG_ARM_MAX_FIB=0.236
   OB_MG_FVG_MIN_PCT=0.08  OB_MG_REQUIRE_FVG=0
   OB_MG_WAIT_PULLBACK=1  OB_MG_ARM_TIMEOUT_SEC=900
@@ -2731,8 +2731,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=(os.getenv("OB_MG_GRID_MODE", "fib").strip().lower() or "fib"),
         help="Grid construction (default: fib)",
     )
-    p.add_argument("--fib-interval", default=os.getenv("OB_MG_FIB_INTERVAL", "1m").strip() or "1m",
-                   help="Kline TF for Fib swing (default 1m; use 5m for slower swings)")
+    p.add_argument("--fib-interval", default=os.getenv("OB_MG_FIB_INTERVAL", "5m").strip() or "5m",
+                   help="Kline TF for Fib swing (default 5m; use 1m for faster scalp)")
     p.add_argument("--fib-lookback", type=int, default=_env_int("OB_MG_FIB_LOOKBACK", 40))
     p.add_argument("--fib-min-range", type=float, default=_env_float("OB_MG_FIB_MIN_RANGE", 0.40),
                    help="Min swing range %% on fib interval")

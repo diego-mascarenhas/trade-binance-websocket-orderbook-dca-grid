@@ -16,7 +16,7 @@ Both scripts read the live order book, place DCA orders on real walls, size entr
 
 ### Fib micro-grid (`fib`)
 
-Short pullback grid on Fibonacci retraces (default 1m, arm Fib 0–0.236, LIMIT-only, protect trail after full fill, **1h cooldown** after flat).
+Short pullback grid on Fibonacci retraces (default **5m**, arm Fib 0–0.236, LIMIT-only, protect trail after full fill, **1h cooldown** after flat).
 
 ```bash
 fib LTCUSDT                 # PATH wrapper (or ./fib)

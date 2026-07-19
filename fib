@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Short wrapper: fib SYMBOL [long|short|auto] [extra flags...]
-# Defaults = micro-grid fib (1m, arm 0–0.236, wait-pullback, protect-trail ON)
+# Defaults = micro-grid fib (5m, arm 0–0.236, wait-pullback, protect-trail ON)
 set -euo pipefail
 
 # Resolve symlinks so PATH installs (e.g. ~/bin/fib → repo/fib) find the repo.

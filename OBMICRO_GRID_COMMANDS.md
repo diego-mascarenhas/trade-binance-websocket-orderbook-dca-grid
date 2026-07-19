@@ -54,7 +54,7 @@ fib SYMBOL
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| Grid | Fib `1m` | Swing TF for impulse |
+| Grid | Fib `5m` | Swing TF for impulse |
 | Arm window | Fib **0 → 0.236** | Only near impulse extreme |
 | Entry | LIMIT pullback | No MARKET (`wait-pullback` on) |
 | Levels | `4` | First 4 retrace rungs |
@@ -96,9 +96,9 @@ fib SKLUSDT short \
 fib LDOUSDT --dry-run
 ```
 
-**Fib 5m (slower swings)**
+**Fib 1m (faster scalp)**
 ```bash
-fib LDOUSDT long --fib-interval 5m
+fib LDOUSDT long --fib-interval 1m
 ```
 
 **Hedge: open SHORT while LONG stays**
@@ -135,7 +135,7 @@ fib LTCUSDT --cooldown-sec 300
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--grid-mode` | `fib` | `fib` \| `step` |
-| `--fib-interval` | `1m` | Swing TF (e.g. `5m`) |
+| `--fib-interval` | `5m` | Swing TF (e.g. `1m` for faster scalp) |
 | `--fib-lookback` | `40` | Lookback bars |
 | `--fib-min-range` | `0.40` | Min swing range (%) |
 | `--fib-max-span` | `12` | Max bars in impulse |
@@ -288,7 +288,7 @@ python3 botctl.py list
 ```text
 # Core
 OB_MG_GRID_MODE=fib
-OB_MG_FIB_INTERVAL=1m
+OB_MG_FIB_INTERVAL=5m
 OB_MG_FIB_MIN_RANGE=0.40
 OB_MG_ARM_MAX_FIB=0.236
 OB_MG_FVG_MIN_PCT=0.08
@@ -343,7 +343,7 @@ TELEGRAM_CHAT_ID=
 | | FIB (`fib`) | DCA (`dca`) |
 |--|-------------|-------------|
 | Style | Fib pullback micro-grid | Wall / DCA grid + staged/trail exits |
-| Default TF | 1m Fib + 15s OB | Supervisor loop |
+| Default TF | 5m Fib + 15s OB | Supervisor loop |
 | Protect | Full-fill trailing (default) | Exit plugins (`staged` / `trailing`) |
 | Telegram start | `/fib SYMBOL` | `/start SYMBOL` |
 | Telegram stop | `/stop SYMBOL` (both) | `/stop SYMBOL` |
