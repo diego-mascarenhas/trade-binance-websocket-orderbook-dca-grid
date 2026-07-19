@@ -131,10 +131,56 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       .wrap { grid-template-columns: 1fr; }
       #profile { max-height: 220px; border-right: none; border-top: 1px solid var(--line); }
     }
-    #chart {
+    .chart-col {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
       height: calc(100vh - 70px);
-      min-height: 420px;
       border-right: 1px solid var(--line);
+    }
+    .filter-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(13, 17, 23, 0.95);
+      flex: 0 0 auto;
+      align-items: stretch;
+    }
+    .filter-btn {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 72px;
+      padding: 5px 8px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #161b22;
+      color: var(--text);
+      font: inherit;
+      font-size: 0.68rem;
+      cursor: pointer;
+      text-align: left;
+      line-height: 1.25;
+    }
+    .filter-btn:hover { border-color: #58a6ff88; }
+    .filter-btn .fk { color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.62rem; }
+    .filter-btn .fv { font-weight: 600; }
+    .filter-btn .fs { color: var(--muted); font-size: 0.6rem; }
+    .filter-btn.on.ok { border-color: #3fb95088; background: #12261a; }
+    .filter-btn.on.ok .fv { color: var(--bid); }
+    .filter-btn.on.block { border-color: #f8514988; background: #2a1214; }
+    .filter-btn.on.block .fv { color: var(--ask); }
+    .filter-btn.on.wait { border-color: #d2992288; background: #241c0c; }
+    .filter-btn.on.wait .fv { color: #e3b341; }
+    .filter-btn.off { opacity: 0.42; border-style: dashed; }
+    .filter-btn.locked { cursor: default; }
+    .filter-btn.locked:hover { border-color: var(--line); }
+    #chart {
+      flex: 1 1 auto;
+      height: 0;
+      min-height: 320px;
     }
     #profile {
       height: calc(100vh - 70px);
@@ -288,7 +334,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </header>
   <div id="err" class="err" hidden></div>
   <div class="wrap">
-    <div id="chart"></div>
+    <div class="chart-col">
+      <div class="filter-bar" id="filterBar"></div>
+      <div id="chart"></div>
+    </div>
     <div id="profile">
       <div class="ph">Depth · USDT <span id="bookPh" style="text-transform:none;letter-spacing:0"></span></div>
       <div id="profileLadder"></div>
@@ -399,11 +448,59 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     resize();
 
     let lastLen = 0;
+    let filterSig = "";
+    async function toggleFilter(id, enabled) {
+      try {
+        const r = await fetch("/api/filter", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id, enabled }),
+        });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+      } catch (e) {
+        console.warn("filter toggle failed", e);
+      }
+    }
+    const filterBarEl = document.getElementById("filterBar");
+    if (filterBarEl) {
+      filterBarEl.addEventListener("click", (ev) => {
+        const btn = ev.target.closest("button.filter-btn");
+        if (!btn || btn.dataset.toggle !== "1") return;
+        const id = btn.dataset.id;
+        const next = btn.dataset.en !== "1";
+        // optimistic UI
+        btn.dataset.en = next ? "1" : "0";
+        btn.classList.toggle("off", !next);
+        toggleFilter(id, next);
+      });
+    }
+    function renderFilters(filters) {
+      const bar = document.getElementById("filterBar");
+      if (!bar) return;
+      const sig = JSON.stringify(filters || []);
+      if (sig === filterSig) return;
+      filterSig = sig;
+      bar.innerHTML = (filters || []).map(f => {
+        const en = !!f.enabled;
+        const st = f.state || (en ? "wait" : "off");
+        const cls = "filter-btn "
+          + (f.toggle === false ? "locked " : "")
+          + (en ? ("on " + st) : "off");
+        const tip = (f.status || "") + (f.toggle === false ? " · (setup)" : " · click to toggle");
+        const stLabel = !en ? "OFF" : (st === "ok" ? "pass" : (st === "block" ? "BLOCK" : (st === "wait" ? "wait" : st)));
+        return `<button type="button" class="${cls}" data-id="${f.id}" data-en="${en ? 1 : 0}" data-toggle="${f.toggle === false ? 0 : 1}" title="${tip}">
+          <span class="fk">${f.label || f.id}</span>
+          <span class="fv">${f.value != null ? f.value : "—"}</span>
+          <span class="fs">${stLabel} · ${f.status || ""}</span>
+        </button>`;
+      }).join("");
+    }
     async function tick() {
       try {
         const r = await fetch("/api/state", { cache: "no-store" });
         if (!r.ok) throw new Error("HTTP " + r.status);
         const s = await r.json();
+        renderFilters(s.filters || []);
         document.getElementById("err").hidden = true;
         if (s.error) {
           document.getElementById("err").hidden = false;
@@ -919,6 +1016,11 @@ class BookState:
         self.require_bounce = require_bounce
         self.bb_strict = bb_strict
         self.book_filter = book_filter
+        # Runtime toggles (UI); start matching CLI / sensible defaults
+        self.bb_filter = True
+        self.mom_filter = True
+        self.conf_filter = True
+        self.ratio_filter = min_wall_ratio > 0
 
         self._lock = threading.Lock()
         self._trail: deque[dict[str, float]] = deque()
@@ -961,6 +1063,7 @@ class BookState:
         self._ema_snap: Any = None
         self._signal = "flat"
         self._block_reason = "starting…"
+        self._filters: list[dict[str, Any]] = []
         self._cooldown_until = 0.0
         self._bb_next = 0.0
         self._ema_next = 0.0
@@ -990,6 +1093,7 @@ class BookState:
             "trend": dict(self._trend),
             "book": dict(self._book),
             "confidence": dict(self._confidence),
+            "filters": [],
             "paper": {},
             "live": {},
             "live_enabled": self.live_enabled,
@@ -999,6 +1103,35 @@ class BookState:
             "ts": 0.0,
             "ts_iso": "",
             "error": None,
+        }
+
+    def set_filter(self, fid: str, enabled: bool) -> dict[str, Any]:
+        """Toggle a runtime filter from the UI. Returns updated filter flags."""
+        key = {
+            "bb": "bb_filter",
+            "ema": "ema_filter",
+            "book": "book_filter",
+            "mom": "mom_filter",
+            "bounce": "require_bounce",
+            "ratio": "ratio_filter",
+            "conf": "conf_filter",
+            "bb_strict": "bb_strict",
+        }.get(fid)
+        if key is None:
+            raise KeyError(f"unknown filter {fid}")
+        setattr(self, key, bool(enabled))
+        return self.filter_flags()
+
+    def filter_flags(self) -> dict[str, bool]:
+        return {
+            "bb": bool(self.bb_filter),
+            "ema": bool(self.ema_filter),
+            "book": bool(self.book_filter),
+            "mom": bool(self.mom_filter),
+            "bounce": bool(self.require_bounce),
+            "ratio": bool(self.ratio_filter),
+            "conf": bool(self.conf_filter),
+            "bb_strict": bool(self.bb_strict),
         }
 
     def _exchange_flat(self) -> bool:
@@ -2000,6 +2133,216 @@ class BookState:
             )
         return out
 
+    def _filter_chip(
+        self,
+        *,
+        fid: str,
+        label: str,
+        value: str,
+        enabled: bool,
+        state: str,
+        status: str,
+        toggle: bool = True,
+    ) -> dict[str, Any]:
+        return {
+            "id": fid,
+            "label": label,
+            "value": value,
+            "enabled": enabled,
+            "state": state,  # ok | block | wait | off
+            "status": status,
+            "toggle": toggle,
+        }
+
+    def _filter_bar_idle(self, why: str) -> list[dict[str, Any]]:
+        flags = self.filter_flags()
+        return [
+            self._filter_chip(
+                fid="wall", label="WALL", value="—", enabled=True,
+                state="wait", status=why, toggle=False,
+            ),
+            self._filter_chip(
+                fid="imb", label="IMB", value="—", enabled=True,
+                state="wait", status=why, toggle=False,
+            ),
+            self._filter_chip(
+                fid="bb", label="BB", value=str(self._bb.get("label") or "—"),
+                enabled=flags["bb"],
+                state="off" if not flags["bb"] else ("ok" if self._bb.get("tradeable") else "block"),
+                status="regime filter",
+            ),
+            self._filter_chip(
+                fid="ema", label="EMA", value=str(self._trend.get("label") or "—"),
+                enabled=flags["ema"],
+                state="off" if not flags["ema"] else "wait",
+                status="trend filter",
+            ),
+            self._filter_chip(
+                fid="book", label="BOOK", value=str(self._book.get("label") or "—"),
+                enabled=flags["book"],
+                state="off" if not flags["book"] else "wait",
+                status=str(self._book.get("trend") or ""),
+            ),
+            self._filter_chip(
+                fid="mom", label="MOM", value="—",
+                enabled=flags["mom"],
+                state="off" if not flags["mom"] else "wait",
+                status="micro mom",
+            ),
+            self._filter_chip(
+                fid="bounce", label="BOUNCE", value="off" if not flags["bounce"] else "on",
+                enabled=flags["bounce"],
+                state="off" if not flags["bounce"] else "wait",
+                status="need bounce/reject",
+            ),
+            self._filter_chip(
+                fid="ratio", label="RATIO", value="—",
+                enabled=flags["ratio"],
+                state="off" if not flags["ratio"] else "wait",
+                status=f"min {self.min_wall_ratio:g}×",
+            ),
+            self._filter_chip(
+                fid="conf", label="CONF",
+                value=f"{float(self._confidence.get('score') or 0):.0f}/{self.min_confidence:.0f}",
+                enabled=flags["conf"],
+                state="off" if not flags["conf"] else "wait",
+                status="setup score",
+            ),
+        ]
+
+    def _build_filter_bar(
+        self,
+        *,
+        cand_side: str,
+        imb: float,
+        mom: float,
+        near_bid: bool,
+        near_ask: bool,
+        bid_w: dict[str, float] | None,
+        ask_w: dict[str, float] | None,
+        conf: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        from ob_ema import ema_allows
+
+        flags = self.filter_flags()
+        wall = bid_w if cand_side == "long" else ask_w
+        near = near_bid if cand_side == "long" else near_ask
+        if near_bid and near_ask:
+            wall_val = "bid+ask"
+        elif near_bid:
+            wall_val = "bid"
+        elif near_ask:
+            wall_val = "ask"
+        else:
+            wall_val = "none"
+        wall_state = "ok" if near else "block"
+        wall_st = (
+            f"{abs(float(wall['dist_pct'])):.3f}% · {float(wall['notional'])/1000:.0f}k"
+            if wall and near
+            else f"need ≤{self.touch_pct:g}%"
+        )
+
+        if cand_side == "long":
+            imb_ok = imb >= self.imb_long
+            imb_st = f"≥{self.imb_long*100:.0f}%"
+        else:
+            imb_ok = imb <= self.imb_short
+            imb_st = f"≤{self.imb_short*100:.0f}%"
+        imb_state = "ok" if imb_ok else ("wait" if near else "block")
+
+        bb_lab = str(self._bb.get("label") or "—")
+        bb_ok = bool(self._bb.get("tradeable", True))
+        if flags["bb"] and flags["bb_strict"] and bb_lab == "near-bb":
+            bb_ok = False
+        bb_state = "off" if not flags["bb"] else ("ok" if bb_ok else "block")
+
+        ema_lab = str(self._trend.get("label") or "—")
+        ema_ok = ema_allows(cand_side, self._ema_snap) if self._ema_snap is not None else True
+        ema_state = "off" if not flags["ema"] else ("ok" if ema_ok else "block")
+
+        bp = float(self._book.get("pressure") or 0.5)
+        btr = str(self._book.get("trend") or "")
+        book_ok = True
+        if cand_side == "long" and (bp <= 0.38 or btr == "building-ask"):
+            book_ok = False
+        if cand_side == "short" and (bp >= 0.62 or btr == "building-bid"):
+            book_ok = False
+        book_state = "off" if not flags["book"] else ("ok" if book_ok else "block")
+
+        mom_ok = True
+        if cand_side == "long" and mom < -self.mom_max_against:
+            mom_ok = False
+        if cand_side == "short" and mom > self.mom_max_against:
+            mom_ok = False
+        mom_state = "off" if not flags["mom"] else ("ok" if mom_ok else "block")
+
+        bounce_ok = True
+        if flags["bounce"]:
+            if cand_side == "long" and mom < 0.0:
+                bounce_ok = False
+            if cand_side == "short" and mom > 0.0:
+                bounce_ok = False
+        bounce_state = "off" if not flags["bounce"] else ("ok" if bounce_ok else "wait")
+
+        wall_n = float((wall or {}).get("notional") or 0)
+        opp = ask_w if cand_side == "long" else bid_w
+        opp_n = float((opp or {}).get("notional") or 0)
+        ratio = wall_n / opp_n if opp_n > 0 else 99.0
+        ratio_ok = (not flags["ratio"]) or self.min_wall_ratio <= 0 or opp_n <= 0 or ratio >= self.min_wall_ratio
+        ratio_state = "off" if not flags["ratio"] else ("ok" if ratio_ok else "block")
+
+        score = float(conf.get("score") or 0)
+        conf_ok = score >= self.min_confidence
+        conf_state = "off" if not flags["conf"] else ("ok" if conf_ok else "block")
+
+        return [
+            self._filter_chip(
+                fid="wall", label="WALL", value=wall_val, enabled=True,
+                state=wall_state, status=wall_st, toggle=False,
+            ),
+            self._filter_chip(
+                fid="imb", label="IMB", value=f"{imb*100:.1f}%", enabled=True,
+                state=imb_state, status=f"{cand_side} {imb_st}", toggle=False,
+            ),
+            self._filter_chip(
+                fid="bb", label="BB", value=bb_lab, enabled=flags["bb"],
+                state=bb_state, status="strict" if flags["bb_strict"] else "regime",
+            ),
+            self._filter_chip(
+                fid="ema", label="EMA", value=ema_lab, enabled=flags["ema"],
+                state=ema_state, status=f"allow {cand_side}" if ema_ok else f"blocks {cand_side}",
+            ),
+            self._filter_chip(
+                fid="book", label="BOOK",
+                value=f"{str(self._book.get('label') or '—')[:9]} {bp*100:.0f}%",
+                enabled=flags["book"],
+                state=book_state, status=btr or "ladder",
+            ),
+            self._filter_chip(
+                fid="mom", label="MOM", value=f"{mom:+.3f}%",
+                enabled=flags["mom"],
+                state=mom_state, status=f"max against {self.mom_max_against:g}%",
+            ),
+            self._filter_chip(
+                fid="bounce", label="BOUNCE",
+                value=("up" if mom > 0 else ("dn" if mom < 0 else "flat")),
+                enabled=flags["bounce"],
+                state=bounce_state, status="off=ignore" if not flags["bounce"] else "need align",
+            ),
+            self._filter_chip(
+                fid="ratio", label="RATIO",
+                value=("∞" if opp_n <= 0 else f"{ratio:.2f}×"),
+                enabled=flags["ratio"],
+                state=ratio_state, status=f"min {self.min_wall_ratio:g}×",
+            ),
+            self._filter_chip(
+                fid="conf", label="CONF",
+                value=f"{score:.0f}/{self.min_confidence:.0f}",
+                enabled=flags["conf"],
+                state=conf_state, status=f"side {cand_side}",
+            ),
+        ]
+
     def _eval_signal(
         self,
         mid: float,
@@ -2022,24 +2365,24 @@ class BookState:
             self._confidence = {
                 "score": 0.0, "min": self.min_confidence, "side": None, "parts": {},
             }
+            self._filters = self._filter_bar_idle("paper off")
             return "flat"
         if self._paper:
             self._block_reason = "in position"
+            self._filters = self._filter_bar_idle("in position")
             return self._paper["side"]
         if now < self._cooldown_until:
             left = max(0.0, self._cooldown_until - now)
             self._block_reason = f"cooldown {left:.1f}s left"
+            self._filters = self._filter_bar_idle(f"cooldown {left:.0f}s")
             return "flat"
+
         # Re-evaluate BB vs *current* mid each tick (avoids stale breakout lock)
         self._bb = self._bb_regime_for_mid(mid)
-        if not self._bb.get("tradeable", True):
-            self._block_reason = f"regime {self._bb.get('label', '?')} (need inside/near BB)"
-            return "flat"
 
         bid_w = self._nearest_wall(bids, below=True, mid=mid)
         ask_w = self._nearest_wall(asks, below=False, mid=mid)
         need = self._min_tp_dist_pct()
-        # Reward wall from FULL depth so fee+edge targets are not dropped
         long_tp = self._reward_wall(asks, above=True, mid=mid, min_dist_pct=need)
         short_tp = self._reward_wall(bids, above=False, mid=mid, min_dist_pct=need)
 
@@ -2062,26 +2405,51 @@ class BookState:
                 mom_pct=mom,
             )
 
-        # Live confidence for the most relevant candidate side
         if near_bid or (imb >= self.imb_long and bid_w):
-            self._confidence = _conf("long", bid_w)
+            cand_side, cand_wall = "long", bid_w
         elif near_ask or (imb <= self.imb_short and ask_w):
-            self._confidence = _conf("short", ask_w)
+            cand_side, cand_wall = "short", ask_w
         else:
-            side = "long" if imb >= 0.5 else "short"
-            self._confidence = _conf(side, bid_w if side == "long" else ask_w)
+            cand_side = "long" if imb >= 0.5 else "short"
+            cand_wall = bid_w if cand_side == "long" else ask_w
+        self._confidence = _conf(cand_side, cand_wall)
+
+        # Live filter chip statuses (what blocks / allows the candidate)
+        self._filters = self._build_filter_bar(
+            cand_side=cand_side,
+            imb=imb,
+            mom=mom,
+            near_bid=bool(near_bid),
+            near_ask=bool(near_ask),
+            bid_w=bid_w,
+            ask_w=ask_w,
+            conf=self._confidence,
+        )
+
+        if self.bb_filter and not self._bb.get("tradeable", True):
+            self._block_reason = f"regime {self._bb.get('label', '?')} (need inside/near BB)"
+            return "flat"
 
         def _try_open(side: str, wall: dict[str, float], why: str) -> bool:
             conf = _conf(side, wall)
             self._confidence = conf
-            if self.bb_strict and str(self._bb.get("label")) == "near-bb":
+            self._filters = self._build_filter_bar(
+                cand_side=side,
+                imb=imb,
+                mom=mom,
+                near_bid=bool(near_bid),
+                near_ask=bool(near_ask),
+                bid_w=bid_w,
+                ask_w=ask_w,
+                conf=conf,
+            )
+            if self.bb_filter and self.bb_strict and str(self._bb.get("label")) == "near-bb":
                 self._block_reason = "bb near-edge (strict)"
                 return False
             if self.ema_filter and not ema_allows(side, self._ema_snap):
                 trend = (self._trend or {}).get("label", "?")
                 self._block_reason = f"ema {trend} blocks {side}"
                 return False
-            # Ladder book pressure: block only strong opposite stack
             if self.book_filter:
                 bp = float(self._book.get("pressure") or 0.5)
                 btr = str(self._book.get("trend") or "")
@@ -2097,13 +2465,13 @@ class BookState:
                         f"({bp*100:.0f}% bid) against short"
                     )
                     return False
-            # Soft: only block strong adverse momentum (bounce is optional)
-            if side == "long" and mom < -self.mom_max_against:
-                self._block_reason = f"mom {mom:+.3f}% still dumping"
-                return False
-            if side == "short" and mom > self.mom_max_against:
-                self._block_reason = f"mom {mom:+.3f}% still pumping"
-                return False
+            if self.mom_filter:
+                if side == "long" and mom < -self.mom_max_against:
+                    self._block_reason = f"mom {mom:+.3f}% still dumping"
+                    return False
+                if side == "short" and mom > self.mom_max_against:
+                    self._block_reason = f"mom {mom:+.3f}% still pumping"
+                    return False
             if self.require_bounce:
                 if side == "long" and mom < 0.0:
                     self._block_reason = "wait bounce off bid wall"
@@ -2115,12 +2483,12 @@ class BookState:
             opp = ask_w if side == "long" else bid_w
             opp_n = float((opp or {}).get("notional") or 0)
             ratio = wall_n / opp_n if opp_n > 0 else 99.0
-            if self.min_wall_ratio > 0 and opp_n > 0 and ratio < self.min_wall_ratio:
+            if self.ratio_filter and self.min_wall_ratio > 0 and opp_n > 0 and ratio < self.min_wall_ratio:
                 self._block_reason = (
                     f"wall ratio {ratio:.2f} < {self.min_wall_ratio:g}"
                 )
                 return False
-            if conf["score"] < self.min_confidence:
+            if self.conf_filter and conf["score"] < self.min_confidence:
                 self._block_reason = (
                     f"conf {conf['score']:.0f} < min {self.min_confidence:.0f}"
                 )
@@ -2133,7 +2501,6 @@ class BookState:
             self._block_reason = ""
             return True
 
-        # TP wall preferred; if none, still enter — _open_paper falls back to pct TP
         if near_bid and imb >= self.imb_long:
             if _try_open("long", bid_w, "bid-wall+imb"):
                 return "long"
@@ -2145,7 +2512,6 @@ class BookState:
             if self._block_reason:
                 return "flat"
 
-        # Explain why flat (first matching reason)
         reasons = []
         if not near_bid and not near_ask:
             reasons.append(f"no wall≥{self.min_wall_usdt/1000:.0f}k within {self.touch_pct:g}%")
@@ -2163,7 +2529,7 @@ class BookState:
             if near_ask and imb <= self.imb_short and not self._ema_snap.allow_short:
                 reasons.append(f"ema {self._trend.get('label')}≠bear")
         score = float(self._confidence.get("score") or 0)
-        if score < self.min_confidence and (near_bid or near_ask):
+        if self.conf_filter and score < self.min_confidence and (near_bid or near_ask):
             reasons.append(f"conf {score:.0f}<{self.min_confidence:.0f}")
         if not reasons:
             reasons.append("filters not met")
@@ -2279,6 +2645,7 @@ class BookState:
                         "trend": dict(self._trend),
                         "book": dict(self._book),
                         "confidence": dict(self._confidence),
+                        "filters": list(self._filters),
                         "paper": dict(self._paper) if self._paper else {},
                         "live": dict(self._live),
                         "live_enabled": self.live_enabled,
@@ -2305,6 +2672,15 @@ def make_handler(state: BookState, ui_poll_ms: int):
         def log_message(self, fmt: str, *args: Any) -> None:
             return
 
+        def _json(self, code: int, payload: dict[str, Any]) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
             if path in ("/", "/index.html"):
@@ -2316,16 +2692,29 @@ def make_handler(state: BookState, ui_poll_ms: int):
                 self.wfile.write(body)
                 return
             if path == "/api/state":
-                body = json.dumps(state.snapshot()).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._json(200, state.snapshot())
                 return
             self.send_response(404)
             self.end_headers()
+
+        def do_POST(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path
+            if path != "/api/filter":
+                self.send_response(404)
+                self.end_headers()
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n) if n > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8") or "{}")
+                fid = str(data.get("id") or "")
+                enabled = bool(data.get("enabled"))
+                flags = state.set_filter(fid, enabled)
+                self._json(200, {"ok": True, "id": fid, "enabled": enabled, "flags": flags})
+            except KeyError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
 
     return Handler
 
