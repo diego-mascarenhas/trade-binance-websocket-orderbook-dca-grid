@@ -248,6 +248,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       if (n == null || Number.isNaN(n)) return "—";
       return Number(n).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
     }
+    function fmtElapsed(sec) {
+      sec = Math.max(0, Math.floor(Number(sec) || 0));
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
+      if (h > 0) return h + "h " + String(m).padStart(2, "0") + "m";
+      if (m > 0) return m + "m " + String(s).padStart(2, "0") + "s";
+      return s + "s";
+    }
     function wallRows(walls, tbody) {
       tbody.innerHTML = walls.map(w => `
         <tr>
@@ -281,7 +290,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         document.getElementById("imbBar").style.width = (s.imbalance * 100).toFixed(1) + "%";
         document.getElementById("imbDetail").textContent =
           `bid vol ${fmt(s.bid_vol, 2)} · ask vol ${fmt(s.ask_vol, 2)}`;
-        document.getElementById("ts").textContent = s.ts_iso || "";
+        const started = (s.session && s.session.started_at) || s.started_at;
+        const elapsedSec = started
+          ? Math.max(0, Math.floor((Date.now() / 1000) - Number(started)))
+          : (s.elapsed_sec || 0);
+        document.getElementById("ts").textContent = fmtElapsed(elapsedSec);
+        document.getElementById("ts").title = s.ts_iso ? ("clock " + s.ts_iso) : "";
 
         const regime = s.regime || {};
         const regimeEl = document.getElementById("regime");
@@ -305,9 +319,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         sessPill.className = "pill " + (sessNet >= 0 ? "on" : "off");
         const sessBox = document.getElementById("sessionBox");
         const n = sess.trades || 0;
+        const feeSrc = sess.fee_source === "binance"
+          ? `Binance ${sess.fee_mode || "taker"} (m ${(Number(sess.maker_pct||0)).toFixed(4)}% · t ${(Number(sess.taker_pct||0)).toFixed(4)}%)`
+          : `fallback (no API keys)`;
         if (n === 0 && !(s.paper && s.paper.side)) {
           sessBox.className = "pos-box empty";
-          sessBox.textContent = "no closed trades yet";
+          sessBox.innerHTML =
+            `no closed trades yet<br><span class="meta">fees ${Number(sess.fee_rt_pct||0).toFixed(4)}%/RT · ${feeSrc}</span>`;
         } else {
           sessBox.className = "pos-box";
           const u = sess.unrealized_pct || 0;
@@ -320,7 +338,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             (sess.notional ? ` · ≈ ${((sess.net_pct||0) * sess.notional / 100).toFixed(2)} USDT` : "") +
             `<br>open uPnL <span class="${uCls}">${u >= 0 ? "+" : ""}${Number(u).toFixed(3)}%</span>` +
             ` · total <span class="${(sess.total_pct||0) >= 0 ? "win" : "loss"}">${(sess.total_pct||0) >= 0 ? "+" : ""}${Number(sess.total_pct||0).toFixed(3)}%</span>` +
-            `<br><span class="meta">fees = estimate ${Number(sess.fee_rt_pct||0).toFixed(3)}%/trade (not exchange API)</span>`;
+            `<br><span class="meta">fees ${Number(sess.fee_rt_pct||0).toFixed(4)}%/RT · ${feeSrc}</span>`;
         }
 
         const paper = s.paper || {};
@@ -338,7 +356,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             `wall ${fmt(paper.wall_price, pd)} · ` +
             `pnl <span class="${pnlCls}">${pnl >= 0 ? "+" : ""}${pnl.toFixed(3)}%</span>` +
             ` · peak ${peak >= 0 ? "+" : ""}${Number(peak).toFixed(3)}%` +
-            `<br><span class="meta">TP/SL follow book · flip/rev/give while green</span>`;
+            `<br><span class="meta">in profit: SL→BE then trails peak · soft exits if net≥0</span>`;
         } else {
           paperBox.className = "pos-box empty";
           paperBox.textContent = "flat — waiting for wall bounce";
@@ -461,6 +479,37 @@ def bollinger(closes: list[float], period: int, std_mult: float) -> tuple[float,
     return mid + std_mult * sd, mid, mid - std_mult * sd
 
 
+def fetch_commission_rates(
+    symbol: str, api: str, sec: str, recv_window: int
+) -> dict[str, float]:
+    """User commission rates from Binance Futures (fractions → percent).
+
+    GET /fapi/v1/commissionRate
+    """
+    from orderbook_dca_grid import _signed_request
+
+    raw = _signed_request(
+        "GET",
+        "/fapi/v1/commissionRate",
+        {"symbol": symbol.upper()},
+        api,
+        sec,
+        recv_window,
+    )
+    maker = float(raw.get("makerCommissionRate", 0) or 0) * 100.0
+    taker = float(raw.get("takerCommissionRate", 0) or 0) * 100.0
+    return {"maker_pct": maker, "taker_pct": taker}
+
+
+def round_trip_fee_pct(maker_pct: float, taker_pct: float, mode: str) -> float:
+    mode = (mode or "taker").lower()
+    if mode == "maker":
+        return maker_pct * 2.0
+    if mode == "mixed":
+        return maker_pct + taker_pct
+    return taker_pct * 2.0  # taker entry + taker exit (conservative for mid fills)
+
+
 class BookState:
     def __init__(
         self,
@@ -497,6 +546,12 @@ class BookState:
         max_tp_pct: float,
         fee_rt_pct: float,
         notional: float,
+        min_edge_pct: float,
+        min_hold_sec: float,
+        net_exits: bool,
+        fee_mode: str,
+        protect_be: bool,
+        protect_trail: bool,
     ) -> None:
         self.symbol = symbol.upper()
         self.limit = limit
@@ -528,8 +583,15 @@ class BookState:
         self.exits = exits  # "wall" | "pct"
         self.sl_buffer_pct = sl_buffer_pct
         self.max_tp_pct = max_tp_pct
-        self.fee_rt_pct = fee_rt_pct  # estimated round-trip fee % (not from API)
+        self.fee_rt_pct = fee_rt_pct  # fallback until Binance commissionRate loads
+        self.fee_fallback_pct = fee_rt_pct
+        self.fee_mode = fee_mode
         self.notional = notional
+        self.min_edge_pct = min_edge_pct  # extra %% beyond fees for TP target
+        self.min_hold_sec = min_hold_sec
+        self.net_exits = net_exits  # skip soft exits unless gross covers fees
+        self.protect_be = protect_be
+        self.protect_trail = protect_trail
 
         self._lock = threading.Lock()
         self._trail: deque[dict[str, float]] = deque()
@@ -544,6 +606,10 @@ class BookState:
             "fees_pct": 0.0,
             "net_pct": 0.0,
             "fee_rt_pct": fee_rt_pct,
+            "fee_source": "fallback",
+            "fee_mode": fee_mode,
+            "maker_pct": 0.0,
+            "taker_pct": 0.0,
             "notional": notional,
             "started_at": time.time(),
         }
@@ -554,6 +620,7 @@ class BookState:
         self._cooldown_until = 0.0
         self._bb_next = 0.0
         self._live_next = 0.0
+        self._fee_next = 0.0
         self._closes: list[float] = []
         self._snapshot: dict[str, Any] = self._empty_snap()
         self._stop = threading.Event()
@@ -585,11 +652,40 @@ class BookState:
 
     def _session_view(self, unrealized_pct: float = 0.0) -> dict[str, Any]:
         net = float(self._session["net_pct"])
+        self._session["fee_rt_pct"] = self.fee_rt_pct
         return {
             **self._session,
             "unrealized_pct": unrealized_pct,
             "total_pct": net + unrealized_pct,
         }
+
+    def _refresh_fees(self, now: float) -> None:
+        if now < self._fee_next:
+            return
+        self._fee_next = now + 300.0  # refresh every 5 min
+        if not self.api_key or not self.api_secret:
+            self._session["fee_source"] = "fallback"
+            self._session["fee_rt_pct"] = self.fee_fallback_pct
+            self.fee_rt_pct = self.fee_fallback_pct
+            return
+        try:
+            rates = fetch_commission_rates(
+                self.symbol, self.api_key, self.api_secret, self.recv_window
+            )
+            maker = rates["maker_pct"]
+            taker = rates["taker_pct"]
+            rt = round_trip_fee_pct(maker, taker, self.fee_mode)
+            self.fee_rt_pct = rt
+            self._session["fee_source"] = "binance"
+            self._session["fee_mode"] = self.fee_mode
+            self._session["maker_pct"] = maker
+            self._session["taker_pct"] = taker
+            self._session["fee_rt_pct"] = rt
+        except Exception as exc:  # noqa: BLE001
+            self._session["fee_source"] = "fallback"
+            self._session["fee_error"] = str(exc)
+            self.fee_rt_pct = self.fee_fallback_pct
+            self._session["fee_rt_pct"] = self.fee_fallback_pct
 
     def stop(self) -> None:
         self._stop.set()
@@ -704,10 +800,43 @@ class BookState:
             return (mark - entry) / entry * 100
         return (entry - mark) / entry * 100
 
+    def _min_tp_dist_pct(self) -> float:
+        """Minimum reward to opposite wall so a win can cover fees + edge."""
+        return self.fee_rt_pct + self.min_edge_pct
+
+    def _covers_fees(self, gross_pct: float) -> bool:
+        return gross_pct >= self.fee_rt_pct
+
     def _pct_tp_sl(self, side: str, entry: float) -> tuple[float, float]:
+        # Prefer fee-aware distance over tiny legacy tp_pct
+        tp_d = max(self.tp_pct, self._min_tp_dist_pct())
         if side == "long":
-            return entry * (1 + self.tp_pct / 100), entry * (1 - self.sl_pct / 100)
-        return entry * (1 - self.tp_pct / 100), entry * (1 + self.sl_pct / 100)
+            return entry * (1 + tp_d / 100), entry * (1 - self.sl_pct / 100)
+        return entry * (1 - tp_d / 100), entry * (1 + self.sl_pct / 100)
+
+    def _reward_wall(
+        self,
+        walls: list[dict[str, float]],
+        *,
+        above: bool,
+        mid: float,
+        min_dist_pct: float,
+    ) -> dict[str, float] | None:
+        """Nearest significant wall at least min_dist_pct away (farther target)."""
+        cands: list[dict[str, float]] = []
+        for w in walls:
+            if w["notional"] < self.min_wall_usdt:
+                continue
+            if above and w["price"] <= mid:
+                continue
+            if not above and w["price"] >= mid:
+                continue
+            dist = abs(w["price"] - mid) / mid * 100 if mid else 0.0
+            if dist >= min_dist_pct:
+                cands.append(w)
+        if not cands:
+            return None
+        return min(cands, key=lambda w: abs(w["price"] - mid))
 
     def _wall_tp_sl(
         self,
@@ -719,28 +848,34 @@ class BookState:
         best_bid: float | None,
         best_ask: float | None,
     ) -> tuple[float, float, str]:
-        """Dynamic TP/SL from nearest opposing / supporting walls."""
+        """Dynamic TP/SL: TP = opposite wall far enough to cover fees; SL = support."""
         fallback_tp, fallback_sl = self._pct_tp_sl(side, entry)
         buf = self.sl_buffer_pct / 100
+        need = self._min_tp_dist_pct()
         note = "wall"
 
         if side == "long":
-            ask_w = self._nearest_wall(ask_walls, below=False, mid=mid)
+            ask_w = self._reward_wall(ask_walls, above=True, mid=mid, min_dist_pct=need)
+            if ask_w is None:
+                ask_w = self._nearest_wall(ask_walls, below=False, mid=mid)
             bid_w = self._nearest_wall(bid_walls, below=True, mid=min(mid, entry))
             if ask_w:
                 tp = ask_w["price"]
+                dist = abs(tp - entry) / entry * 100
+                if dist < need:
+                    tp = entry * (1 + need / 100)
+                    note = "wall+min"
             elif best_ask and best_ask > mid:
-                tp = best_ask
+                tp = max(best_ask, entry * (1 + need / 100))
                 note = "wall+bbo"
             else:
                 tp = fallback_tp
                 note = "wall→pct"
-            # Cap absurdly far TP
             max_tp = entry * (1 + self.max_tp_pct / 100)
             if tp > max_tp:
                 tp = max_tp
             if tp <= mid:
-                tp = max(fallback_tp, mid * 1.00005)
+                tp = max(fallback_tp, mid * (1 + need / 200))
 
             if bid_w:
                 sl = bid_w["price"] * (1 - buf)
@@ -749,17 +884,22 @@ class BookState:
                 note = note if "pct" in note else "wall+bbo"
             else:
                 sl = fallback_sl
-            # SL must stay below mid; may trail above entry as bids lift
             sl = min(sl, mid * (1 - buf))
             return tp, sl, note
 
         # short
-        bid_w = self._nearest_wall(bid_walls, below=True, mid=mid)
+        bid_w = self._reward_wall(bid_walls, above=False, mid=mid, min_dist_pct=need)
+        if bid_w is None:
+            bid_w = self._nearest_wall(bid_walls, below=True, mid=mid)
         ask_w = self._nearest_wall(ask_walls, below=False, mid=max(mid, entry))
         if bid_w:
             tp = bid_w["price"]
+            dist = abs(entry - tp) / entry * 100
+            if dist < need:
+                tp = entry * (1 - need / 100)
+                note = "wall+min"
         elif best_bid and best_bid < mid:
-            tp = best_bid
+            tp = min(best_bid, entry * (1 - need / 100))
             note = "wall+bbo"
         else:
             tp = fallback_tp
@@ -768,7 +908,7 @@ class BookState:
         if tp < min_tp:
             tp = min_tp
         if tp >= mid:
-            tp = min(fallback_tp, mid * 0.99995)
+            tp = min(fallback_tp, mid * (1 - need / 200))
 
         if ask_w:
             sl = ask_w["price"] * (1 + buf)
@@ -908,11 +1048,48 @@ class BookState:
             pos["peak_mid"] = max(float(pos.get("peak_mid", mid)), mid)
         else:
             pos["peak_mid"] = min(float(pos.get("peak_mid", mid)), mid)
-        if pnl >= self.min_lock_pct:
+        # Arm only when gross already covers estimated fees
+        arm_need = max(self.min_lock_pct, self.fee_rt_pct if self.net_exits else 0.0)
+        if pnl >= arm_need:
             pos["armed"] = True
 
+        # Once in fee-covered profit: protect — BE then trail under/over peak
+        if pos.get("armed"):
+            protect_note = []
+            if self.protect_be:
+                if side == "long":
+                    if float(pos["sl"]) < entry:
+                        pos["sl"] = entry
+                        protect_note.append("BE")
+                else:
+                    if float(pos["sl"]) > entry:
+                        pos["sl"] = entry
+                        protect_note.append("BE")
+            if self.protect_trail:
+                peak_mid = float(pos["peak_mid"])
+                if side == "long":
+                    trail_sl = peak_mid * (1 - self.rev_pct / 100)
+                    if trail_sl > entry:
+                        pos["sl"] = max(float(pos["sl"]), trail_sl)
+                        protect_note.append("trail")
+                else:
+                    trail_sl = peak_mid * (1 + self.rev_pct / 100)
+                    if trail_sl < entry:
+                        pos["sl"] = min(float(pos["sl"]), trail_sl)
+                        protect_note.append("trail")
+            if protect_note:
+                base = str(pos.get("exits") or "wall")
+                tag = "+".join(protect_note)
+                if tag not in base:
+                    pos["exits"] = f"{base}+{tag}"
+
+        held = now - float(pos.get("opened_at", now))
+        soft_ok = held >= self.min_hold_sec
+        # Soft exits only if net would be >= 0 (covers fee estimate)
+        can_soft = soft_ok and (not self.net_exits or self._covers_fees(pnl))
+
         # Proactive: lock green when sense flips or price reverses from peak
-        if pos.get("armed") and pnl > 0:
+        if pos.get("armed") and pnl > 0 and can_soft:
             if self.flip_exit:
                 if side == "long" and imb < 0.5:
                     self._close_paper(mid, now, "flip")
@@ -933,8 +1110,8 @@ class BookState:
                         self._close_paper(mid, now, "rev")
                         return
 
-        # Was green, price crossed back through entry → cut before larger loss
-        if self.giveback_exit and pos.get("armed") and pnl <= 0:
+        # Was green (fee-covered), price crossed back through entry
+        if self.giveback_exit and pos.get("armed") and pnl <= 0 and soft_ok:
             self._close_paper(mid, now, "give")
             return
 
@@ -983,26 +1160,32 @@ class BookState:
 
         bid_w = self._nearest_wall(bid_walls, below=True, mid=mid)
         ask_w = self._nearest_wall(ask_walls, below=False, mid=mid)
+        need = self._min_tp_dist_pct()
+        # Must have a reward wall far enough to cover fees+edge (skip micro scalps)
+        long_tp = self._reward_wall(ask_walls, above=True, mid=mid, min_dist_pct=need)
+        short_tp = self._reward_wall(bid_walls, above=False, mid=mid, min_dist_pct=need)
 
-        # best bid/ask carried on walls list order is not guaranteed; caller may pass via snap
         best_bid = max((w["price"] for w in bid_walls), default=None)
         best_ask = min((w["price"] for w in ask_walls), default=None)
-        # Prefer true BBO if present on walls nearest mid
-        near_bid = self._nearest_wall(bid_walls, below=True, mid=mid)
-        near_ask = self._nearest_wall(ask_walls, below=False, mid=mid)
-        if near_bid:
-            best_bid = near_bid["price"] if best_bid is None else best_bid
-        if near_ask:
-            best_ask = near_ask["price"] if best_ask is None else best_ask
 
-        if bid_w and abs(bid_w["dist_pct"]) <= self.touch_pct and imb >= self.imb_long:
+        if (
+            bid_w
+            and abs(bid_w["dist_pct"]) <= self.touch_pct
+            and imb >= self.imb_long
+            and long_tp is not None
+        ):
             self._open_paper(
                 "long", mid, bid_w["price"], now, "bid-wall+imb",
                 bid_walls=bid_walls, ask_walls=ask_walls,
                 best_bid=best_bid, best_ask=best_ask,
             )
             return "long"
-        if ask_w and abs(ask_w["dist_pct"]) <= self.touch_pct and imb <= self.imb_short:
+        if (
+            ask_w
+            and abs(ask_w["dist_pct"]) <= self.touch_pct
+            and imb <= self.imb_short
+            and short_tp is not None
+        ):
             self._open_paper(
                 "short", mid, ask_w["price"], now, "ask-wall+imb",
                 bid_walls=bid_walls, ask_walls=ask_walls,
@@ -1051,6 +1234,7 @@ class BookState:
                 snap = self._fetch_book()
                 mid = float(snap["mid"])
                 now = float(snap["ts"])
+                self._refresh_fees(now)
                 self._refresh_bb(now, mid)
                 self._refresh_live(now)
                 imb = float(snap["imbalance"])
@@ -1164,7 +1348,7 @@ def main() -> None:
                    help="TP/SL mode: wall=dynamic bid/ask walls (default), pct=fixed %%")
     p.add_argument("--tp-pct", type=float, default=0.08, help="fallback / pct-mode TP %%")
     p.add_argument("--sl-pct", type=float, default=0.06, help="fallback / pct-mode SL %%")
-    p.add_argument("--max-tp-pct", type=float, default=0.05,
+    p.add_argument("--max-tp-pct", type=float, default=0.25,
                    help="cap dynamic TP distance from entry %%")
     p.add_argument("--sl-buffer-pct", type=float, default=0.005,
                    help="place SL this %% beyond the support/resistance wall")
@@ -1174,8 +1358,19 @@ def main() -> None:
     p.add_argument("--imb-short", type=float, default=0.45, help="max bid imbalance for short")
     p.add_argument("--bb-period", type=int, default=20)
     p.add_argument("--bb-std", type=float, default=2.0)
-    p.add_argument("--bb-interval", default="1m")
+    p.add_argument("--bb-interval", default="5m",
+                   help="BB regime timeframe (5m = fewer choppy entries than 1m)")
     p.add_argument("--cooldown-sec", type=float, default=20.0)
+    p.add_argument("--min-edge-pct", type=float, default=0.04,
+                   help="extra %% beyond fees required to opposite wall before entry")
+    p.add_argument("--min-hold-sec", type=float, default=3.0,
+                   help="min seconds in trade before soft exits (flip/rev/give)")
+    p.add_argument("--net-exits", action=argparse.BooleanOptionalAction, default=True,
+                   help="only soft-exit when gross pnl covers fee estimate")
+    p.add_argument("--protect-be", action=argparse.BooleanOptionalAction, default=True,
+                   help="once in fee-covered profit, move SL to breakeven")
+    p.add_argument("--protect-trail", action=argparse.BooleanOptionalAction, default=True,
+                   help="once armed, trail SL under/over peak by --rev-pct")
     p.add_argument("--min-lock-pct", type=float, default=0.01,
                    help="min paper profit %% before proactive exits arm")
     p.add_argument("--rev-pct", type=float, default=0.02,
@@ -1187,7 +1382,9 @@ def main() -> None:
     p.add_argument("--giveback-exit", action=argparse.BooleanOptionalAction, default=True,
                    help="if was green then mid crosses entry, close immediately")
     p.add_argument("--fee-rt-pct", type=float, default=0.08,
-                   help="estimated round-trip fee %% per paper trade (NOT from exchange API)")
+                   help="fallback round-trip fee %% if Binance commissionRate unavailable")
+    p.add_argument("--fee-mode", choices=("taker", "maker", "mixed"), default="taker",
+                   help="how to build RT from Binance rates: 2*taker | 2*maker | maker+taker")
     p.add_argument("--notional", type=float, default=100.0,
                    help="virtual USDT size for session PnL ≈ USDT display")
     p.add_argument("--no-paper", action="store_true", help="disable paper entries")
@@ -1195,17 +1392,16 @@ def main() -> None:
     p.add_argument("--recv-window", type=int, default=15_000)
     args = p.parse_args()
 
-    api_key = ""
-    api_secret = ""
-    hedge = False
-    if args.live_pos:
-        from orderbook_dca_grid import _resolve_hedge, load_env_file, load_keys
+    from orderbook_dca_grid import load_env_file, load_keys
 
-        load_env_file(None)
-        api_key, api_secret = load_keys(None)
+    load_env_file(None)
+    api_key, api_secret = load_keys(None)
+    hedge = False
+    if args.live_pos and api_key and api_secret:
+        from orderbook_dca_grid import _resolve_hedge
+
         ns = argparse.Namespace(position_mode="auto", recv_window=args.recv_window)
-        if api_key and api_secret:
-            hedge = _resolve_hedge(ns, api_key, api_secret)
+        hedge = _resolve_hedge(ns, api_key, api_secret)
 
     state = BookState(
         args.symbol,
@@ -1240,7 +1436,16 @@ def main() -> None:
         max_tp_pct=args.max_tp_pct,
         fee_rt_pct=args.fee_rt_pct,
         notional=args.notional,
+        min_edge_pct=args.min_edge_pct,
+        min_hold_sec=args.min_hold_sec,
+        net_exits=args.net_exits,
+        fee_mode=args.fee_mode,
+        protect_be=args.protect_be,
+        protect_trail=args.protect_trail,
     )
+    # Pull Binance commission rates immediately (needs API keys in .env)
+    state._refresh_fees(0.0)
+
     worker = threading.Thread(target=state.loop, name="depth", daemon=True)
     worker.start()
 
@@ -1259,8 +1464,24 @@ def main() -> None:
         f"giveback={args.giveback_exit}  arm>={args.min_lock_pct:g}%  rev={args.rev_pct:g}%"
     )
     print(
-        f"session fee estimate {args.fee_rt_pct:g}%/trade (round-trip)  "
-        f"notional {args.notional:g} USDT — not from exchange commission API"
+        f"protect: BE={args.protect_be} trail={args.protect_trail} "
+        f"(arms when pnl covers fees)"
+    )
+    fee_src = state._session.get("fee_source", "fallback")
+    print(
+        f"fees [{fee_src}] mode={args.fee_mode}  RT={state.fee_rt_pct:g}%  "
+        f"maker={state._session.get('maker_pct', 0):g}%  "
+        f"taker={state._session.get('taker_pct', 0):g}%  "
+        f"notional {args.notional:g} USDT"
+    )
+    if fee_src != "binance":
+        print("  (put BINANCE API keys in .env to load /fapi/v1/commissionRate)")
+        if state._session.get("fee_error"):
+            print(f"  fee error: {state._session['fee_error']}")
+    need = state.fee_rt_pct + args.min_edge_pct
+    print(
+        f"fee recover: min TP wall {need:g}%  bb={args.bb_interval}  "
+        f"net-exits={args.net_exits}  min-hold={args.min_hold_sec:g}s"
     )
     print("No real orders from this script. Ctrl+C to stop.")
     try:
