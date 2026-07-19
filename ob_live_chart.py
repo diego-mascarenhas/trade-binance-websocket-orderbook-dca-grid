@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Live order-book wall dashboard + paper scalper (Binance Futures).
+"""Live order-book wall dashboard + OB scalper (Binance Futures).
 
-Polls depth, draws mid + top walls, Bollinger regime, and simulates
-wall-bounce entries. TP/SL default to dynamic order-book walls (ask for TP
-on longs, bid for SL) and update each tick. Also proactive flip/rev exits.
+Polls depth, draws mid + walls / depth profile, Bollinger regime, and trades
+wall-bounce entries with dynamic TP/SL. By default places REAL market orders.
+Pass --dry-run for paper-only simulation.
 
 Usage:
-    python3 ob_live_chart.py BTCUSDT
-    python3 ob_live_chart.py ETHUSDT --port 8765 --tp-pct 0.08 --sl-pct 0.06
-    python3 ob_live_chart.py BTCUSDT --live-pos   # overlay real position if keys in .env
+    python3 ob_live_chart.py SOLUSDT                  # LIVE orders
+    python3 ob_live_chart.py SOLUSDT --dry-run        # paper only
+    python3 ob_live_chart.py BTCUSDT                 # LIVE, exchange min size
+    python3 ob_live_chart.py BTCUSDT --notional 50   # LIVE, ~50 USDT
     # open http://127.0.0.1:8765/
 """
 
@@ -19,11 +20,13 @@ import json
 import math
 import os
 import statistics
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections import deque
+from decimal import ROUND_DOWN, Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
@@ -92,18 +95,92 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .entry { color: var(--entry); }
     .wrap {
       display: grid;
-      grid-template-columns: 1fr 300px;
+      grid-template-columns: 1fr 168px 280px;
       gap: 0;
       min-height: calc(100vh - 70px);
     }
-    @media (max-width: 960px) {
+    @media (max-width: 1100px) {
+      .wrap { grid-template-columns: 1fr 150px; }
+      aside { display: none; }
+    }
+    @media (max-width: 720px) {
       .wrap { grid-template-columns: 1fr; }
+      #profile { max-height: 220px; border-right: none; border-top: 1px solid var(--line); }
     }
     #chart {
       height: calc(100vh - 70px);
       min-height: 420px;
       border-right: 1px solid var(--line);
     }
+    #profile {
+      height: calc(100vh - 70px);
+      min-height: 420px;
+      border-right: 1px solid var(--line);
+      background: linear-gradient(180deg, #12161c 0%, #0e1116 100%);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    #profile .ph {
+      padding: 8px 8px 4px;
+      font-size: 0.65rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      flex: 0 0 auto;
+    }
+    #profileLadder {
+      flex: 1 1 auto;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 4px 0;
+      gap: 1px;
+    }
+    .pv-row {
+      display: grid;
+      grid-template-columns: 54px 1fr;
+      align-items: center;
+      gap: 4px;
+      height: 7px;
+      padding: 0 6px;
+      flex: 1 1 0;
+      min-height: 4px;
+      max-height: 14px;
+    }
+    .pv-row.mid {
+      height: 12px;
+      max-height: 16px;
+      border-top: 1px solid rgba(88,166,255,0.35);
+      border-bottom: 1px solid rgba(88,166,255,0.35);
+    }
+    .pv-px {
+      font-size: 0.58rem;
+      color: var(--muted);
+      text-align: right;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    .pv-row.ask .pv-px { color: #e3b341; }
+    .pv-row.bid .pv-px { color: #58a6ff; }
+    .pv-track {
+      height: 70%;
+      min-height: 3px;
+      display: flex;
+      justify-content: flex-end;
+      background: rgba(48,54,61,0.35);
+      border-radius: 1px;
+      overflow: hidden;
+    }
+    .pv-fill {
+      height: 100%;
+      border-radius: 1px;
+      transition: width 0.2s ease;
+    }
+    .pv-row.ask .pv-fill { background: linear-gradient(90deg, #8b6914, #e3b341); }
+    .pv-row.bid .pv-fill { background: linear-gradient(90deg, #1f6feb, #58a6ff); }
+    .pv-row.wall .pv-fill { box-shadow: 0 0 0 1px rgba(255,255,255,0.25) inset; }
     aside {
       padding: 10px 14px 20px;
       overflow: auto;
@@ -130,16 +207,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     th:first-child, td:first-child { text-align: left; }
     th { color: var(--muted); font-weight: 500; }
     .bar-wrap {
-      height: 8px;
+      height: 10px;
       background: #21262d;
       border-radius: 2px;
       overflow: hidden;
       margin-top: 8px;
+      display: flex;
+      width: 100%;
     }
-    .bar {
+    .bar-bid {
       height: 100%;
       width: 50%;
-      background: linear-gradient(90deg, var(--bid), #238636 50%, var(--ask));
+      background: var(--bid);
+      transition: width 0.25s ease;
+    }
+    .bar-ask {
+      height: 100%;
+      width: 50%;
+      background: var(--ask);
       transition: width 0.25s ease;
     }
     .err { color: var(--ask); font-size: 0.8rem; padding: 8px 20px; }
@@ -166,35 +251,30 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <span class="pill" id="regimePill"><span class="meta">regime</span> <span id="regime">—</span></span>
     <span class="pill" id="sigPill"><span class="meta">signal</span> <span id="signal">FLAT</span></span>
     <span class="pill" id="sessPill"><span class="meta">session</span> <span id="sessNet">—</span></span>
+    <span class="pill" id="modePill"><span class="meta">mode</span> <span id="modeLabel">—</span></span>
     <span class="meta" id="ts">waiting…</span>
   </header>
   <div id="err" class="err" hidden></div>
   <div class="wrap">
     <div id="chart"></div>
+    <div id="profile">
+      <div class="ph">Depth · USDT</div>
+      <div id="profileLadder"></div>
+    </div>
     <aside>
       <h2>Session PnL (paper)</h2>
       <div class="pos-box empty" id="sessionBox">no closed trades yet</div>
-      <h2>Paper position</h2>
+      <h2>Position</h2>
       <div class="pos-box empty" id="paperPos">flat — waiting for wall bounce</div>
       <h2>Live position</h2>
       <div class="pos-box empty" id="livePos">—</div>
       <h2>Imbalance (band)</h2>
-      <div class="bar-wrap"><div class="bar" id="imbBar"></div></div>
+      <div class="bar-wrap"><div class="bar-bid" id="imbBid"></div><div class="bar-ask" id="imbAsk"></div></div>
       <div class="meta" style="margin-top:6px" id="imbDetail">—</div>
       <h2>Recent paper trades</h2>
       <table>
         <thead><tr><th>side</th><th>exit</th><th>why</th><th>pnl%</th></tr></thead>
         <tbody id="trades"></tbody>
-      </table>
-      <h2 class="bid">Bid walls</h2>
-      <table>
-        <thead><tr><th>price</th><th>qty</th><th>USDT</th><th>%</th></tr></thead>
-        <tbody id="bids"></tbody>
-      </table>
-      <h2 class="ask">Ask walls</h2>
-      <table>
-        <thead><tr><th>price</th><th>qty</th><th>USDT</th><th>%</th></tr></thead>
-        <tbody id="asks"></tbody>
       </table>
     </aside>
   </div>
@@ -257,14 +337,26 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       if (m > 0) return m + "m " + String(s).padStart(2, "0") + "s";
       return s + "s";
     }
-    function wallRows(walls, tbody) {
-      tbody.innerHTML = walls.map(w => `
-        <tr>
-          <td>${fmt(w.price, w.price >= 1000 ? 2 : 4)}</td>
-          <td>${fmt(w.qty, 3)}</td>
-          <td>${fmt(w.notional, 0)}</td>
-          <td>${w.dist_pct.toFixed(3)}</td>
-        </tr>`).join("");
+    function renderProfile(profile, mid) {
+      const el = document.getElementById("profileLadder");
+      if (!profile || !profile.length) {
+        el.innerHTML = "";
+        return;
+      }
+      const maxN = Math.max(1, ...profile.map(p => p.notional || 0));
+      const pd = mid >= 1000 ? 2 : (mid >= 1 ? 4 : 5);
+      el.innerHTML = profile.map(p => {
+        const pct = Math.max(2, Math.round((p.notional / maxN) * 100));
+        const isMid = p.side === "mid";
+        const cls = isMid ? "mid" : (p.side + (p.wall ? " wall" : ""));
+        const px = isMid ? "MID" : fmt(p.price, pd);
+        const w = isMid ? 8 : pct;
+        const title = isMid ? ("mid " + fmt(mid, pd)) : (p.side + " " + fmt(p.notional, 0) + " USDT");
+        return `<div class="pv-row ${cls}" title="${title}">
+          <div class="pv-px">${px}</div>
+          <div class="pv-track"><div class="pv-fill" style="width:${w}%;${isMid ? "background:#58a6ff" : ""}"></div></div>
+        </div>`;
+      }).join("");
     }
     function resize() {
       chart.applyOptions({ width: chartEl.clientWidth, height: chartEl.clientHeight });
@@ -286,9 +378,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const pd = s.mid >= 1000 ? 2 : 4;
         document.getElementById("mid").textContent = fmt(s.mid, pd);
         document.getElementById("spread").textContent = fmt(s.spread, s.mid >= 1000 ? 2 : 5);
-        document.getElementById("imb").textContent = (s.imbalance * 100).toFixed(1) + "% bid";
-        document.getElementById("imbBar").style.width = (s.imbalance * 100).toFixed(1) + "%";
-        document.getElementById("imbDetail").textContent =
+        const bidPct = Math.max(0, Math.min(100, (s.imbalance || 0.5) * 100));
+        const askPct = 100 - bidPct;
+        document.getElementById("imb").textContent =
+          bidPct.toFixed(1) + "% bid / " + askPct.toFixed(1) + "% ask";
+        document.getElementById("imbBid").style.width = bidPct.toFixed(1) + "%";
+        document.getElementById("imbAsk").style.width = askPct.toFixed(1) + "%";
+        let imbDetail =
           `bid vol ${fmt(s.bid_vol, 2)} · ask vol ${fmt(s.ask_vol, 2)}`;
         const started = (s.session && s.session.started_at) || s.started_at;
         const elapsedSec = started
@@ -309,6 +405,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         sigEl.textContent = sig;
         sigEl.className = sig === "LONG" ? "bid" : sig === "SHORT" ? "ask" : "";
         sigPill.className = "pill " + (sig === "FLAT" ? "" : "on");
+        sigPill.title = s.block_reason || "";
+        if (sig === "FLAT" && s.block_reason) {
+          sigEl.textContent = "FLAT";
+          imbDetail = `wait: ${s.block_reason} · ` + imbDetail;
+        }
+        document.getElementById("imbDetail").textContent = imbDetail;
 
         const sess = s.session || {};
         const sessNet = sess.net_pct != null ? sess.net_pct : 0;
@@ -317,6 +419,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         sessEl.textContent = (sessNet >= 0 ? "+" : "") + Number(sessNet).toFixed(3) + "%";
         sessEl.className = sessNet >= 0 ? "win" : "loss";
         sessPill.className = "pill " + (sessNet >= 0 ? "on" : "off");
+        const modeEl = document.getElementById("modeLabel");
+        const modePill = document.getElementById("modePill");
+        if (s.dry_run) {
+          modeEl.textContent = "DRY-RUN";
+          modeEl.className = "";
+          modePill.className = "pill";
+        } else {
+          modeEl.textContent = "LIVE";
+          modeEl.className = "ask";
+          modePill.className = "pill off";
+        }
         const sessBox = document.getElementById("sessionBox");
         const n = sess.trades || 0;
         const feeSrc = sess.fee_source === "binance"
@@ -348,18 +461,30 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           const pnlCls = pnl >= 0 ? "win" : "loss";
           paperBox.className = "pos-box";
           const peak = paper.peak_pnl_pct != null ? paper.peak_pnl_pct : pnl;
+          const beOn = !!paper.be_locked;
+          const needFee = Number(s.session && s.session.fee_rt_pct != null ? s.session.fee_rt_pct : 0.1);
+          const beLine = beOn
+            ? `<span class="win">BE LOCKED</span> @ ${fmt(paper.entry, pd)}`
+            : `<span class="meta">BE pending</span> (need ~+${Math.max(0, needFee - pnl).toFixed(3)}% more / fees)`;
+          const src = paper.source === "live" ? "LIVE" : "paper";
+          const qtyBit = paper.qty ? ` · qty ${fmt(paper.qty, 4)}` : "";
           paperBox.innerHTML =
             `<span class="${paper.side === "long" ? "bid" : "ask"}">${paper.side.toUpperCase()}</span>` +
-            ` @ <span class="entry">${fmt(paper.entry, pd)}</span><br>` +
+            ` @ <span class="entry">${fmt(paper.entry, pd)}</span>` +
+            ` <span class="meta">[${src}]</span>${qtyBit}<br>` +
             `TP ${fmt(paper.tp, pd)} · SL ${fmt(paper.sl, pd)}` +
             ` <span class="meta">(${paper.exits || "wall"})</span><br>` +
+            `${beLine}<br>` +
             `wall ${fmt(paper.wall_price, pd)} · ` +
             `pnl <span class="${pnlCls}">${pnl >= 0 ? "+" : ""}${pnl.toFixed(3)}%</span>` +
-            ` · peak ${peak >= 0 ? "+" : ""}${Number(peak).toFixed(3)}%` +
-            `<br><span class="meta">in profit: SL→BE then trails peak · soft exits if net≥0</span>`;
+            ` · peak ${peak >= 0 ? "+" : ""}${Number(peak).toFixed(3)}%`;
         } else {
           paperBox.className = "pos-box empty";
-          paperBox.textContent = "flat — waiting for wall bounce";
+          let flatMsg = s.block_reason
+            ? ("flat — " + s.block_reason)
+            : "flat — waiting for wall bounce";
+          if (s.order_error) flatMsg += " · err: " + s.order_error;
+          paperBox.textContent = flatMsg;
         }
 
         const live = s.live || {};
@@ -390,8 +515,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </tr>`;
         }).join("");
 
-        wallRows(s.bid_walls || [], document.getElementById("bids"));
-        wallRows(s.ask_walls || [], document.getElementById("asks"));
+        renderProfile(s.depth_profile || [], s.mid);
 
         const trail = (s.trail || []).map(p => ({ time: p.t, value: p.mid }));
         if (trail.length) {
@@ -427,8 +551,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         }
         if (paper.side) {
           addLine(paper.entry, "#d2a8ff", "ENTRY", 2);
+          // Always show BE target at entry; solid gold when locked
+          if (paper.be_locked) {
+            addLine(paper.entry, "#e3b341", "BE ✓", 2, LightweightCharts.LineStyle.Solid);
+          } else {
+            addLine(paper.entry, "rgba(227,179,65,0.55)", "BE", 1, LightweightCharts.LineStyle.SparseDotted);
+          }
           addLine(paper.tp, "#3fb950", "TP", 1, LightweightCharts.LineStyle.Dashed);
-          addLine(paper.sl, "#f85149", "SL", 1, LightweightCharts.LineStyle.Dashed);
+          const slLabel = paper.be_locked && Math.abs(paper.sl - paper.entry) / paper.entry < 1e-8
+            ? "SL=BE" : "SL";
+          addLine(paper.sl, "#f85149", slLabel, 1, LightweightCharts.LineStyle.Dashed);
         }
         if (live.side && live.entry) {
           addLine(live.entry, "#ffa657", "LIVE", 2, LightweightCharts.LineStyle.SparseDotted);
@@ -510,6 +642,69 @@ def round_trip_fee_pct(maker_pct: float, taker_pct: float, mode: str) -> float:
     return taker_pct * 2.0  # taker entry + taker exit (conservative for mid fills)
 
 
+def _cid(prefix: str, symbol: str, side: str) -> str:
+    ts = int(time.time()) % 1_000_000
+    tag = "L" if side == "long" else "S"
+    return f"{prefix}{tag}{symbol.upper()}{ts}"[:36]
+
+
+def market_open(
+    symbol: str,
+    is_long: bool,
+    qty_str: str,
+    hedge: bool,
+    api: str,
+    sec: str,
+    recv: int,
+    *,
+    cid: str,
+) -> dict[str, Any]:
+    from orderbook_dca_grid import _signed_request
+
+    side = "BUY" if is_long else "SELL"
+    params: dict[str, Any] = {
+        "symbol": symbol.upper(),
+        "side": side,
+        "type": "MARKET",
+        "quantity": qty_str,
+        "newClientOrderId": cid,
+    }
+    if hedge:
+        params["positionSide"] = "LONG" if is_long else "SHORT"
+    return _signed_request("POST", "/fapi/v1/order", params, api, sec, recv)
+
+
+def qty_exchange_min(price: float, filt: dict[str, Decimal]) -> tuple[str, float]:
+    """Smallest valid qty: LOT_SIZE min_qty, bumped to MIN_NOTIONAL if needed."""
+    from orderbook_dca_grid import _dec_places
+
+    step = filt["step_size"]
+    qty_dp = _dec_places(step)
+    if price <= 0:
+        raise ValueError("invalid price for sizing")
+    qty_d = filt["min_qty"]
+    while qty_d * Decimal(str(price)) < filt["min_notional"]:
+        qty_d += step
+    qty_str = f"{qty_d:.{qty_dp}f}"
+    return qty_str, float(qty_d)
+
+
+def qty_for_notional(notional: float, price: float, filt: dict[str, Decimal]) -> tuple[str, float]:
+    from orderbook_dca_grid import _dec_places, _round_to
+
+    step = filt["step_size"]
+    qty_dp = _dec_places(step)
+    if price <= 0:
+        raise ValueError("invalid price for sizing")
+    qty_d = _round_to(notional / price, step, ROUND_DOWN)
+    if qty_d < filt["min_qty"]:
+        qty_d = filt["min_qty"]
+    while qty_d * Decimal(str(price)) < filt["min_notional"]:
+        qty_d += step
+    qty_str = f"{qty_d:.{qty_dp}f}"
+    return qty_str, float(qty_d)
+
+
 class BookState:
     def __init__(
         self,
@@ -529,13 +724,16 @@ class BookState:
         bb_period: int,
         bb_std: float,
         bb_interval: str,
+        bb_pad_pct: float,
         cooldown_sec: float,
         paper: bool,
+        dry_run: bool,
         live_pos: bool,
         api_key: str,
         api_secret: str,
         recv_window: int,
         hedge: bool,
+        filt: dict[str, Decimal] | None,
         flip_exit: bool,
         rev_exit: bool,
         min_lock_pct: float,
@@ -568,13 +766,17 @@ class BookState:
         self.bb_period = bb_period
         self.bb_std = bb_std
         self.bb_interval = bb_interval
+        self.bb_pad_pct = bb_pad_pct  # allow entries slightly outside BB (scalp re-entry)
         self.cooldown_sec = cooldown_sec
         self.paper_enabled = paper
-        self.live_enabled = live_pos
+        self.dry_run = dry_run
+        self.live_enabled = live_pos or (not dry_run)
         self.api_key = api_key
         self.api_secret = api_secret
         self.recv_window = recv_window
         self.hedge = hedge
+        self.filt = filt
+        self._last_order_error: str | None = None
         self.flip_exit = flip_exit
         self.rev_exit = rev_exit
         self.min_lock_pct = min_lock_pct
@@ -611,12 +813,14 @@ class BookState:
             "maker_pct": 0.0,
             "taker_pct": 0.0,
             "notional": notional,
+            "dry_run": dry_run,
             "started_at": time.time(),
         }
         self._paper: dict[str, Any] | None = None
         self._live: dict[str, Any] = {}
         self._bb: dict[str, Any] = {"label": "n/a", "tradeable": True}
         self._signal = "flat"
+        self._block_reason = "starting…"
         self._cooldown_until = 0.0
         self._bb_next = 0.0
         self._live_next = 0.0
@@ -635,10 +839,13 @@ class BookState:
             "ask_vol": 0.0,
             "bid_walls": [],
             "ask_walls": [],
+            "depth_profile": [],
             "trail": [],
             "bb_trail": [],
             "regime": self._bb,
             "signal": "flat",
+            "block_reason": "starting…",
+            "dry_run": self.dry_run,
             "paper": {},
             "live": {},
             "live_enabled": self.live_enabled,
@@ -649,6 +856,29 @@ class BookState:
             "ts_iso": "",
             "error": None,
         }
+
+    def _exchange_flat(self) -> bool:
+        if self.dry_run or not self.api_key:
+            return True
+        try:
+            from orderbook_dca_grid import get_position_meta
+
+            long_m = get_position_meta(
+                self.symbol, True, self.hedge, self.api_key, self.api_secret, self.recv_window
+            )
+            short_m = get_position_meta(
+                self.symbol, False, self.hedge, self.api_key, self.api_secret, self.recv_window
+            )
+            return float(long_m["qty"]) <= 0 and float(short_m["qty"]) <= 0
+        except Exception:
+            return False
+
+    def _size_order(self, price: float) -> tuple[str, float]:
+        if not self.filt:
+            raise RuntimeError("symbol filters not loaded")
+        if self.notional <= 0:
+            return qty_exchange_min(price, self.filt)
+        return qty_for_notional(self.notional, price, self.filt)
 
     def _session_view(self, unrealized_pct: float = 0.0) -> dict[str, Any]:
         net = float(self._session["net_pct"])
@@ -711,8 +941,84 @@ class BookState:
         out.sort(key=lambda w: abs(w["dist_pct"]))
         return out[:n]
 
+    def _depth_profile(
+        self,
+        bids: list[list[float]],
+        asks: list[list[float]],
+        mid: float,
+        *,
+        levels: int = 28,
+        wall_usdt: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Horizontal depth ladder for UI (asks above mid, bids below)."""
+        min_wall = self.min_wall_usdt if wall_usdt is None else wall_usdt
+        ask_rows = []
+        for price, qty in asks[:levels]:
+            notional = price * qty
+            ask_rows.append(
+                {
+                    "side": "ask",
+                    "price": price,
+                    "qty": qty,
+                    "notional": notional,
+                    "wall": notional >= min_wall,
+                }
+            )
+        bid_rows = []
+        for price, qty in bids[:levels]:
+            notional = price * qty
+            bid_rows.append(
+                {
+                    "side": "bid",
+                    "price": price,
+                    "qty": qty,
+                    "notional": notional,
+                    "wall": notional >= min_wall,
+                }
+            )
+        # Top = highest ask … down to mid … then best bid down
+        ask_rows.sort(key=lambda r: r["price"], reverse=True)
+        mid_row = {"side": "mid", "price": mid, "qty": 0.0, "notional": 0.0, "wall": False}
+        return ask_rows + [mid_row] + bid_rows
+
+    def _bb_regime_for_mid(self, mid: float) -> dict[str, Any]:
+        """Re-score BB every tick vs live mid (bands may be cached)."""
+        upper = self._bb.get("upper")
+        lower = self._bb.get("lower")
+        mid_bb = self._bb.get("mid")
+        if upper is None or lower is None or mid_bb is None:
+            return {
+                **self._bb,
+                "tradeable": self._bb.get("label") not in ("warmup",),
+                "live_mid": mid,
+            }
+        pad = mid * (self.bb_pad_pct / 100.0)
+        inside = lower <= mid <= upper
+        near = (lower - pad) <= mid <= (upper + pad)
+        width_pct = float(self._bb.get("width_pct") or 0.0)
+        tight = width_pct < 2.5 if mid >= 1000 else width_pct < 4.0
+        if inside:
+            label = "range" if tight else "wide"
+        elif near:
+            label = "near-bb"
+        else:
+            label = "breakout"
+        # Trade when inside OR slightly outside (pad). Hard breakout still blocked.
+        tradeable = near
+        return {
+            **self._bb,
+            "label": label,
+            "tradeable": tradeable,
+            "live_mid": mid,
+            "inside": inside,
+            "near": near,
+        }
+
     def _refresh_bb(self, now: float, mid: float) -> None:
         if now < self._bb_next:
+            # Keep label/tradeable fresh even between kline fetches
+            if self._bb.get("upper") is not None:
+                self._bb = self._bb_regime_for_mid(mid)
             return
         self._bb_next = now + 15.0
         try:
@@ -725,24 +1031,13 @@ class BookState:
                 return
             upper, mid_bb, lower = bb
             width_pct = (upper - lower) / mid_bb * 100 if mid_bb else 0.0
-            # Inside bands + not exploded width => range / tradeable for mean-revert scalp
-            inside = lower <= mid <= upper
-            tight = width_pct < 2.5 if mid >= 1000 else width_pct < 4.0
-            tradeable = inside and tight
-            if not inside:
-                label = "breakout"
-            elif not tight:
-                label = "wide"
-            else:
-                label = "range"
             self._bb = {
-                "label": label,
-                "tradeable": tradeable,
                 "upper": upper,
                 "mid": mid_bb,
                 "lower": lower,
                 "width_pct": width_pct,
             }
+            self._bb = self._bb_regime_for_mid(mid)
             t_sec = int(now)
             pt = {"t": t_sec, "upper": upper, "mid": mid_bb, "lower": lower}
             if self._bb_trail and self._bb_trail[-1]["t"] == t_sec:
@@ -933,28 +1228,93 @@ class BookState:
         best_bid: float | None = None,
         best_ask: float | None = None,
     ) -> None:
+        fill_entry = entry
+        qty = 0.0
+        qty_str = ""
+        source = "paper" if self.dry_run else "live"
+        order_id = ""
+
+        if not self.dry_run:
+            if not self.api_key or not self.api_secret or not self.filt:
+                self._block_reason = "live needs API keys + filters"
+                self._last_order_error = self._block_reason
+                return
+            if not self._exchange_flat():
+                self._block_reason = "exchange already has a position"
+                self._last_order_error = self._block_reason
+                return
+            try:
+                qty_str, qty = self._size_order(entry)
+                cid = _cid("oblive", self.symbol, side)
+                resp = market_open(
+                    self.symbol,
+                    side == "long",
+                    qty_str,
+                    self.hedge,
+                    self.api_key,
+                    self.api_secret,
+                    self.recv_window,
+                    cid=cid,
+                )
+                order_id = str(resp.get("orderId", "") or cid)
+                # Prefer avg fill / position entry when available
+                avg = float(resp.get("avgPrice", 0) or 0)
+                if avg > 0:
+                    fill_entry = avg
+                else:
+                    from orderbook_dca_grid import get_position_meta
+
+                    meta = get_position_meta(
+                        self.symbol,
+                        side == "long",
+                        self.hedge,
+                        self.api_key,
+                        self.api_secret,
+                        self.recv_window,
+                    )
+                    if float(meta["entry"]) > 0:
+                        fill_entry = float(meta["entry"])
+                    if float(meta["qty"]) > 0:
+                        qty = float(meta["qty"])
+                print(
+                    f"LIVE OPEN {side.upper()} {self.symbol} qty={qty_str} "
+                    f"@ ~{fill_entry:g} cid={cid}",
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._block_reason = f"open failed: {exc}"
+                self._last_order_error = str(exc)
+                print(f"LIVE OPEN FAILED: {exc}", flush=True)
+                return
+
         if self.exits == "wall":
             tp, sl, exits_note = self._wall_tp_sl(
-                side, entry, entry, bid_walls or [], ask_walls or [], best_bid, best_ask
+                side, fill_entry, fill_entry, bid_walls or [], ask_walls or [], best_bid, best_ask
             )
         else:
-            tp, sl = self._pct_tp_sl(side, entry)
+            tp, sl = self._pct_tp_sl(side, fill_entry)
             exits_note = "pct"
         self._paper = {
             "side": side,
-            "entry": entry,
+            "entry": fill_entry,
             "tp": tp,
             "sl": sl,
             "wall_price": wall_price,
             "opened_at": now,
-            "source": "paper",
+            "source": source,
             "reason": reason,
             "exits": exits_note,
+            "qty": qty,
+            "qty_str": qty_str,
+            "order_id": order_id,
             "pnl_pct": 0.0,
             "peak_pnl_pct": 0.0,
-            "peak_mid": entry,
+            "peak_mid": fill_entry,
             "armed": False,
         }
+        self._last_order_error = None
+        if qty > 0 and fill_entry > 0:
+            self._session["notional"] = qty * fill_entry
         self._markers.append(
             {
                 "t": int(now),
@@ -972,6 +1332,42 @@ class BookState:
         if not pos:
             return
         side = pos["side"]
+        if not self.dry_run and self.api_key and self.filt:
+            try:
+                from orderbook_dca_grid import get_position_meta, market_close_position
+
+                meta = get_position_meta(
+                    self.symbol,
+                    side == "long",
+                    self.hedge,
+                    self.api_key,
+                    self.api_secret,
+                    self.recv_window,
+                )
+                qty = float(meta["qty"]) or float(pos.get("qty") or 0)
+                if qty > 0:
+                    closed = market_close_position(
+                        self.symbol,
+                        side == "long",
+                        qty,
+                        self.hedge,
+                        self.filt,
+                        self.api_key,
+                        self.api_secret,
+                        self.recv_window,
+                    )
+                    print(
+                        f"LIVE CLOSE {side.upper()} {self.symbol} qty={closed:g} "
+                        f"why={why} @ ~{mark:g}",
+                        flush=True,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self._last_order_error = str(exc)
+                print(f"LIVE CLOSE FAILED: {exc}", flush=True)
+                # Keep managing position until close succeeds
+                self._block_reason = f"close failed: {exc}"
+                return
+
         gross = self._pnl_pct(pos["entry"], mark, side)
         fee = self.fee_rt_pct
         net = gross - fee
@@ -983,6 +1379,7 @@ class BookState:
             "fee_pct": fee,
             "net_pct": net,
             "why": why,
+            "source": pos.get("source", "paper"),
             "t": int(now),
         }
         self._trades.append(trade)
@@ -1008,8 +1405,13 @@ class BookState:
         if len(self._markers) > 80:
             self._markers = self._markers[-80:]
         self._paper = None
-        self._cooldown_until = now + self.cooldown_sec
+        # Shorter pause after SL so the bot can re-arm; longer after wins
+        cd = self.cooldown_sec
+        if why == "sl":
+            cd = min(cd, 5.0)
+        self._cooldown_until = now + cd
         self._signal = "flat"
+        self._block_reason = f"cooldown {cd:g}s after {why}"
 
     def _manage_paper(
         self,
@@ -1048,40 +1450,42 @@ class BookState:
             pos["peak_mid"] = max(float(pos.get("peak_mid", mid)), mid)
         else:
             pos["peak_mid"] = min(float(pos.get("peak_mid", mid)), mid)
-        # Arm only when gross already covers estimated fees
-        arm_need = max(self.min_lock_pct, self.fee_rt_pct if self.net_exits else 0.0)
-        if pnl >= arm_need:
+        # Soft-exit arm: need fee-covered profit. BE arm: earlier (min_lock).
+        soft_arm_need = max(self.min_lock_pct, self.fee_rt_pct if self.net_exits else 0.0)
+        be_arm_need = self.min_lock_pct
+        if pnl >= soft_arm_need:
             pos["armed"] = True
+        be_ready = pnl >= be_arm_need
+        pos["be_locked"] = False
 
-        # Once in fee-covered profit: protect — BE then trail under/over peak
-        if pos.get("armed"):
-            protect_note = []
-            if self.protect_be:
-                if side == "long":
-                    if float(pos["sl"]) < entry:
-                        pos["sl"] = entry
-                        protect_note.append("BE")
-                else:
-                    if float(pos["sl"]) > entry:
-                        pos["sl"] = entry
-                        protect_note.append("BE")
-            if self.protect_trail:
-                peak_mid = float(pos["peak_mid"])
-                if side == "long":
-                    trail_sl = peak_mid * (1 - self.rev_pct / 100)
-                    if trail_sl > entry:
-                        pos["sl"] = max(float(pos["sl"]), trail_sl)
-                        protect_note.append("trail")
-                else:
-                    trail_sl = peak_mid * (1 + self.rev_pct / 100)
-                    if trail_sl < entry:
-                        pos["sl"] = min(float(pos["sl"]), trail_sl)
-                        protect_note.append("trail")
-            if protect_note:
-                base = str(pos.get("exits") or "wall")
-                tag = "+".join(protect_note)
-                if tag not in base:
-                    pos["exits"] = f"{base}+{tag}"
+        # Protect: BE as soon as slightly green; trail once fee-covered (armed)
+        protect_note = []
+        if self.protect_be and be_ready:
+            if side == "long":
+                if float(pos["sl"]) < entry:
+                    pos["sl"] = entry
+                protect_note.append("BE")
+                pos["be_locked"] = True
+            else:
+                if float(pos["sl"]) > entry:
+                    pos["sl"] = entry
+                protect_note.append("BE")
+                pos["be_locked"] = True
+        if self.protect_trail and pos.get("armed"):
+            peak_mid = float(pos["peak_mid"])
+            if side == "long":
+                trail_sl = peak_mid * (1 - self.rev_pct / 100)
+                if trail_sl > entry:
+                    pos["sl"] = max(float(pos["sl"]), trail_sl)
+                    protect_note.append("trail")
+            else:
+                trail_sl = peak_mid * (1 + self.rev_pct / 100)
+                if trail_sl < entry:
+                    pos["sl"] = min(float(pos["sl"]), trail_sl)
+                    protect_note.append("trail")
+        if protect_note:
+            base = str(pos.get("exits") or "wall").split("+")[0]
+            pos["exits"] = base + "+" + "+".join(protect_note)
 
         held = now - float(pos.get("opened_at", now))
         soft_ok = held >= self.min_hold_sec
@@ -1141,6 +1545,22 @@ class BookState:
             return None
         return min(cands, key=lambda w: abs(w["dist_pct"]))
 
+    def _levels_as_walls(
+        self, levels: list[list[float]], mid: float
+    ) -> list[dict[str, float]]:
+        """Full depth → wall dicts (for entries; not just top-N by size)."""
+        out: list[dict[str, float]] = []
+        for price, qty in levels:
+            out.append(
+                {
+                    "price": price,
+                    "qty": qty,
+                    "notional": price * qty,
+                    "dist_pct": (price - mid) / mid * 100 if mid else 0.0,
+                }
+            )
+        return out
+
     def _eval_signal(
         self,
         mid: float,
@@ -1148,50 +1568,74 @@ class BookState:
         bid_walls: list[dict[str, float]],
         ask_walls: list[dict[str, float]],
         now: float,
+        *,
+        all_bids: list[dict[str, float]] | None = None,
+        all_asks: list[dict[str, float]] | None = None,
     ) -> str:
+        bids = all_bids if all_bids is not None else bid_walls
+        asks = all_asks if all_asks is not None else ask_walls
+
         if not self.paper_enabled:
+            self._block_reason = "paper off"
             return "flat"
         if self._paper:
+            self._block_reason = "in position"
             return self._paper["side"]
         if now < self._cooldown_until:
+            left = max(0.0, self._cooldown_until - now)
+            self._block_reason = f"cooldown {left:.1f}s left"
             return "flat"
+        # Re-evaluate BB vs *current* mid each tick (avoids stale breakout lock)
+        self._bb = self._bb_regime_for_mid(mid)
         if not self._bb.get("tradeable", True):
+            self._block_reason = f"regime {self._bb.get('label', '?')} (need inside/near BB)"
             return "flat"
 
-        bid_w = self._nearest_wall(bid_walls, below=True, mid=mid)
-        ask_w = self._nearest_wall(ask_walls, below=False, mid=mid)
+        bid_w = self._nearest_wall(bids, below=True, mid=mid)
+        ask_w = self._nearest_wall(asks, below=False, mid=mid)
         need = self._min_tp_dist_pct()
-        # Must have a reward wall far enough to cover fees+edge (skip micro scalps)
-        long_tp = self._reward_wall(ask_walls, above=True, mid=mid, min_dist_pct=need)
-        short_tp = self._reward_wall(bid_walls, above=False, mid=mid, min_dist_pct=need)
+        # Reward wall from FULL depth so fee+edge targets are not dropped
+        long_tp = self._reward_wall(asks, above=True, mid=mid, min_dist_pct=need)
+        short_tp = self._reward_wall(bids, above=False, mid=mid, min_dist_pct=need)
 
-        best_bid = max((w["price"] for w in bid_walls), default=None)
-        best_ask = min((w["price"] for w in ask_walls), default=None)
+        best_bid = max((w["price"] for w in bids), default=None)
+        best_ask = min((w["price"] for w in asks), default=None)
 
-        if (
-            bid_w
-            and abs(bid_w["dist_pct"]) <= self.touch_pct
-            and imb >= self.imb_long
-            and long_tp is not None
-        ):
+        near_bid = bid_w and abs(bid_w["dist_pct"]) <= self.touch_pct
+        near_ask = ask_w and abs(ask_w["dist_pct"]) <= self.touch_pct
+
+        if near_bid and imb >= self.imb_long and long_tp is not None:
             self._open_paper(
                 "long", mid, bid_w["price"], now, "bid-wall+imb",
-                bid_walls=bid_walls, ask_walls=ask_walls,
+                bid_walls=bids, ask_walls=asks,
                 best_bid=best_bid, best_ask=best_ask,
             )
+            self._block_reason = ""
             return "long"
-        if (
-            ask_w
-            and abs(ask_w["dist_pct"]) <= self.touch_pct
-            and imb <= self.imb_short
-            and short_tp is not None
-        ):
+        if near_ask and imb <= self.imb_short and short_tp is not None:
             self._open_paper(
                 "short", mid, ask_w["price"], now, "ask-wall+imb",
-                bid_walls=bid_walls, ask_walls=ask_walls,
+                bid_walls=bids, ask_walls=asks,
                 best_bid=best_bid, best_ask=best_ask,
             )
+            self._block_reason = ""
             return "short"
+
+        # Explain why flat (first matching reason)
+        reasons = []
+        if not near_bid and not near_ask:
+            reasons.append(f"no wall within {self.touch_pct:g}%")
+        elif near_bid and imb < self.imb_long:
+            reasons.append(f"imb {imb*100:.1f}% < long {self.imb_long*100:.0f}%")
+        elif near_ask and imb > self.imb_short:
+            reasons.append(f"imb {imb*100:.1f}% > short {self.imb_short*100:.0f}%")
+        if near_bid and long_tp is None:
+            reasons.append(f"no ask TP ≥{need:g}% away")
+        if near_ask and short_tp is None:
+            reasons.append(f"no bid TP ≥{need:g}% away")
+        if not reasons:
+            reasons.append("filters not met")
+        self._block_reason = " · ".join(reasons)
         return "flat"
 
     def _fetch_book(self) -> dict[str, Any]:
@@ -1222,6 +1666,9 @@ class BookState:
             "best_ask": best_ask,
             "bid_walls": self._top_walls(bids, mid, self.walls),
             "ask_walls": self._top_walls(asks, mid, self.walls),
+            "all_bids": self._levels_as_walls(bids, mid),
+            "all_asks": self._levels_as_walls(asks, mid),
+            "depth_profile": self._depth_profile(bids, asks, mid, levels=min(28, self.limit)),
             "ts": now,
             "ts_iso": time.strftime("%H:%M:%S", time.localtime(now)),
             "error": None,
@@ -1242,8 +1689,8 @@ class BookState:
                     mid,
                     now,
                     imb,
-                    bid_walls=snap["bid_walls"],
-                    ask_walls=snap["ask_walls"],
+                    bid_walls=snap["all_bids"],
+                    ask_walls=snap["all_asks"],
                     best_bid=snap.get("best_bid"),
                     best_ask=snap.get("best_ask"),
                 )
@@ -1253,6 +1700,8 @@ class BookState:
                     snap["bid_walls"],
                     snap["ask_walls"],
                     now,
+                    all_bids=snap["all_bids"],
+                    all_asks=snap["all_asks"],
                 )
                 unreal = 0.0
                 if self._paper:
@@ -1275,13 +1724,21 @@ class BookState:
                     # Drop markers outside trail window (Lightweight Charts requires time in data)
                     t_min = self._trail[0]["t"] if self._trail else 0
                     self._markers = [m for m in self._markers if m["t"] >= t_min]
+                    pub = {
+                        k: v
+                        for k, v in snap.items()
+                        if k not in ("all_bids", "all_asks")
+                    }
                     self._snapshot = {
                         "symbol": self.symbol,
-                        **snap,
+                        **pub,
                         "trail": list(self._trail),
                         "bb_trail": list(self._bb_trail),
                         "regime": dict(self._bb),
                         "signal": self._signal,
+                        "block_reason": self._block_reason,
+                        "dry_run": self.dry_run,
+                        "order_error": self._last_order_error,
                         "paper": dict(self._paper) if self._paper else {},
                         "live": dict(self._live),
                         "live_enabled": self.live_enabled,
@@ -1334,7 +1791,7 @@ def make_handler(state: BookState, ui_poll_ms: int):
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Live OB wall chart + paper scalper")
+    p = argparse.ArgumentParser(description="Live OB wall chart + scalper (LIVE by default)")
     p.add_argument("symbol", nargs="?", default="BTCUSDT")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
@@ -1352,15 +1809,18 @@ def main() -> None:
                    help="cap dynamic TP distance from entry %%")
     p.add_argument("--sl-buffer-pct", type=float, default=0.005,
                    help="place SL this %% beyond the support/resistance wall")
-    p.add_argument("--touch-pct", type=float, default=0.04, help="max dist %% to wall for entry")
-    p.add_argument("--min-wall-usdt", type=float, default=80_000.0, help="min wall notional")
+    p.add_argument("--touch-pct", type=float, default=0.08, help="max dist %% to wall for entry")
+    p.add_argument("--min-wall-usdt", type=float, default=40_000.0, help="min wall notional")
     p.add_argument("--imb-long", type=float, default=0.55, help="min bid imbalance for long")
     p.add_argument("--imb-short", type=float, default=0.45, help="max bid imbalance for short")
     p.add_argument("--bb-period", type=int, default=20)
     p.add_argument("--bb-std", type=float, default=2.0)
     p.add_argument("--bb-interval", default="5m",
                    help="BB regime timeframe (5m = fewer choppy entries than 1m)")
-    p.add_argument("--cooldown-sec", type=float, default=20.0)
+    p.add_argument("--bb-pad-pct", type=float, default=0.20,
+                   help="allow entries this %% outside BB bands (re-entry after stop)")
+    p.add_argument("--cooldown-sec", type=float, default=8.0,
+                   help="pause after close (SL uses min(this, 5s))")
     p.add_argument("--min-edge-pct", type=float, default=0.04,
                    help="extra %% beyond fees required to opposite wall before entry")
     p.add_argument("--min-hold-sec", type=float, default=3.0,
@@ -1385,21 +1845,42 @@ def main() -> None:
                    help="fallback round-trip fee %% if Binance commissionRate unavailable")
     p.add_argument("--fee-mode", choices=("taker", "maker", "mixed"), default="taker",
                    help="how to build RT from Binance rates: 2*taker | 2*maker | maker+taker")
-    p.add_argument("--notional", type=float, default=100.0,
-                   help="virtual USDT size for session PnL ≈ USDT display")
-    p.add_argument("--no-paper", action="store_true", help="disable paper entries")
-    p.add_argument("--live-pos", action="store_true", help="overlay real Binance position")
+    p.add_argument("--notional", type=float, default=0.0,
+                   help="order size in USDT; 0 (default) = exchange minimum for the symbol")
+    p.add_argument("--dry-run", action="store_true",
+                   help="paper only — no real orders (default is LIVE)")
+    p.add_argument("--no-trade", action="store_true",
+                   help="chart only — disable entries entirely")
+    p.add_argument("--live-pos", action="store_true",
+                   help="overlay exchange position (on by default when LIVE)")
     p.add_argument("--recv-window", type=int, default=15_000)
     args = p.parse_args()
 
-    from orderbook_dca_grid import load_env_file, load_keys
+    from orderbook_dca_grid import (
+        _resolve_hedge,
+        load_env_file,
+        load_keys,
+        load_symbol_filters,
+    )
 
     load_env_file(None)
     api_key, api_secret = load_keys(None)
+    dry_run = bool(args.dry_run)
+    filt: dict[str, Decimal] | None = None
     hedge = False
-    if args.live_pos and api_key and api_secret:
-        from orderbook_dca_grid import _resolve_hedge
 
+    if not dry_run:
+        if not api_key or not api_secret:
+            print("LIVE mode needs API keys in .env — or pass --dry-run", file=sys.stderr)
+            sys.exit(1)
+        try:
+            filt = load_symbol_filters(args.symbol)
+        except Exception as exc:
+            print(f"Could not load symbol filters: {exc}", file=sys.stderr)
+            sys.exit(1)
+        ns = argparse.Namespace(position_mode="auto", recv_window=args.recv_window)
+        hedge = _resolve_hedge(ns, api_key, api_secret)
+    elif args.live_pos and api_key and api_secret:
         ns = argparse.Namespace(position_mode="auto", recv_window=args.recv_window)
         hedge = _resolve_hedge(ns, api_key, api_secret)
 
@@ -1419,13 +1900,16 @@ def main() -> None:
         bb_period=args.bb_period,
         bb_std=args.bb_std,
         bb_interval=args.bb_interval,
+        bb_pad_pct=args.bb_pad_pct,
         cooldown_sec=args.cooldown_sec,
-        paper=not args.no_paper,
-        live_pos=args.live_pos,
+        paper=not args.no_trade,
+        dry_run=dry_run,
+        live_pos=args.live_pos or (not dry_run),
         api_key=api_key,
         api_secret=api_secret,
         recv_window=args.recv_window,
         hedge=hedge,
+        filt=filt,
         flip_exit=args.flip_exit,
         rev_exit=args.rev_exit,
         min_lock_pct=args.min_lock_pct,
@@ -1452,12 +1936,21 @@ def main() -> None:
     handler = make_handler(state, args.ui_ms)
     httpd = ThreadingHTTPServer((args.host, args.port), handler)
     url = f"http://{args.host}:{args.port}/"
-    mode = "paper+chart" if state.paper_enabled else "chart-only"
+    mode = "DRY-RUN" if dry_run else "LIVE"
+    if args.no_trade:
+        mode = "CHART-ONLY"
     print(f"OB live chart  {state.symbol}  [{mode}]  →  {url}")
+    if not dry_run and not args.no_trade:
+        print("*** LIVE TRADING — real MARKET orders on Binance Futures ***")
+        if args.notional > 0:
+            size_txt = f"≈ {args.notional:g} USDT"
+        else:
+            size_txt = "exchange minimum (minQty / minNotional)"
+        print(f"*** size {size_txt} per entry  hedge={hedge} ***")
     print(
         f"exits={args.exits}  TP% {args.tp_pct:g}  SL% {args.sl_pct:g}  "
         f"max-tp {args.max_tp_pct:g}%  touch {args.touch_pct:g}%  "
-        f"min-wall {args.min_wall_usdt:,.0f} USDT  live-pos={args.live_pos}"
+        f"min-wall {args.min_wall_usdt:,.0f} USDT"
     )
     print(
         f"proactive: flip={args.flip_exit} rev={args.rev_exit} "
@@ -1483,7 +1976,10 @@ def main() -> None:
         f"fee recover: min TP wall {need:g}%  bb={args.bb_interval}  "
         f"net-exits={args.net_exits}  min-hold={args.min_hold_sec:g}s"
     )
-    print("No real orders from this script. Ctrl+C to stop.")
+    if dry_run:
+        print("Dry-run: no real orders. Ctrl+C to stop.")
+    else:
+        print("LIVE: entries/exits send MARKET orders. Ctrl+C to stop.")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
