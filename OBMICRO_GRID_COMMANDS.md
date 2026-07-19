@@ -60,7 +60,7 @@ fib SYMBOL
 | Levels | `4` | First 4 retrace rungs |
 | Size | base `10` / level `8` USDT | Or `--entry-usdt N` |
 | Leverage | symbol **max** | Unless `--set-leverage` / `--no-max-leverage` |
-| TP | `avg` + `0.35%` | 1st fill @ swing extreme, then avg±% |
+| TP | `avg` + **0.30% net** (+0.08% fees) | Refreshed from live avg on every DCA |
 | SL | `0.50%` / Fib origin | Fixed until protect trail |
 | Protect trail | **ON** | After full fill + profit ≥ callback |
 | Cooldown | **3600 s (1h)** | After flat before next arm |
@@ -165,8 +165,9 @@ fib LTCUSDT --cooldown-sec 300
 | `--level-size` | `8` | Deeper rung notional USDT |
 | `--set-leverage` | `0` | Force leverage (`0` = symbol max) |
 | `--no-max-leverage` | off | Do not raise to symbol max |
-| `--tp-mode` | `avg` | `avg` \| `swing` |
-| `--tp-pct` | `0.35` | With avg: % from live average |
+| `--tp-mode` | `avg` | `avg` = live avg ± (net%+fees), refresh each DCA \| `swing` |
+| `--tp-pct` | `0.30` | **Net** take-profit % from average (after fees) |
+| `--tp-fee-pct` | `0.08` | Round-trip fee % added on top of `--tp-pct` (gross ≈ 0.38%) |
 | `--sl-pct` | `0.50` | SL % from entry/mark |
 | `--protect-trail` / `--no-protect-trail` | **on** | Full `--levels` filled + in profit → trailing SL |
 | `--protect-trail-callback` | `0.2` | Trailing `callbackRate` % (also min profit before arm) |
@@ -192,8 +193,8 @@ fib LTCUSDT --cooldown-sec 300
 1. **Signal** — 15s OB bar (`auto`) or fixed `--direction`.
 2. **Fib plan** — detect swing on `--fib-interval`; arm only if mark is in Fib **0.000 … `--arm-max-fib`**.
 3. **Arm** — place LIMIT grid (default) or MARKET+grid (`--no-wait-pullback`).
-4. **First fill** — arm exchange **TP + SL** algos (`obmg*` client ids).
-5. **More fills** — refresh TP/SL (or trail) for full qty; optional Telegram `#FIB FILL`.
+4. **First fill** — arm exchange **TP + SL** (`TP = avg ± (0.30% net + 0.08% fees)`, no Fib cap).
+5. **More fills (DCA)** — recompute TP from new average (~0.38% gross) and refresh exchange exits; optional Telegram `#FIB FILL`.
 6. **Protect trail** (default) — when all `--levels` are filled **and** mark profit ≥ callback %:
    - cancel fixed SL
    - place `TRAILING_STOP_MARKET` (TP kept)
@@ -299,7 +300,8 @@ OB_MG_RAISE_MIN_PCT=0.05
 
 # Exits / protect / cooldown
 OB_MG_TP_MODE=avg
-OB_MG_TP_PCT=0.35
+OB_MG_TP_PCT=0.30
+OB_MG_TP_FEE_PCT=0.08
 OB_MG_SL_PCT=0.50
 OB_MG_PROTECT_TRAIL=1
 OB_MG_PROTECT_TRAIL_CALLBACK=0.2

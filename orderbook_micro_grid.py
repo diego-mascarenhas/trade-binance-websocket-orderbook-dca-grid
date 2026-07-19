@@ -28,7 +28,7 @@ Env (optional):
   OB_MG_FVG_MIN_PCT=0.08  OB_MG_REQUIRE_FVG=0
   OB_MG_WAIT_PULLBACK=1  OB_MG_ARM_TIMEOUT_SEC=900
   OB_MG_RAISE_TOP=1  OB_MG_RAISE_MIN_PCT=0.05
-  OB_MG_TP_MODE=avg  OB_MG_TP_PCT=0.35
+  OB_MG_TP_MODE=avg  OB_MG_TP_PCT=0.30  OB_MG_TP_FEE_PCT=0.08
   OB_MG_PROTECT_TRAIL=1  OB_MG_PROTECT_TRAIL_CALLBACK=0.2
   OB_MG_COOLDOWN_SEC=3600
   OB_MG_BASE_SIZE=10  OB_MG_LEVEL_SIZE=8  OB_MG_BAR_SEC=15
@@ -322,8 +322,10 @@ FIB_ARM_MAX = 0.236
 FIB_TP_EXT = 1.272  # extension beyond impulse end (legacy / swing-mode helper)
 FIB_SL_BUF = 0.15   # % beyond swing origin
 FVG_MIN_PCT = 0.08  # min FVG height % (1m majors rarely clear 0.25%)
-# TP after fills: avg = from live average (+ tp_pct); swing = fixed at impulse extreme
+# TP after fills: avg = from live average (+ tp_pct net + fees); swing = impulse extreme
 TP_MODE_DEFAULT = "avg"
+TP_PCT_DEFAULT = 0.30          # net profit target % (after fees)
+TP_FEE_RT_DEFAULT = 0.08       # approx round-trip fee % added on top of net TP
 
 
 def _fib_px(swing: SwingImpulse, ratio: float, *, is_long: bool) -> float:
@@ -380,13 +382,15 @@ def resolve_tp_price(
     tp_mode: str,
     tp_pct: float,
     first_fill: bool = False,
+    fee_rt_pct: float = TP_FEE_RT_DEFAULT,
 ) -> float:
-    """Compute live TP.
+    """Compute live TP from entry average.
 
     - ``swing``: always impulse extreme.
-    - ``avg`` (default): first fill stays at swing max; later compensations use
-      average ± tp_pct (capped by swing extreme so TP does not stay too far).
+    - ``avg`` (default): always ``entry ± (tp_pct + fee_rt)`` — **no Fib cap**.
+      ``tp_pct`` is net; fees added via ``fee_rt_pct``. Recalculate on every DCA.
     """
+    _ = first_fill  # kept for call-site compat; avg always uses live average
     mode = (tp_mode or TP_MODE_DEFAULT).strip().lower()
     swing_tp = 0.0
     if plan is not None:
@@ -394,26 +398,28 @@ def resolve_tp_price(
         if plan.swing is not None:
             swing_tp = plan.swing.high if is_long else plan.swing.low
 
+    gross_pct = max(float(tp_pct), 0.05) + max(float(fee_rt_pct), 0.0)
+
     if mode in ("swing", "high", "max"):
         return swing_tp if swing_tp > 0 else (
-            entry_avg * (1 + tp_pct / 100) if is_long else entry_avg * (1 - tp_pct / 100)
+            entry_avg * (1 + gross_pct / 100) if is_long else entry_avg * (1 - gross_pct / 100)
         )
-
-    # avg mode: first fill = punto máximo; compensations pull TP toward avg
-    if first_fill and swing_tp > 0:
-        return swing_tp
 
     if entry_avg <= 0:
         return swing_tp
     if is_long:
-        tp = entry_avg * (1 + max(tp_pct, 0.05) / 100)
-        if swing_tp > 0:
-            tp = min(tp, swing_tp)
-        return tp
-    tp = entry_avg * (1 - max(tp_pct, 0.05) / 100)
-    if swing_tp > 0:
-        tp = max(tp, swing_tp)
-    return tp
+        return entry_avg * (1 + gross_pct / 100)
+    return entry_avg * (1 - gross_pct / 100)
+
+
+def _tp_args(args: argparse.Namespace | None) -> tuple[str, float, float]:
+    """Return (tp_mode, tp_pct_net, fee_rt_pct) from CLI/env defaults."""
+    mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT) if args else TP_MODE_DEFAULT)
+    pct = float(getattr(args, "tp_pct", TP_PCT_DEFAULT) if args else TP_PCT_DEFAULT)
+    fee = float(
+        getattr(args, "tp_fee_pct", TP_FEE_RT_DEFAULT) if args else TP_FEE_RT_DEFAULT
+    )
+    return mode, pct, fee
 
 
 def detect_swing_impulse(
@@ -954,7 +960,8 @@ def render_plan(symbol: str, plan: GridPlan, *, include_ladder: bool = True) -> 
     if plan.note:
         lines.append(f"{DIM}{plan.note}{RESET}")
     lines.append(
-        f"{DIM}TP: 1st fill @ swing max · later fills avg+tp% (or --tp-mode swing = always max){RESET}"
+        f"{DIM}TP: avg ± (net tp% + fees), refreshed each DCA "
+        f"(or --tp-mode swing = impulse extreme){RESET}"
     )
     if include_ladder:
         lines.extend(
@@ -1672,10 +1679,10 @@ def adopt_existing_position(
         cancel_our_sl(symbol, api, sec, recv)  # trail replaces fixed SL
     exits_armed = (tp > 0 and sl > 0) or trail_armed
     if not exits_armed:
-        tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT))
+        tp_mode, tp_pct, fee_rt = _tp_args(args)
         tp = resolve_tp_price(
             is_long, entry, plan, tp_mode=tp_mode,
-            tp_pct=float(getattr(args, "tp_pct", 0.35)), first_fill=True,
+            tp_pct=tp_pct, fee_rt_pct=fee_rt,
         )
         sl = float(plan.sl_price)
         try:
@@ -1766,7 +1773,7 @@ def place_exchange_exits(
     sec: str,
     recv: int,
     *,
-    fee_buffer_pct: float = 0.12,
+    fee_buffer_pct: float = 0.04,
 ) -> tuple[float, float]:
     """Arm TAKE_PROFIT_MARKET + STOP_MARKET for current (or planned) qty."""
     tick = filt["tick_size"]
@@ -1779,7 +1786,9 @@ def place_exchange_exits(
     qty_str = f"{qty_d:.{qty_dp}f}"
 
     tp, sl = float(tp_price), float(sl_price)
-    min_tp = max(fee_buffer_pct * 2.0, 0.30)
+    # Soft floor: keep TP at least ~1× one-way fee away from entry (gross TP
+    # already includes round-trip via resolve_tp_price).
+    min_tp = max(fee_buffer_pct, 0.05)
     if entry > 0 and abs(tp - entry) / entry * 100 < min_tp:
         tp = entry * (1 + min_tp / 100) if is_long else entry * (1 - min_tp / 100)
 
@@ -1952,9 +1961,10 @@ def arm_cycle(
     append_journal(symbol, f"GRID placed={n}/{len(plan.levels)}")
 
     print(f"{BOLD}Arming exchange TP/SL…{RESET}")
-    tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT)) if args else TP_MODE_DEFAULT
-    tp_pct = float(getattr(args, "tp_pct", 0.35)) if args else 0.35
-    tp_target = resolve_tp_price(plan.is_long, entry, plan, tp_mode=tp_mode, tp_pct=tp_pct, first_fill=True)
+    tp_mode, tp_pct, fee_rt = _tp_args(args)
+    tp_target = resolve_tp_price(
+        plan.is_long, entry, plan, tp_mode=tp_mode, tp_pct=tp_pct, fee_rt_pct=fee_rt,
+    )
     tp, sl = place_exchange_exits(
         symbol, plan.is_long, qty, entry, mark or entry,
         tp_target, plan.sl_price, filt, hedge, api, sec, recv,
@@ -2211,16 +2221,16 @@ def tick_pending(
     # First fill — promote to active and arm TP (avg by default)
     if not state.exits_armed:
         clear_live_table(state)
-        tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT))
+        tp_mode, tp_pct, fee_rt = _tp_args(args)
         tp_target = resolve_tp_price(
             state.is_long, entry, state.plan,
-            tp_mode=tp_mode, tp_pct=float(getattr(args, "tp_pct", 0.35)),
-            first_fill=True,
+            tp_mode=tp_mode, tp_pct=tp_pct, fee_rt_pct=fee_rt,
         )
         sl_target = state.plan.sl_price
         print(
             f"{GREEN}✓ Pullback fill qty={qty:g} @ {price_fmt(entry)} — "
-            f"arming TP {price_fmt(tp_target)} (1st=swing max) / SL {price_fmt(sl_target)}{RESET}"
+            f"arming TP {price_fmt(tp_target)} "
+            f"(avg+{tp_pct:g}% net +{fee_rt:g}% fees) / SL {price_fmt(sl_target)}{RESET}"
         )
         try:
             tp, sl = place_exchange_exits(
@@ -2337,15 +2347,15 @@ def refresh_exits_if_grown(
             except Exception as exc:
                 print(f"{RED}Trail refresh failed: {exc}{RESET}")
         else:
-            tp_mode = str(getattr(args, "tp_mode", TP_MODE_DEFAULT))
+            tp_mode, tp_pct, fee_rt = _tp_args(args)
             tp = resolve_tp_price(
                 state.is_long, entry, state.plan,
-                tp_mode=tp_mode, tp_pct=float(getattr(args, "tp_pct", 0.35)),
-                first_fill=False,
+                tp_mode=tp_mode, tp_pct=tp_pct, fee_rt_pct=fee_rt,
             )
             sl = state.plan.sl_price if state.plan else state.sl
             print(
-                f"{DIM}TP → {price_fmt(tp)} (compensation · {tp_mode} from avg {price_fmt(entry)}){RESET}"
+                f"{DIM}TP → {price_fmt(tp)} "
+                f"(avg {price_fmt(entry)} · net {tp_pct:g}% + fees {fee_rt:g}%){RESET}"
             )
             try:
                 tp, sl = place_exchange_exits(
@@ -2356,7 +2366,8 @@ def refresh_exits_if_grown(
                 state.entry = entry
                 append_journal(
                     symbol,
-                    f"EXITS refresh tp={tp:.8g} sl={sl:.8g} qty={qty:g} tp_mode={tp_mode}",
+                    f"EXITS refresh tp={tp:.8g} sl={sl:.8g} qty={qty:g} "
+                    f"tp_mode={tp_mode} net={tp_pct:g} fee={fee_rt:g}",
                 )
             except Exception as exc:
                 print(f"{RED}Exit refresh failed: {exc}{RESET}")
@@ -2491,7 +2502,7 @@ def run(args: argparse.Namespace) -> int:
         f"bar {args.bar_sec:g}s · levels {args.levels} · "
         f"base {args.base_size:g} · level {args.level_size:g} USDT"
         f"{margin_hint} · "
-        f"TP={args.tp_mode}+{args.tp_pct:g}% · SL {args.sl_pct:g}% · "
+        f"TP={args.tp_mode}+{args.tp_pct:g}%net+{args.tp_fee_pct:g}%fee · SL {args.sl_pct:g}% · "
         f"protect_trail={'ON' if args.protect_trail else 'OFF'}"
         f"(cb={args.protect_trail_callback:g}%) · "
         f"cooldown={args.cooldown_sec:g}s · "
@@ -2740,7 +2751,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Fib mode: hard-skip without aligned FVG (default off; FVG still preferred)")
     p.add_argument("--wait-pullback", action=argparse.BooleanOptionalAction,
                    default=_env_bool("OB_MG_WAIT_PULLBACK", True),
-                   help="Fib: LIMIT grid only, no MARKET; TP after fill @ swing max (default on)")
+                   help="Fib: LIMIT grid only, no MARKET; TP/SL after first fill (default on)")
     p.add_argument("--raise-top", action=argparse.BooleanOptionalAction,
                    default=_env_bool("OB_MG_RAISE_TOP", True),
                    help="While pending, raise Fib/TP if impulse makes new high/low (default on)")
@@ -2765,9 +2776,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Do not raise leverage to symbol max before arming")
     p.add_argument("--tp-mode", choices=("avg", "swing"),
                    default=(os.getenv("OB_MG_TP_MODE", TP_MODE_DEFAULT).strip().lower() or TP_MODE_DEFAULT),
-                   help="TP: avg=1st fill @ swing max then avg+tp%% (default); swing=always impulse extreme")
-    p.add_argument("--tp-pct", type=float, default=_env_float("OB_MG_TP_PCT", 0.35),
-                   help="With --tp-mode avg: %% above/below live average (default 0.35)")
+                   help="TP: avg=live average ± (net%%+fees), refreshed each DCA (default); swing=impulse extreme")
+    p.add_argument("--tp-pct", type=float, default=_env_float("OB_MG_TP_PCT", TP_PCT_DEFAULT),
+                   help="Net take-profit %% from live average after fees (default 0.30)")
+    p.add_argument("--tp-fee-pct", type=float, default=_env_float("OB_MG_TP_FEE_PCT", TP_FEE_RT_DEFAULT),
+                   help="Round-trip fee %% added on top of --tp-pct (default 0.08)")
     p.add_argument("--sl-pct", type=float, default=_env_float("OB_MG_SL_PCT", 0.50))
     p.add_argument(
         "--protect-trail",
