@@ -9,8 +9,8 @@ SHARE="$HOME/.local/share/ob-live"
 APP="$SHARE/app"
 DEST="$HOME/Library/LaunchAgents"
 PY="$(command -v python3)"
-SYMBOLS=(BTCUSDT ETHUSDT BNBUSDT SOLUSDT)
-PORTS=(8765 8766 8767 8768)
+SYMBOLS=(BTCUSDT ETHUSDT SOLUSDT)
+PORTS=(8765 8766 8768)
 
 mkdir -p "$APP" "$DEST"
 

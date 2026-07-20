@@ -393,6 +393,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     .btn-sl.off:hover { border-color: #58a6ff88; }
     .btn-sl:disabled { opacity: 0.45; cursor: wait; }
+    .btn-last {
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #161b22;
+      color: var(--muted);
+      font: inherit;
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .btn-last:hover { border-color: #e3b34188; }
+    .btn-last.on {
+      border-color: #e3b34188;
+      background: #241c0c;
+      color: #e3b341;
+    }
+    .btn-last.on:hover { border-color: #e3b341; background: #2d2410; }
+    .btn-last:disabled { opacity: 0.45; cursor: wait; }
     #trades td { font-size: 0.65rem; }
     .win { color: var(--bid); }
     .loss { color: var(--ask); }
@@ -433,6 +454,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="pos-actions">
           <button type="button" class="btn-live" id="btnLive" title="Toggle LIVE orders">LIVE</button>
           <button type="button" class="btn-sl" id="btnSl" title="Toggle stop-loss">SL</button>
+          <button type="button" class="btn-last" id="btnLast" title="Last trade — no new entries">LAST</button>
           <button type="button" class="btn-close" id="btnClose" hidden>Close</button>
         </div>
       </div>
@@ -656,6 +678,42 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     const btnSlEl = document.getElementById("btnSl");
     if (btnSlEl) btnSlEl.addEventListener("click", toggleSl);
+    let togglingLast = false;
+    function syncLastBtn(lastOn) {
+      const btn = document.getElementById("btnLast");
+      if (!btn || togglingLast) return;
+      const on = !!lastOn;
+      btn.classList.toggle("on", on);
+      btn.textContent = on ? "LAST ON" : "LAST";
+      btn.title = on
+        ? "LAST ON — managing open trade only; no new entries. Click to resume entries"
+        : "LAST — finish current trade, then stop opening new positions";
+    }
+    async function toggleLast() {
+      const btn = document.getElementById("btnLast");
+      if (togglingLast || !btn) return;
+      const next = !btn.classList.contains("on");
+      togglingLast = true;
+      btn.disabled = true;
+      try {
+        const r = await fetch("/api/last", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: next }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) throw new Error(data.error || ("HTTP " + r.status));
+        syncLastBtn(!!data.last_trade);
+      } catch (e) {
+        console.warn("last toggle failed", e);
+        alert("LAST toggle failed: " + (e.message || e));
+      } finally {
+        togglingLast = false;
+        btn.disabled = false;
+      }
+    }
+    const btnLastEl = document.getElementById("btnLast");
+    if (btnLastEl) btnLastEl.addEventListener("click", toggleLast);
     const filterBarEl = document.getElementById("filterBar");
     if (filterBarEl) {
       filterBarEl.addEventListener("click", (ev) => {
@@ -815,6 +873,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         }
         syncLiveBtn(!!s.dry_run);
         syncSlBtn(s.sl_enabled !== false, s.sl_hits, s.sl_to_dry);
+        syncLastBtn(!!s.last_trade);
         const smc = s.structure || {};
         const smcEl = document.getElementById("smc");
         const smcPill = document.getElementById("smcPill");
@@ -1262,6 +1321,8 @@ class BookState:
         self.ob_tp_exit = True
         # Hard SL exits (UI toggle); TP / soft exits stay active
         self.sl_enabled = True
+        # Last trade: manage open position, block new entries
+        self.last_trade = False
         # After N session SL hits while LIVE → force PAPER (0 = never)
         self.sl_to_dry = 3
         self.sl_hits = 0
@@ -1376,6 +1437,7 @@ class BookState:
             "sl_enabled": self.sl_enabled,
             "sl_hits": self.sl_hits,
             "sl_to_dry": self.sl_to_dry,
+            "last_trade": self.last_trade,
             "trend": dict(self._trend),
             "structure": dict(self._structure),
             "osc": dict(self._osc),
@@ -1434,6 +1496,29 @@ class BookState:
             "sl_enabled": self.sl_enabled,
             "sl_hits": self.sl_hits,
             "sl_to_dry": self.sl_to_dry,
+        }
+
+    def set_last_trade(self, enabled: bool) -> dict[str, Any]:
+        """Finish current trade then stop new entries (UI LAST button)."""
+        self.last_trade = bool(enabled)
+        if self.last_trade and not self._paper:
+            self._block_reason = "last trade — no new entries"
+        elif not self.last_trade and self._block_reason.startswith("last trade"):
+            self._block_reason = "entries resumed"
+        with self._lock:
+            self._snapshot["last_trade"] = self.last_trade
+            self._snapshot["block_reason"] = self._block_reason
+            self._snapshot["paper"] = dict(self._paper) if self._paper else {}
+        note = "manage open only" if self._paper else "no new entries"
+        print(
+            f"LAST → {'ON' if self.last_trade else 'OFF'} {self.symbol} · {note}",
+            flush=True,
+        )
+        return {
+            "ok": True,
+            "last_trade": self.last_trade,
+            "in_position": bool(self._paper),
+            "note": note,
         }
 
     def manual_close(self) -> dict[str, Any]:
@@ -3718,8 +3803,13 @@ class BookState:
             self._block_reason = "paper off"
             return "flat"
         if self._paper:
-            self._block_reason = "in position"
+            self._block_reason = (
+                "in position · LAST — no re-entry" if self.last_trade else "in position"
+            )
             return self._paper["side"]
+        if self.last_trade:
+            self._block_reason = "last trade — no new entries"
+            return "flat"
         if now < self._cooldown_until:
             left = max(0.0, self._cooldown_until - now)
             self._block_reason = f"cooldown {left:.1f}s left"
@@ -3967,6 +4057,7 @@ class BookState:
                         "sl_enabled": self.sl_enabled,
                         "sl_hits": self.sl_hits,
                         "sl_to_dry": self.sl_to_dry,
+                        "last_trade": self.last_trade,
                         "order_error": self._last_order_error,
                         "trend": dict(self._trend),
                         "structure": dict(self._structure),
@@ -4061,6 +4152,21 @@ def make_handler(state: BookState, ui_poll_ms: int):
                         self._json(400, {"ok": False, "error": "missing enabled"})
                         return
                     result = state.set_sl(bool(data.get("enabled")))
+                    self._json(200 if result.get("ok") else 400, result)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._json(400, {"ok": False, "error": str(exc)})
+                except Exception as exc:  # noqa: BLE001
+                    self._json(500, {"ok": False, "error": str(exc)})
+                return
+            if path == "/api/last":
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    raw = self.rfile.read(n) if n > 0 else b"{}"
+                    data = json.loads(raw.decode("utf-8") or "{}")
+                    if "enabled" not in data:
+                        self._json(400, {"ok": False, "error": "missing enabled"})
+                        return
+                    result = state.set_last_trade(bool(data.get("enabled")))
                     self._json(200 if result.get("ok") else 400, result)
                 except (ValueError, json.JSONDecodeError) as exc:
                     self._json(400, {"ok": False, "error": str(exc)})
