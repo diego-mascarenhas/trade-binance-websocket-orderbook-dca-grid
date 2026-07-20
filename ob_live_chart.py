@@ -372,6 +372,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     .btn-live.on:hover { border-color: #f85149; background: #3d1518; }
     .btn-live:disabled { opacity: 0.45; cursor: wait; }
+    .btn-sl {
+      padding: 4px 10px;
+      border: 1px solid #f8514988;
+      border-radius: 4px;
+      background: #2a1214;
+      color: var(--ask);
+      font: inherit;
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .btn-sl:hover { border-color: #f85149; background: #3d1518; }
+    .btn-sl.off {
+      border-color: var(--line);
+      background: #161b22;
+      color: var(--muted);
+    }
+    .btn-sl.off:hover { border-color: #58a6ff88; }
+    .btn-sl:disabled { opacity: 0.45; cursor: wait; }
     #trades td { font-size: 0.65rem; }
     .win { color: var(--bid); }
     .loss { color: var(--ask); }
@@ -410,6 +431,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <h2>Position</h2>
         <div class="pos-actions">
           <button type="button" class="btn-live" id="btnLive" title="Toggle LIVE orders">LIVE</button>
+          <button type="button" class="btn-sl" id="btnSl" title="Toggle stop-loss">SL</button>
           <button type="button" class="btn-close" id="btnClose" hidden>Close</button>
         </div>
       </div>
@@ -591,6 +613,42 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     const btnLiveEl = document.getElementById("btnLive");
     if (btnLiveEl) btnLiveEl.addEventListener("click", toggleLive);
+    let togglingSl = false;
+    function syncSlBtn(slOn) {
+      const btn = document.getElementById("btnSl");
+      if (!btn || togglingSl) return;
+      const on = !!slOn;
+      btn.classList.toggle("off", !on);
+      btn.textContent = on ? "SL" : "SL OFF";
+      btn.title = on
+        ? "Stop-loss ON — click to disable hard SL exits"
+        : "Stop-loss OFF — click to re-enable hard SL exits";
+    }
+    async function toggleSl() {
+      const btn = document.getElementById("btnSl");
+      if (togglingSl || !btn) return;
+      const next = btn.classList.contains("off");
+      togglingSl = true;
+      btn.disabled = true;
+      try {
+        const r = await fetch("/api/sl", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: next }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) throw new Error(data.error || ("HTTP " + r.status));
+        syncSlBtn(!!data.sl_enabled);
+      } catch (e) {
+        console.warn("sl toggle failed", e);
+        alert("SL toggle failed: " + (e.message || e));
+      } finally {
+        togglingSl = false;
+        btn.disabled = false;
+      }
+    }
+    const btnSlEl = document.getElementById("btnSl");
+    if (btnSlEl) btnSlEl.addEventListener("click", toggleSl);
     const filterBarEl = document.getElementById("filterBar");
     if (filterBarEl) {
       filterBarEl.addEventListener("click", (ev) => {
@@ -749,6 +807,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           modePill.className = "pill off";
         }
         syncLiveBtn(!!s.dry_run);
+        syncSlBtn(s.sl_enabled !== false);
         const sessBox = document.getElementById("sessionBox");
         const n = sess.trades || 0;
         const feeSrc = sess.fee_source === "binance"
@@ -800,11 +859,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           const dcaBit = dcaN > 0
             ? ` · <span class="entry">DCA×${dcaN}</span>`
             : "";
+          const slOn = s.sl_enabled !== false;
+          const slBit = slOn
+            ? `SL ${fmt(paper.sl, pd)}`
+            : `<span class="meta">SL OFF</span>`;
           paperBox.innerHTML =
             `<span class="${paper.side === "long" ? "bid" : "ask"}">${paper.side.toUpperCase()}</span>` +
             ` avg <span class="entry">${fmt(paper.entry, pd)}</span>` +
             ` <span class="meta">[${src}]</span>${qtyBit}${dcaBit}<br>` +
-            `TP ${fmt(paper.tp, pd)} · SL ${fmt(paper.sl, pd)}` +
+            `TP ${fmt(paper.tp, pd)} · ${slBit}` +
             ` <span class="meta">(${paper.exits || "wall"})</span><br>` +
             `${beLine}<br>` +
             `wall ${fmt(paper.wall_price, pd)} · ` +
@@ -891,9 +954,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             addLine(paper.entry, "#e3b341", "BE", 1, LightweightCharts.LineStyle.Solid);
           }
           addLine(paper.tp, "#3fb950", "TP", 1, LightweightCharts.LineStyle.Dashed);
-          const slLabel = paper.be_locked && Math.abs(paper.sl - paper.entry) / paper.entry < 1e-8
-            ? "BE" : "SL";
-          addLine(paper.sl, "#f85149", slLabel, 1, LightweightCharts.LineStyle.Dashed);
+          if (s.sl_enabled !== false) {
+            const slLabel = paper.be_locked && Math.abs(paper.sl - paper.entry) / paper.entry < 1e-8
+              ? "BE" : "SL";
+            addLine(paper.sl, "#f85149", slLabel, 1, LightweightCharts.LineStyle.Dashed);
+          }
         }
         if (live.side && live.entry) {
           addLine(live.entry, "#ffa657", "L", 1, LightweightCharts.LineStyle.SparseDotted);
@@ -1168,6 +1233,8 @@ class BookState:
         self.dca_cooldown_sec = 12.0
         # When fee-covered: snap TP to nearest opposite OB and close on touch
         self.ob_tp_exit = True
+        # Hard SL exits (UI toggle); TP / soft exits stay active
+        self.sl_enabled = True
 
         self._lock = threading.Lock()
         self._trail: deque[dict[str, float]] = deque()
@@ -1237,6 +1304,7 @@ class BookState:
             "signal": "flat",
             "block_reason": "starting…",
             "dry_run": self.dry_run,
+            "sl_enabled": self.sl_enabled,
             "trend": dict(self._trend),
             "book": dict(self._book),
             "confidence": dict(self._confidence),
@@ -1265,11 +1333,23 @@ class BookState:
             "bb_strict": "bb_strict",
             "dca": "dca_enabled",
             "obtp": "ob_tp_exit",
+            "sl": "sl_enabled",
         }.get(fid)
         if key is None:
             raise KeyError(f"unknown filter {fid}")
         setattr(self, key, bool(enabled))
         return self.filter_flags()
+
+    def set_sl(self, enabled: bool) -> dict[str, Any]:
+        """Toggle hard stop-loss exits from the UI (TP / soft exits unchanged)."""
+        self.sl_enabled = bool(enabled)
+        with self._lock:
+            self._snapshot["sl_enabled"] = self.sl_enabled
+        print(
+            f"SL → {'ON' if self.sl_enabled else 'OFF'} {self.symbol}",
+            flush=True,
+        )
+        return {"ok": True, "sl_enabled": self.sl_enabled}
 
     def manual_close(self) -> dict[str, Any]:
         """Market-close open position from the UI (paper or LIVE)."""
@@ -1502,6 +1582,7 @@ class BookState:
             "bb_strict": bool(self.bb_strict),
             "dca": bool(self.dca_enabled),
             "obtp": bool(self.ob_tp_exit),
+            "sl": bool(self.sl_enabled),
         }
 
     def _fee_cover_need(self, pos: dict[str, Any] | None = None) -> float:
@@ -2845,14 +2926,14 @@ class BookState:
         if side == "long":
             if mid >= pos["tp"]:
                 self._close_paper(mid, now, "tp")
-            elif mid <= pos["sl"]:
+            elif self.sl_enabled and mid <= pos["sl"]:
                 adverse = (entry - mid) / entry * 100 if entry else 0.0
                 if (not in_grace) or adverse >= emergency:
                     self._close_paper(mid, now, "sl")
         else:
             if mid <= pos["tp"]:
                 self._close_paper(mid, now, "tp")
-            elif mid >= pos["sl"]:
+            elif self.sl_enabled and mid >= pos["sl"]:
                 adverse = (mid - entry) / entry * 100 if entry else 0.0
                 if (not in_grace) or adverse >= emergency:
                     self._close_paper(mid, now, "sl")
@@ -3458,6 +3539,7 @@ class BookState:
                         "signal": self._signal,
                         "block_reason": self._block_reason,
                         "dry_run": self.dry_run,
+                        "sl_enabled": self.sl_enabled,
                         "order_error": self._last_order_error,
                         "trend": dict(self._trend),
                         "book": dict(self._book),
@@ -3535,6 +3617,21 @@ def make_handler(state: BookState, ui_poll_ms: int):
                         self._json(400, {"ok": False, "error": "missing enabled"})
                         return
                     result = state.set_live(bool(data.get("enabled")))
+                    self._json(200 if result.get("ok") else 400, result)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._json(400, {"ok": False, "error": str(exc)})
+                except Exception as exc:  # noqa: BLE001
+                    self._json(500, {"ok": False, "error": str(exc)})
+                return
+            if path == "/api/sl":
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    raw = self.rfile.read(n) if n > 0 else b"{}"
+                    data = json.loads(raw.decode("utf-8") or "{}")
+                    if "enabled" not in data:
+                        self._json(400, {"ok": False, "error": "missing enabled"})
+                        return
+                    result = state.set_sl(bool(data.get("enabled")))
                     self._json(200 if result.get("ok") else 400, result)
                 except (ValueError, json.JSONDecodeError) as exc:
                     self._json(400, {"ok": False, "error": str(exc)})
