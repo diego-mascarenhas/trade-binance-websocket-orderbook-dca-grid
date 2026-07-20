@@ -19,6 +19,8 @@ for f in \
   ob_live_chart.py \
   orderbook_dca_grid.py \
   ob_ema.py \
+  ob_oscillators.py \
+  ob_structure.py \
   futures_scan.py \
   telegram_notify.py \
   trade_sounds.py

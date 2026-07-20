@@ -406,6 +406,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <span class="pill"><span class="meta">imb</span> <span id="imb">—</span></span>
     <span class="pill" id="regimePill"><span class="meta">regime</span> <span id="regime">—</span></span>
     <span class="pill" id="trendPill"><span class="meta">trend</span> <span id="trend">—</span></span>
+    <span class="pill" id="smcPill"><span class="meta">smc</span> <span id="smc">—</span></span>
     <span class="pill" id="bookPill"><span class="meta">book</span> <span id="book">—</span></span>
     <span class="pill" id="confPill"><span class="meta">conf</span> <span id="conf">—</span></span>
     <span class="pill" id="sigPill"><span class="meta">signal</span> <span id="signal">FLAT</span></span>
@@ -614,14 +615,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     const btnLiveEl = document.getElementById("btnLive");
     if (btnLiveEl) btnLiveEl.addEventListener("click", toggleLive);
     let togglingSl = false;
-    function syncSlBtn(slOn) {
+    function syncSlBtn(slOn, slHits, slToDry) {
       const btn = document.getElementById("btnSl");
       if (!btn || togglingSl) return;
       const on = !!slOn;
+      const hits = slHits != null ? Number(slHits) : 0;
+      const lim = slToDry != null ? Number(slToDry) : 3;
       btn.classList.toggle("off", !on);
-      btn.textContent = on ? "SL" : "SL OFF";
+      btn.textContent = on
+        ? (lim > 0 ? `SL ${hits}/${lim}` : "SL")
+        : "SL OFF";
       btn.title = on
-        ? "Stop-loss ON — click to disable hard SL exits"
+        ? (lim > 0
+          ? `Stop-loss ON · ${hits}/${lim} SL → DRY · click to disable`
+          : "Stop-loss ON — click to disable hard SL exits")
         : "Stop-loss OFF — click to re-enable hard SL exits";
     }
     async function toggleSl() {
@@ -638,7 +645,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         });
         const data = await r.json().catch(() => ({}));
         if (!r.ok || !data.ok) throw new Error(data.error || ("HTTP " + r.status));
-        syncSlBtn(!!data.sl_enabled);
+        syncSlBtn(!!data.sl_enabled, data.sl_hits, data.sl_to_dry);
       } catch (e) {
         console.warn("sl toggle failed", e);
         alert("SL toggle failed: " + (e.message || e));
@@ -807,7 +814,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           modePill.className = "pill off";
         }
         syncLiveBtn(!!s.dry_run);
-        syncSlBtn(s.sl_enabled !== false);
+        syncSlBtn(s.sl_enabled !== false, s.sl_hits, s.sl_to_dry);
+        const smc = s.structure || {};
+        const smcEl = document.getElementById("smc");
+        const smcPill = document.getElementById("smcPill");
+        if (smcEl && smcPill) {
+          const choch = smc.choch || "none";
+          const bits = [];
+          if (choch !== "none") bits.push("CHoCH " + choch);
+          if (smc.eql) bits.push("EQL");
+          if (smc.eqh) bits.push("EQH");
+          if (!bits.length) {
+            bits.push(smc.label || "flat");
+          }
+          smcEl.textContent = bits.join(" · ");
+          smcEl.className = choch === "long" || smc.eql
+            ? "bid"
+            : (choch === "short" || smc.eqh ? "ask" : "");
+          const biased = choch !== "none" || smc.eql || smc.eqh;
+          smcPill.className = "pill " + (biased ? "on" : "");
+          smcPill.title = smc.detail || smc.reason || "";
+        }
         const sessBox = document.getElementById("sessionBox");
         const n = sess.trades || 0;
         const feeSrc = sess.fee_source === "binance"
@@ -1235,6 +1262,19 @@ class BookState:
         self.ob_tp_exit = True
         # Hard SL exits (UI toggle); TP / soft exits stay active
         self.sl_enabled = True
+        # After N session SL hits while LIVE → force PAPER (0 = never)
+        self.sl_to_dry = 3
+        self.sl_hits = 0
+        # Oscillator / SMC filters (UI toggles)
+        self.rsi_filter = True
+        self.adx_filter = True
+        self.smc_filter = False
+        self.osc_interval = "5m"
+        self.rsi_oversold = 30.0
+        self.rsi_overbought = 70.0
+        self.adx_period = 14
+        self.adx_min = 20.0
+        self.structure_interval = "5m"
 
         self._lock = threading.Lock()
         self._trail: deque[dict[str, float]] = deque()
@@ -1268,6 +1308,24 @@ class BookState:
             "trend": "n/a",
             "detail": "",
         }
+        self._osc: dict[str, Any] = {
+            "rsi": None,
+            "adx": None,
+            "di_plus": None,
+            "di_minus": None,
+            "rsi_side": "none",
+            "adx_side": "none",
+            "detail": "",
+        }
+        self._structure: dict[str, Any] = {
+            "label": "n/a",
+            "choch": "none",
+            "eqh": False,
+            "eql": False,
+            "allow_long": False,
+            "allow_short": False,
+            "detail": "",
+        }
         self._confidence: dict[str, Any] = {
             "score": 0.0,
             "min": min_confidence,
@@ -1275,12 +1333,16 @@ class BookState:
             "parts": {},
         }
         self._ema_snap: Any = None
+        self._osc_snap: Any = None
+        self._struct_snap: Any = None
         self._signal = "flat"
         self._block_reason = "starting…"
         self._filters: list[dict[str, Any]] = []
         self._cooldown_until = 0.0
         self._bb_next = 0.0
         self._ema_next = 0.0
+        self._osc_next = 0.0
+        self._struct_next = 0.0
         self._live_next = 0.0
         self._fee_next = 0.0
         self._closes: list[float] = []
@@ -1305,7 +1367,11 @@ class BookState:
             "block_reason": "starting…",
             "dry_run": self.dry_run,
             "sl_enabled": self.sl_enabled,
+            "sl_hits": self.sl_hits,
+            "sl_to_dry": self.sl_to_dry,
             "trend": dict(self._trend),
+            "structure": dict(self._structure),
+            "osc": dict(self._osc),
             "book": dict(self._book),
             "confidence": dict(self._confidence),
             "filters": [],
@@ -1334,6 +1400,9 @@ class BookState:
             "dca": "dca_enabled",
             "obtp": "ob_tp_exit",
             "sl": "sl_enabled",
+            "rsi": "rsi_filter",
+            "adx": "adx_filter",
+            "smc": "smc_filter",
         }.get(fid)
         if key is None:
             raise KeyError(f"unknown filter {fid}")
@@ -1345,11 +1414,18 @@ class BookState:
         self.sl_enabled = bool(enabled)
         with self._lock:
             self._snapshot["sl_enabled"] = self.sl_enabled
+            self._snapshot["sl_hits"] = self.sl_hits
+            self._snapshot["sl_to_dry"] = self.sl_to_dry
         print(
             f"SL → {'ON' if self.sl_enabled else 'OFF'} {self.symbol}",
             flush=True,
         )
-        return {"ok": True, "sl_enabled": self.sl_enabled}
+        return {
+            "ok": True,
+            "sl_enabled": self.sl_enabled,
+            "sl_hits": self.sl_hits,
+            "sl_to_dry": self.sl_to_dry,
+        }
 
     def manual_close(self) -> dict[str, Any]:
         """Market-close open position from the UI (paper or LIVE)."""
@@ -1515,6 +1591,7 @@ class BookState:
                     return {"ok": False, "error": f"live setup failed: {exc}"}
             self.dry_run = False
             self.live_enabled = True
+            self.sl_hits = 0  # fresh LIVE session for SL→DRY counter
             now = time.time()
             try:
                 ex = self._fetch_exchange_position()
@@ -1554,6 +1631,8 @@ class BookState:
         with self._lock:
             self._snapshot["dry_run"] = self.dry_run
             self._snapshot["live_enabled"] = self.live_enabled
+            self._snapshot["sl_hits"] = self.sl_hits
+            self._snapshot["sl_to_dry"] = self.sl_to_dry
             self._snapshot["paper"] = dict(self._paper) if self._paper else {}
             self._snapshot["trades"] = list(self._trades)
             self._snapshot["markers"] = list(self._markers)
@@ -1568,6 +1647,8 @@ class BookState:
             "adopted": adopted is not None,
             "adopt": adopted,
             "note": note,
+            "sl_hits": self.sl_hits,
+            "sl_to_dry": self.sl_to_dry,
         }
 
     def filter_flags(self) -> dict[str, bool]:
@@ -1583,6 +1664,9 @@ class BookState:
             "dca": bool(self.dca_enabled),
             "obtp": bool(self.ob_tp_exit),
             "sl": bool(self.sl_enabled),
+            "rsi": bool(self.rsi_filter),
+            "adx": bool(self.adx_filter),
+            "smc": bool(self.smc_filter),
         }
 
     def _fee_cover_need(self, pos: dict[str, Any] | None = None) -> float:
@@ -1687,6 +1771,131 @@ class BookState:
         except Exception as exc:  # noqa: BLE001
             self._ema_snap = None
             self._trend = {"label": "ema-err", "detail": str(exc)}
+
+    def _refresh_osc(self, now: float) -> None:
+        if now < self._osc_next:
+            return
+        self._osc_next = now + 20.0
+        try:
+            from ob_oscillators import OscillatorConfig, fetch_oscillators
+
+            snap = fetch_oscillators(
+                self.symbol,
+                OscillatorConfig(
+                    interval=self.osc_interval,
+                    rsi_oversold=self.rsi_oversold,
+                    rsi_overbought=self.rsi_overbought,
+                    adx_period=self.adx_period,
+                    adx_min=self.adx_min,
+                ),
+            )
+            self._osc_snap = snap
+            self._osc = {
+                "rsi": snap.rsi,
+                "adx": snap.adx,
+                "di_plus": snap.di_plus,
+                "di_minus": snap.di_minus,
+                "rsi_side": snap.rsi_side,
+                "adx_side": snap.adx_side,
+                "interval": snap.interval,
+                "detail": snap.reason,
+            }
+        except Exception as exc:  # noqa: BLE001
+            self._osc_snap = None
+            self._osc = {
+                "rsi": None,
+                "adx": None,
+                "di_plus": None,
+                "di_minus": None,
+                "rsi_side": "none",
+                "adx_side": "none",
+                "detail": str(exc),
+            }
+
+    def _refresh_structure(self, now: float) -> None:
+        if now < self._struct_next:
+            return
+        self._struct_next = now + 25.0
+        try:
+            from ob_structure import StructureConfig, fetch_structure
+
+            snap = fetch_structure(
+                self.symbol,
+                StructureConfig(interval=self.structure_interval),
+            )
+            self._struct_snap = snap
+            label = "flat"
+            if snap.choch != "none":
+                label = f"choch-{snap.choch}"
+            elif snap.eql:
+                label = "eql"
+            elif snap.eqh:
+                label = "eqh"
+            self._structure = {
+                "label": label,
+                "choch": snap.choch,
+                "eqh": bool(snap.eqh),
+                "eql": bool(snap.eql),
+                "allow_long": bool(snap.allow_long),
+                "allow_short": bool(snap.allow_short),
+                "eqh_level": snap.eqh_level,
+                "eql_level": snap.eql_level,
+                "interval": snap.interval,
+                "detail": snap.reason,
+                "reason": snap.reason,
+            }
+        except Exception as exc:  # noqa: BLE001
+            self._struct_snap = None
+            self._structure = {
+                "label": "smc-err",
+                "choch": "none",
+                "eqh": False,
+                "eql": False,
+                "allow_long": False,
+                "allow_short": False,
+                "detail": str(exc),
+                "reason": str(exc),
+            }
+
+    def _rsi_allows(self, side: str) -> bool:
+        """Block entries into RSI extremes against the side."""
+        if not self.rsi_filter:
+            return True
+        rsi = self._osc.get("rsi")
+        if rsi is None:
+            return True
+        if side == "long" and float(rsi) >= self.rsi_overbought:
+            return False
+        if side == "short" and float(rsi) <= self.rsi_oversold:
+            return False
+        return True
+
+    def _adx_allows(self, side: str) -> bool:
+        """Require trend strength + DI alignment when ADX filter is on."""
+        if not self.adx_filter:
+            return True
+        adx = self._osc.get("adx")
+        if adx is None:
+            return True
+        if float(adx) < self.adx_min:
+            return False
+        bias = str(self._osc.get("adx_side") or "none")
+        if bias == "none":
+            return False
+        return bias == side
+
+    def _smc_allows(self, side: str) -> bool:
+        """When SMC filter on: block clear opposing structure bias."""
+        if not self.smc_filter:
+            return True
+        st = self._structure or {}
+        allow_l = bool(st.get("allow_long"))
+        allow_s = bool(st.get("allow_short"))
+        if side == "long" and allow_s and not allow_l:
+            return False
+        if side == "short" and allow_l and not allow_s:
+            return False
+        return True
 
     def _recent_mom_pct(self) -> float:
         """Short-horizon mid momentum %% from the live trail (~last few samples)."""
@@ -2444,15 +2653,23 @@ class BookState:
         if len(self._markers) > 80:
             self._markers = self._markers[-80:]
         self._paper = None
-        # After SL: longer cooldown + force PAPER (no auto LIVE re-entry)
+        # After SL: longer cooldown; after N session SLs → force PAPER
         cd = self.cooldown_sec
         if why == "sl":
             cd = max(cd, 12.0)
+            self.sl_hits += 1
         self._cooldown_until = now + cd
         self._signal = "flat"
-        if why == "sl" and not self.dry_run:
+        lim = int(self.sl_to_dry or 0)
+        if why == "sl" and not self.dry_run and lim > 0 and self.sl_hits >= lim:
             self.set_live(False)
-            self._block_reason = f"cooldown {cd:g}s after sl · LIVE→PAPER"
+            self._block_reason = (
+                f"cooldown {cd:g}s after sl · "
+                f"{self.sl_hits}/{lim} SL → PAPER"
+            )
+        elif why == "sl":
+            left = f" · {self.sl_hits}/{lim}→DRY" if lim > 0 else ""
+            self._block_reason = f"cooldown {cd:g}s after sl{left}"
         else:
             self._block_reason = f"cooldown {cd:g}s after {why}"
 
@@ -3038,6 +3255,9 @@ class BookState:
                 status=f"min {self.min_wall_ratio:g}×",
             ),
             self._conf_filter_chip(),
+            self._rsi_filter_chip(),
+            self._adx_filter_chip(),
+            self._smc_filter_chip(),
             self._dca_filter_chip(),
             self._obtp_filter_chip(),
         ]
@@ -3169,9 +3389,94 @@ class BookState:
                 state=ratio_state, status=f"min {self.min_wall_ratio:g}×",
             ),
             self._conf_filter_chip(conf),
+            self._rsi_filter_chip(cand_side),
+            self._adx_filter_chip(cand_side),
+            self._smc_filter_chip(cand_side),
             self._dca_filter_chip(),
             self._obtp_filter_chip(),
         ]
+
+    def _rsi_filter_chip(self, cand_side: str = "long") -> dict[str, Any]:
+        flags = self.filter_flags()
+        rsi = self._osc.get("rsi")
+        val = "—" if rsi is None else f"{float(rsi):.1f}"
+        if not flags["rsi"]:
+            return self._filter_chip(
+                fid="rsi", label="RSI", value=val, enabled=False,
+                state="off", status="disabled",
+            )
+        ok = self._rsi_allows(cand_side)
+        side_lab = str(self._osc.get("rsi_side") or "none")
+        status = (
+            f"{cand_side} ok · {side_lab}"
+            if ok
+            else f"blocks {cand_side} (OS/OB)"
+        )
+        return self._filter_chip(
+            fid="rsi", label="RSI", value=val, enabled=True,
+            state="ok" if ok else "block",
+            status=status,
+        )
+
+    def _adx_filter_chip(self, cand_side: str = "long") -> dict[str, Any]:
+        flags = self.filter_flags()
+        adx = self._osc.get("adx")
+        di_p = self._osc.get("di_plus")
+        di_m = self._osc.get("di_minus")
+        if adx is None:
+            val = "—"
+        else:
+            val = f"{float(adx):.0f}"
+            if di_p is not None and di_m is not None:
+                val = f"{float(adx):.0f} ±{float(di_p):.0f}/{float(di_m):.0f}"
+        if not flags["adx"]:
+            return self._filter_chip(
+                fid="adx", label="ADX", value=val, enabled=False,
+                state="off", status="disabled",
+            )
+        ok = self._adx_allows(cand_side)
+        if adx is not None and float(adx) < self.adx_min:
+            status = f"need ≥{self.adx_min:g}"
+            state = "wait"
+        elif ok:
+            status = f"trend {self._osc.get('adx_side')}"
+            state = "ok"
+        else:
+            status = f"DI against {cand_side}"
+            state = "block"
+        return self._filter_chip(
+            fid="adx", label="ADX", value=val, enabled=True,
+            state=state, status=status,
+        )
+
+    def _smc_filter_chip(self, cand_side: str = "long") -> dict[str, Any]:
+        flags = self.filter_flags()
+        st = self._structure or {}
+        choch = str(st.get("choch") or "none")
+        bits = []
+        if choch != "none":
+            bits.append(choch)
+        if st.get("eql"):
+            bits.append("EQL")
+        if st.get("eqh"):
+            bits.append("EQH")
+        val = " · ".join(bits) if bits else str(st.get("label") or "flat")
+        if not flags["smc"]:
+            return self._filter_chip(
+                fid="smc", label="SMC", value=val, enabled=False,
+                state="off", status="display only (header)",
+            )
+        ok = self._smc_allows(cand_side)
+        status = (
+            f"allow {cand_side}"
+            if ok
+            else f"structure against {cand_side}"
+        )
+        return self._filter_chip(
+            fid="smc", label="SMC", value=val, enabled=True,
+            state="ok" if ok else "block",
+            status=status,
+        )
 
     def _conf_filter_chip(self, conf: dict[str, Any] | None = None) -> dict[str, Any]:
         flags = self.filter_flags()
@@ -3391,6 +3696,21 @@ class BookState:
                     f"conf {conf['score']:.0f} < min {self.min_confidence:.0f}"
                 )
                 return False
+            if self.rsi_filter and not self._rsi_allows(side):
+                rsi = self._osc.get("rsi")
+                self._block_reason = f"rsi {float(rsi or 0):.1f} blocks {side}"
+                return False
+            if self.adx_filter and not self._adx_allows(side):
+                adx = self._osc.get("adx")
+                bias = self._osc.get("adx_side") or "none"
+                self._block_reason = (
+                    f"adx {float(adx or 0):.0f}/{bias} blocks {side}"
+                )
+                return False
+            if self.smc_filter and not self._smc_allows(side):
+                lab = (self._structure or {}).get("label") or "?"
+                self._block_reason = f"smc {lab} blocks {side}"
+                return False
             self._open_paper(
                 side, mid, wall["price"], now, why,
                 bid_walls=bids, ask_walls=asks,
@@ -3483,6 +3803,8 @@ class BookState:
                 self._refresh_fees(now)
                 self._refresh_bb(now, mid)
                 self._refresh_ema(now)
+                self._refresh_osc(now)
+                self._refresh_structure(now)
                 self._refresh_live(now)
                 imb = float(snap["imbalance"])
                 self._manage_paper(
@@ -3540,8 +3862,12 @@ class BookState:
                         "block_reason": self._block_reason,
                         "dry_run": self.dry_run,
                         "sl_enabled": self.sl_enabled,
+                        "sl_hits": self.sl_hits,
+                        "sl_to_dry": self.sl_to_dry,
                         "order_error": self._last_order_error,
                         "trend": dict(self._trend),
+                        "structure": dict(self._structure),
+                        "osc": dict(self._osc),
                         "book": dict(self._book),
                         "confidence": dict(self._confidence),
                         "filters": list(self._filters),
@@ -3720,6 +4046,20 @@ def main() -> None:
                    help="min seconds between DCA adds")
     p.add_argument("--ob-tp", action=argparse.BooleanOptionalAction, default=True,
                    help="when fees covered, snap TP to opposite OB and close on touch")
+    p.add_argument("--sl-to-dry", type=int, default=3,
+                   help="after N session SL hits while LIVE → PAPER (0=never; default 3)")
+    p.add_argument("--rsi-filter", action=argparse.BooleanOptionalAction, default=True,
+                   help="block long in RSI overbought / short in oversold")
+    p.add_argument("--adx-filter", action=argparse.BooleanOptionalAction, default=True,
+                   help="require ADX≥min and DI aligned with side")
+    p.add_argument("--adx-min", type=float, default=20.0,
+                   help="min ADX for trend filter (default 20)")
+    p.add_argument("--smc-filter", action=argparse.BooleanOptionalAction, default=False,
+                   help="block entries against SMC structure bias (pill always shown)")
+    p.add_argument("--osc-interval", default="5m",
+                   help="RSI/ADX kline interval")
+    p.add_argument("--structure-interval", default="5m",
+                   help="SMC / iCHoCH kline interval")
     p.add_argument("--net-exits", action=argparse.BooleanOptionalAction, default=True,
                    help="only soft-exit when gross pnl covers fee estimate")
     p.add_argument("--protect-be", action=argparse.BooleanOptionalAction, default=True,
@@ -3851,6 +4191,13 @@ def main() -> None:
     state.dca_space_pct = max(0.02, float(args.dca_space_pct))
     state.dca_cooldown_sec = max(0.0, float(args.dca_cooldown_sec))
     state.ob_tp_exit = bool(args.ob_tp)
+    state.sl_to_dry = max(0, int(args.sl_to_dry))
+    state.rsi_filter = bool(args.rsi_filter)
+    state.adx_filter = bool(args.adx_filter)
+    state.adx_min = float(args.adx_min)
+    state.smc_filter = bool(args.smc_filter)
+    state.osc_interval = str(args.osc_interval)
+    state.structure_interval = str(args.structure_interval)
     # Pull Binance commission rates immediately (needs API keys in .env)
     state._refresh_fees(0.0)
 

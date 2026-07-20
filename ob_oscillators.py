@@ -28,6 +28,8 @@ class OscillatorConfig:
     stoch_d: int = 3
     stoch_oversold: float = 20.0
     stoch_overbought: float = 80.0
+    adx_period: int = 14
+    adx_min: float = 20.0  # trend strength threshold (UI filter)
 
 
 @dataclass
@@ -40,6 +42,10 @@ class OscillatorSnapshot:
     stoch_side: str  # long | short | none
     reason: str
     ts: float = 0.0
+    adx: float = 0.0
+    di_plus: float = 0.0
+    di_minus: float = 0.0
+    adx_side: str = "none"  # long | short | none (DI bias when ADX ≥ min)
 
 
 def _rsi(closes: list[float], period: int) -> list[float]:
@@ -124,18 +130,81 @@ def _stoch_side(
     return "none"
 
 
+def _adx(
+    high: list[float],
+    low: list[float],
+    close: list[float],
+    period: int,
+) -> tuple[float, float, float]:
+    """Wilder ADX. Returns (adx, +DI, -DI) for the latest closed bar."""
+    n = len(close)
+    if n < period + 2:
+        return 0.0, 0.0, 0.0
+    tr_l: list[float] = []
+    plus_dm: list[float] = []
+    minus_dm: list[float] = []
+    for i in range(1, n):
+        up = high[i] - high[i - 1]
+        down = low[i - 1] - low[i]
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+        tr_l.append(
+            max(
+                high[i] - low[i],
+                abs(high[i] - close[i - 1]),
+                abs(low[i] - close[i - 1]),
+            )
+        )
+    if len(tr_l) < period:
+        return 0.0, 0.0, 0.0
+    atr = sum(tr_l[:period])
+    sm_plus = sum(plus_dm[:period])
+    sm_minus = sum(minus_dm[:period])
+    dx_vals: list[float] = []
+
+    def _di(sm: float, atr_v: float) -> float:
+        return 0.0 if atr_v <= 1e-12 else 100.0 * sm / atr_v
+
+    di_p = _di(sm_plus, atr)
+    di_m = _di(sm_minus, atr)
+    denom = di_p + di_m
+    dx_vals.append(0.0 if denom <= 1e-12 else 100.0 * abs(di_p - di_m) / denom)
+
+    for i in range(period, len(tr_l)):
+        atr = atr - (atr / period) + tr_l[i]
+        sm_plus = sm_plus - (sm_plus / period) + plus_dm[i]
+        sm_minus = sm_minus - (sm_minus / period) + minus_dm[i]
+        di_p = _di(sm_plus, atr)
+        di_m = _di(sm_minus, atr)
+        denom = di_p + di_m
+        dx_vals.append(0.0 if denom <= 1e-12 else 100.0 * abs(di_p - di_m) / denom)
+
+    if len(dx_vals) < period:
+        adx = sum(dx_vals) / len(dx_vals) if dx_vals else 0.0
+        return adx, di_p, di_m
+    adx = sum(dx_vals[:period]) / period
+    for i in range(period, len(dx_vals)):
+        adx = (adx * (period - 1) + dx_vals[i]) / period
+    return adx, di_p, di_m
+
+
 def fetch_oscillators(symbol: str, cfg: OscillatorConfig | None = None) -> OscillatorSnapshot:
     cfg = cfg or OscillatorConfig()
     key = (
         f"{symbol.upper()}:{cfg.interval}:{cfg.rsi_period}:{cfg.stoch_k}:"
-        f"{cfg.rsi_oversold}:{cfg.stoch_oversold}"
+        f"{cfg.rsi_oversold}:{cfg.stoch_oversold}:{cfg.adx_period}:{cfg.adx_min}"
     )
     cached = _CACHE.get(key)
     now = time.time()
     if cached and now - cached.ts < cfg.cache_sec:
         return cached
 
-    need = max(cfg.lookback, cfg.rsi_period + 10, cfg.stoch_k + cfg.stoch_d + 10)
+    need = max(
+        cfg.lookback,
+        cfg.rsi_period + 10,
+        cfg.stoch_k + cfg.stoch_d + 10,
+        cfg.adx_period * 3 + 5,
+    )
     klines = fetch_klines(FAPI_BASE, symbol.upper(), cfg.interval, need)
     # Drop forming candle
     bars = klines[:-1] if len(klines) > 1 else klines
@@ -159,6 +228,7 @@ def fetch_oscillators(symbol: str, cfg: OscillatorConfig | None = None) -> Oscil
 
     rsi_s = _rsi(close, cfg.rsi_period)
     k_s, d_s = _stoch(high, low, close, cfg.stoch_k, cfg.stoch_d)
+    adx, di_p, di_m = _adx(high, low, close, cfg.adx_period)
 
     rsi = rsi_s[-1] if rsi_s else 50.0
     prev_rsi = rsi_s[-2] if len(rsi_s) >= 2 else rsi
@@ -174,12 +244,26 @@ def fetch_oscillators(symbol: str, cfg: OscillatorConfig | None = None) -> Oscil
         sk, sd, prev_k, prev_d,
         oversold=cfg.stoch_oversold, overbought=cfg.stoch_overbought,
     )
+    adx_side = "none"
+    if adx >= cfg.adx_min:
+        if di_p > di_m:
+            adx_side = "long"
+        elif di_m > di_p:
+            adx_side = "short"
 
-    parts = [f"RSI={rsi:.1f}", f"Stoch={sk:.1f}/{sd:.1f}"]
+    parts = [
+        f"RSI={rsi:.1f}",
+        f"Stoch={sk:.1f}/{sd:.1f}",
+        f"ADX={adx:.1f}",
+        f"+DI={di_p:.1f}",
+        f"-DI={di_m:.1f}",
+    ]
     if rsi_side != "none":
         parts.append(f"rsi→{rsi_side}")
     if stoch_side != "none":
         parts.append(f"stoch→{stoch_side}")
+    if adx_side != "none":
+        parts.append(f"adx→{adx_side}")
 
     snap = OscillatorSnapshot(
         interval=cfg.interval,
@@ -190,6 +274,10 @@ def fetch_oscillators(symbol: str, cfg: OscillatorConfig | None = None) -> Oscil
         stoch_side=stoch_side,
         reason=" · ".join(parts),
         ts=now,
+        adx=adx,
+        di_plus=di_p,
+        di_minus=di_m,
+        adx_side=adx_side,
     )
     _CACHE[key] = snap
     return snap
@@ -206,5 +294,6 @@ def format_oscillators_console(snap: OscillatorSnapshot) -> str:
     return (
         f"{DIM}osc {snap.interval}{RESET}  "
         f"{CYAN}RSI={snap.rsi:.1f}{RESET}→{side_c(snap.rsi_side)}  "
-        f"{CYAN}Stoch={snap.stoch_k:.1f}/{snap.stoch_d:.1f}{RESET}→{side_c(snap.stoch_side)}"
+        f"{CYAN}Stoch={snap.stoch_k:.1f}/{snap.stoch_d:.1f}{RESET}→{side_c(snap.stoch_side)}  "
+        f"{CYAN}ADX={snap.adx:.1f}{RESET}→{side_c(snap.adx_side)}"
     )
