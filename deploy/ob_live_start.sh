@@ -31,4 +31,5 @@ if [[ ! -x "$PY" ]]; then
 fi
 
 cd "$ROOT"
-exec "$PY" -u "$ROOT/ob_live_chart.py" "$SYMBOL" --dry-run --port "$PORT"
+exec "$PY" -u "$ROOT/ob_live_chart.py" "$SYMBOL" --dry-run --port "$PORT" \
+  --feed-paused --sample-sec 1.2 --limit 50

@@ -2,6 +2,7 @@
 set -euo pipefail
 DEST="$HOME/Library/LaunchAgents"
 SHARE="$HOME/.local/share/ob-live"
+# Active fleet + stale labels to always clean up
 SYMBOLS=(btcusdt ethusdt bnbusdt solusdt)
 for s in "${SYMBOLS[@]}"; do
   label="com.oblive.$s"

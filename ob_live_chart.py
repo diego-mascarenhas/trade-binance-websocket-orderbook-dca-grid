@@ -414,6 +414,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     .btn-last.on:hover { border-color: #e3b341; background: #2d2410; }
     .btn-last:disabled { opacity: 0.45; cursor: wait; }
+    .btn-feed {
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #161b22;
+      color: var(--muted);
+      font: inherit;
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .btn-feed:hover { border-color: #58a6ff88; }
+    .btn-feed.on {
+      border-color: #f8514988;
+      background: #2a1214;
+      color: var(--ask);
+    }
+    .btn-feed.on:hover { border-color: #f85149; background: #3d1518; }
+    .btn-feed:disabled { opacity: 0.45; cursor: wait; }
     #trades td { font-size: 0.65rem; }
     .win { color: var(--bid); }
     .loss { color: var(--ask); }
@@ -453,6 +474,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <h2>Position</h2>
         <div class="pos-actions">
           <button type="button" class="btn-live" id="btnLive" title="Toggle LIVE orders">LIVE</button>
+          <button type="button" class="btn-feed" id="btnFeed" title="Pause Binance REST polling">FEED</button>
           <button type="button" class="btn-sl" id="btnSl" title="Toggle stop-loss">SL</button>
           <button type="button" class="btn-last" id="btnLast" title="Last trade — no new entries">LAST</button>
           <button type="button" class="btn-close" id="btnClose" hidden>Close</button>
@@ -636,6 +658,42 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     const btnLiveEl = document.getElementById("btnLive");
     if (btnLiveEl) btnLiveEl.addEventListener("click", toggleLive);
+    let togglingFeed = false;
+    function syncFeedBtn(paused) {
+      const btn = document.getElementById("btnFeed");
+      if (!btn || togglingFeed) return;
+      const on = !!paused;
+      btn.classList.toggle("on", on);
+      btn.textContent = on ? "PAUSED" : "FEED";
+      btn.title = on
+        ? "Binance REST paused — no depth/klines/orders polling. Click to resume"
+        : "FEED on — click to pause all Binance REST requests (rate-limit safe)";
+    }
+    async function toggleFeed() {
+      const btn = document.getElementById("btnFeed");
+      if (togglingFeed || !btn) return;
+      const nextPaused = !btn.classList.contains("on");
+      togglingFeed = true;
+      btn.disabled = true;
+      try {
+        const r = await fetch("/api/feed", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ paused: nextPaused }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) throw new Error(data.error || ("HTTP " + r.status));
+        syncFeedBtn(!!data.feed_paused);
+      } catch (e) {
+        console.warn("feed toggle failed", e);
+        alert("FEED toggle failed: " + (e.message || e));
+      } finally {
+        togglingFeed = false;
+        btn.disabled = false;
+      }
+    }
+    const btnFeedEl = document.getElementById("btnFeed");
+    if (btnFeedEl) btnFeedEl.addEventListener("click", toggleFeed);
     let togglingSl = false;
     function syncSlBtn(slOn, slHits, slToDry) {
       const btn = document.getElementById("btnSl");
@@ -872,8 +930,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           modePill.className = "pill off";
         }
         syncLiveBtn(!!s.dry_run);
+        syncFeedBtn(!!s.feed_paused);
         syncSlBtn(s.sl_enabled !== false, s.sl_hits, s.sl_to_dry);
         syncLastBtn(!!s.last_trade);
+        if (s.feed_paused) {
+          modeEl.textContent = (s.dry_run ? "DRY" : "LIVE") + "+PAUSE";
+          modePill.className = "pill off";
+        }
         const smc = s.structure || {};
         const smcEl = document.getElementById("smc");
         const smcPill = document.getElementById("smcPill");
@@ -1248,6 +1311,7 @@ class BookState:
         require_bounce: bool,
         bb_strict: bool,
         book_filter: bool,
+        feed_paused: bool = False,
     ) -> None:
         self.symbol = symbol.upper()
         self.limit = limit
@@ -1270,6 +1334,7 @@ class BookState:
         self.paper_enabled = paper
         self.dry_run = dry_run
         self.live_enabled = live_pos or (not dry_run)
+        self.feed_paused = bool(feed_paused)  # no Binance REST while True
         self.api_key = api_key
         self.api_secret = api_secret
         self.recv_window = recv_window
@@ -1434,6 +1499,7 @@ class BookState:
             "signal": "flat",
             "block_reason": "starting…",
             "dry_run": self.dry_run,
+            "feed_paused": self.feed_paused,
             "sl_enabled": self.sl_enabled,
             "sl_hits": self.sl_hits,
             "sl_to_dry": self.sl_to_dry,
@@ -1479,6 +1545,21 @@ class BookState:
             raise KeyError(f"unknown filter {fid}")
         setattr(self, key, bool(enabled))
         return self.filter_flags()
+
+    def set_feed_paused(self, paused: bool) -> dict[str, Any]:
+        """Pause/resume Binance REST polling (depth, klines, fees, position)."""
+        self.feed_paused = bool(paused)
+        with self._lock:
+            self._snapshot["feed_paused"] = self.feed_paused
+            if self.feed_paused:
+                self._snapshot["error"] = None
+                self._snapshot["block_reason"] = "feed paused — no Binance REST"
+                self._snapshot["ts_iso"] = time.strftime("%H:%M:%S")
+        print(
+            f"FEED → {'PAUSED' if self.feed_paused else 'ON'} {self.symbol}",
+            flush=True,
+        )
+        return {"ok": True, "feed_paused": self.feed_paused}
 
     def set_sl(self, enabled: bool) -> dict[str, Any]:
         """Toggle hard stop-loss exits from the UI (TP / soft exits unchanged)."""
@@ -1664,6 +1745,32 @@ class BookState:
             "sl": sl,
         }
 
+    @staticmethod
+    def _api_err_msg(exc: BaseException, *, prefix: str) -> str:
+        text = str(exc)
+        low = text.lower()
+        if "418" in text or "banned until" in low or "-1003" in text:
+            # Binance embeds ban expiry as epoch ms in the body sometimes
+            import re
+
+            m = re.search(r"banned until (\d+)", text, re.I)
+            until = ""
+            if m:
+                try:
+                    ts = int(m.group(1))
+                    if ts > 10_000_000_000:
+                        ts //= 1000
+                    until = time.strftime(" (until %H:%M:%S)", time.localtime(ts))
+                except ValueError:
+                    until = ""
+            return (
+                f"{prefix}: Binance IP rate-limit ban{until}. "
+                "Wait it out; prefer fewer bots / slower --sample-sec / WebSocket depth."
+            )
+        if "429" in text:
+            return f"{prefix}: Binance rate limit (429) — slow down and retry"
+        return f"{prefix}: {text}"
+
     def set_live(self, enabled: bool) -> dict[str, Any]:
         """Toggle LIVE vs PAPER without closing. LIVE adopts an exchange position if open."""
         want_live = bool(enabled)
@@ -1682,7 +1789,7 @@ class BookState:
                     )
                     self.hedge = _resolve_hedge(ns, self.api_key, self.api_secret)
                 except Exception as exc:  # noqa: BLE001
-                    return {"ok": False, "error": f"live setup failed: {exc}"}
+                    return {"ok": False, "error": self._api_err_msg(exc, prefix="live setup failed")}
             self.dry_run = False
             self.live_enabled = True
             self.sl_hits = 0  # fresh LIVE session for SL→DRY counter
@@ -1690,7 +1797,10 @@ class BookState:
             try:
                 ex = self._fetch_exchange_position()
             except Exception as exc:  # noqa: BLE001
-                return {"ok": False, "error": f"position check failed: {exc}"}
+                # Still arm LIVE; adopt can happen on next toggle / refresh
+                note = self._api_err_msg(exc, prefix="LIVE armed; adopt skipped")
+                print(f"MODE → LIVE {self.symbol} · {note}", flush=True)
+                ex = None
             if ex:
                 local = self._paper
                 same = (
@@ -3989,6 +4099,15 @@ class BookState:
     def loop(self) -> None:
         while not self._stop.is_set():
             t0 = time.time()
+            if self.feed_paused:
+                with self._lock:
+                    self._snapshot["feed_paused"] = True
+                    self._snapshot["error"] = None
+                    self._snapshot["block_reason"] = "feed paused — no Binance REST"
+                    self._snapshot["ts_iso"] = time.strftime("%H:%M:%S")
+                    self._snapshot["signal"] = "flat"
+                self._stop.wait(1.0)
+                continue
             try:
                 snap = self._fetch_book()
                 mid = float(snap["mid"])
@@ -4054,6 +4173,7 @@ class BookState:
                         "signal": self._signal,
                         "block_reason": self._block_reason,
                         "dry_run": self.dry_run,
+                        "feed_paused": self.feed_paused,
                         "sl_enabled": self.sl_enabled,
                         "sl_hits": self.sl_hits,
                         "sl_to_dry": self.sl_to_dry,
@@ -4138,6 +4258,21 @@ def make_handler(state: BookState, ui_poll_ms: int):
                         return
                     result = state.set_live(bool(data.get("enabled")))
                     self._json(200 if result.get("ok") else 400, result)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._json(400, {"ok": False, "error": str(exc)})
+                except Exception as exc:  # noqa: BLE001
+                    self._json(500, {"ok": False, "error": str(exc)})
+                return
+            if path == "/api/feed":
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    raw = self.rfile.read(n) if n > 0 else b"{}"
+                    data = json.loads(raw.decode("utf-8") or "{}")
+                    if "paused" not in data:
+                        self._json(400, {"ok": False, "error": "missing paused"})
+                        return
+                    result = state.set_feed_paused(bool(data.get("paused")))
+                    self._json(200, result)
                 except (ValueError, json.JSONDecodeError) as exc:
                     self._json(400, {"ok": False, "error": str(exc)})
                 except Exception as exc:  # noqa: BLE001
@@ -4310,6 +4445,8 @@ def main() -> None:
                    help="order size in USDT; 0 (default) = exchange minimum for the symbol")
     p.add_argument("--dry-run", action="store_true",
                    help="paper only — no real orders (default is LIVE)")
+    p.add_argument("--feed-paused", action=argparse.BooleanOptionalAction, default=False,
+                   help="start with Binance REST paused (no depth/klines until FEED button)")
     p.add_argument("--no-trade", action="store_true",
                    help="chart only — disable entries entirely")
     p.add_argument("--live-pos", action="store_true",
@@ -4330,6 +4467,7 @@ def main() -> None:
     filt: dict[str, Decimal] | None = None
     hedge = False
 
+    feed_paused = bool(args.feed_paused)
     if not dry_run:
         if not api_key or not api_secret:
             print("LIVE mode needs API keys in .env — or pass --dry-run", file=sys.stderr)
@@ -4341,9 +4479,23 @@ def main() -> None:
             sys.exit(1)
         ns = argparse.Namespace(position_mode="auto", recv_window=args.recv_window)
         hedge = _resolve_hedge(ns, api_key, api_secret)
-    elif args.live_pos and api_key and api_secret:
-        ns = argparse.Namespace(position_mode="auto", recv_window=args.recv_window)
-        hedge = _resolve_hedge(ns, api_key, api_secret)
+    elif api_key and api_secret and not feed_paused:
+        # Preload filters in PAPER so LIVE toggle does not need a fresh REST hit
+        # (skip when starting paused — avoid hitting Binance during IP ban cooldown)
+        try:
+            filt = load_symbol_filters(args.symbol)
+            ns = argparse.Namespace(position_mode="auto", recv_window=args.recv_window)
+            hedge = _resolve_hedge(ns, api_key, api_secret)
+        except Exception as exc:  # noqa: BLE001
+            print(f"PAPER start: filters deferred ({exc})", flush=True)
+            if args.live_pos:
+                try:
+                    ns = argparse.Namespace(
+                        position_mode="auto", recv_window=args.recv_window
+                    )
+                    hedge = _resolve_hedge(ns, api_key, api_secret)
+                except Exception:  # noqa: BLE001
+                    pass
 
     state = BookState(
         args.symbol,
@@ -4367,6 +4519,7 @@ def main() -> None:
         paper=not args.no_trade,
         dry_run=dry_run,
         live_pos=args.live_pos or (not dry_run),
+        feed_paused=feed_paused,
         api_key=api_key,
         api_secret=api_secret,
         recv_window=args.recv_window,
@@ -4439,7 +4592,11 @@ def main() -> None:
     mode = "DRY-RUN" if dry_run else "LIVE"
     if args.no_trade:
         mode = "CHART-ONLY"
+    if feed_paused:
+        mode = f"{mode}+PAUSED"
     print(f"OB live chart  {state.symbol}  [{mode}]  →  {url}")
+    if feed_paused:
+        print("Feed PAUSED — no Binance REST until you click FEED in the UI")
     if not dry_run and not args.no_trade:
         print("*** LIVE TRADING — real MARKET orders on Binance Futures ***")
         if args.notional > 0:

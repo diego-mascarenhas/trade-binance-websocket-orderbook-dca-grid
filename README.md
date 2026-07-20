@@ -58,7 +58,7 @@ trade-binance-websocket-orderbook-dca-grid/
     ├── ob-live@.service           # OB live chart (PAPER / --dry-run by default)
     ├── ob_live_start.sh           # PAPER launcher + fixed ports per symbol
     ├── launchagents/              # macOS agents: BTC/ETH/BNB/SOL
-    ├── install_ob_live_macos.sh   # load BTC/ETH/BNB/SOL LaunchAgents (PAPER)
+    ├── install_ob_live_macos.sh   # load BTC/ETH/BNB LaunchAgents (PAPER)
     ├── uninstall_ob_live_macos.sh
     ├── com.oblive.plist.example   # single-symbol macOS template
     └── sync_pairs.py              # Start/stop fleet from FUTURES_PAIRS / SPOT_PAIRS
@@ -360,25 +360,24 @@ SPOT_PAIRS=BNBUSDT,BTCUSDT,ETHUSDT,SOLUSDT
 
 ## OB live chart as a service (PAPER by default)
 
-Scalper dashboard (`ob_live_chart.py`) for **BTC / ETH / BNB / SOL**. Always starts in **PAPER** (`--dry-run`); enable LIVE from the UI button when ready. After a stop-loss in LIVE, mode falls back to PAPER automatically.
+Scalper dashboard (`ob_live_chart.py`) for **BTC / ETH / BNB**. Always starts in **PAPER** (`--dry-run`) with the Binance feed **PAUSED** (`--feed-paused`); click **FEED** in the UI to start REST polling, then **LIVE** when ready. After a stop-loss in LIVE, mode falls back to PAPER automatically.
 
 | Symbol   | Port | URL |
 |----------|------|-----|
 | BTCUSDT  | 8765 | http://127.0.0.1:8765/ |
 | ETHUSDT  | 8766 | http://127.0.0.1:8766/ |
 | BNBUSDT  | 8767 | http://127.0.0.1:8767/ |
-| SOLUSDT  | 8768 | http://127.0.0.1:8768/ |
 
 ### macOS (LaunchAgents)
 
 ```bash
-./deploy/install_ob_live_macos.sh      # install + start the 4 agents (PAPER)
+./deploy/install_ob_live_macos.sh      # install + start BTC/ETH/BNB (PAPER)
 ./deploy/uninstall_ob_live_macos.sh    # stop + unload
 ```
 
 Because the repo may live on an external volume, the installer syncs a runtime copy to `~/.local/share/ob-live/app` (launchd cannot exec from `/Volumes/…` without Full Disk Access). **Re-run the install script after editing `ob_live_chart.py`** so that copy stays in sync.
 
-Logs: `/tmp/oblive-btcusdt.log` (and eth/bnb/sol).
+Logs: `/tmp/oblive-btcusdt.log` (and eth/bnb).
 
 ### Linux (systemd)
 
@@ -386,7 +385,7 @@ Logs: `/tmp/oblive-btcusdt.log` (and eth/bnb/sol).
 sudo cp deploy/ob-live@.service /etc/systemd/system/
 # set User + WorkingDirectory in the unit to your install path
 sudo systemctl daemon-reload
-sudo systemctl enable --now ob-live@BTCUSDT ob-live@ETHUSDT ob-live@BNBUSDT ob-live@SOLUSDT
+sudo systemctl enable --now ob-live@BTCUSDT ob-live@ETHUSDT ob-live@BNBUSDT
 ```
 
 Ports come from `deploy/ob_live_start.sh` (same mapping as the table above).
@@ -394,7 +393,7 @@ Ports come from `deploy/ob_live_start.sh` (same mapping as the table above).
 ### Manual (foreground)
 
 ```bash
-python3 ob_live_chart.py SOLUSDT --dry-run --port 8768
+python3 ob_live_chart.py BNBUSDT --dry-run --port 8767
 ```
 
 ---

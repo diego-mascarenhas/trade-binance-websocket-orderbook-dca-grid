@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install + load LaunchAgents for BTC/ETH/BNB/SOL (PAPER).
+# Install + load LaunchAgents for BTC/ETH/BNB (PAPER).
 # Copies runtime files into $HOME so launchd works even if the repo is on
 # an external volume (/Volumes/…) blocked by macOS TCC.
 set -euo pipefail
@@ -9,8 +9,8 @@ SHARE="$HOME/.local/share/ob-live"
 APP="$SHARE/app"
 DEST="$HOME/Library/LaunchAgents"
 PY="$(command -v python3)"
-SYMBOLS=(BTCUSDT ETHUSDT SOLUSDT)
-PORTS=(8765 8766 8768)
+SYMBOLS=(BTCUSDT ETHUSDT BNBUSDT)
+PORTS=(8765 8766 8767)
 
 mkdir -p "$APP" "$DEST"
 
@@ -47,12 +47,14 @@ case "$SYMBOL" in
   BTCUSDT) PORT=8765 ;;
   ETHUSDT) PORT=8766 ;;
   BNBUSDT) PORT=8767 ;;
-  SOLUSDT) PORT=8768 ;;
-  *) echo "unsupported symbol: $SYMBOL" >&2; exit 1 ;;
+  *) echo "unsupported symbol: $SYMBOL (fleet is BTC/ETH/BNB)" >&2; exit 1 ;;
 esac
 PY="${OB_LIVE_PYTHON:-python3}"
 cd "$APP"
-exec "$PY" -u "$APP/ob_live_chart.py" "$SYMBOL" --dry-run --port "$PORT"
+# Start PAUSED (no Binance REST) — click FEED in UI to resume.
+# Slower poll + smaller book when resumed (3 bots / Futures IP weight).
+exec "$PY" -u "$APP/ob_live_chart.py" "$SYMBOL" --dry-run --port "$PORT" \
+  --feed-paused --sample-sec 1.2 --limit 50
 EOF
 chmod +x "$SHARE/ob_live_start.sh"
 
@@ -108,6 +110,15 @@ EOF
     launchctl load -w "$dst"
   fi
   echo "loaded $label → http://127.0.0.1:$port/  ($sym PAPER)"
+done
+
+# Drop symbols no longer in the fleet (e.g. leftover SOL)
+for stale in solusdt; do
+  label="com.oblive.$stale"
+  dst="$DEST/$label.plist"
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || \
+    launchctl unload "$dst" 2>/dev/null || true
+  rm -f "$dst" "$ROOT/deploy/launchagents/$label.plist"
 done
 
 # Keep templates in repo for reference
