@@ -1269,12 +1269,19 @@ class BookState:
         self.rsi_filter = False
         self.adx_filter = True
         self.smc_filter = False
+        self.vol_filter = False
         self.osc_interval = "5m"
         self.rsi_oversold = 30.0
         self.rsi_overbought = 70.0
         self.adx_period = 14
         self.adx_min = 20.0
         self.structure_interval = "5m"
+        # BB-width volatility gate (%% of mid); used when vol_filter on
+        self.vol_min_pct = 0.12
+        self.vol_max_pct = 2.5
+        # Giveback: wider than BE buffer; needs a real green peak first
+        self.giveback_buffer_pct = 0.12
+        self.giveback_min_peak_pct = 0.0  # 0 → use fee_need at peak
 
         self._lock = threading.Lock()
         self._trail: deque[dict[str, float]] = deque()
@@ -1403,6 +1410,8 @@ class BookState:
             "rsi": "rsi_filter",
             "adx": "adx_filter",
             "smc": "smc_filter",
+            "vol": "vol_filter",
+            "give": "giveback_exit",
         }.get(fid)
         if key is None:
             raise KeyError(f"unknown filter {fid}")
@@ -1667,6 +1676,8 @@ class BookState:
             "rsi": bool(self.rsi_filter),
             "adx": bool(self.adx_filter),
             "smc": bool(self.smc_filter),
+            "vol": bool(self.vol_filter),
+            "give": bool(self.giveback_exit),
         }
 
     def _fee_cover_need(self, pos: dict[str, Any] | None = None) -> float:
@@ -1896,6 +1907,21 @@ class BookState:
         if side == "short" and allow_l and not allow_s:
             return False
         return True
+
+    def _vol_width_pct(self) -> float | None:
+        w = self._bb.get("width_pct")
+        if w is None:
+            return None
+        return float(w)
+
+    def _vol_allows(self) -> bool:
+        """When vol filter on: BB width must sit in [vol_min, vol_max]."""
+        if not self.vol_filter:
+            return True
+        w = self._vol_width_pct()
+        if w is None:
+            return True
+        return self.vol_min_pct <= w <= self.vol_max_pct
 
     def _recent_mom_pct(self) -> float:
         """Short-horizon mid momentum %% from the live trail (~last few samples)."""
@@ -3129,14 +3155,22 @@ class BookState:
                         self._close_paper(mid, now, "rev")
                         return
 
-        # Giveback only after a clear break through entry (+ buffer), not a touch
+        # Giveback: was meaningfully green, then clear break beyond entry (not a tick)
         if self.giveback_exit and pos.get("armed") and soft_ok and not in_grace:
-            if side == "long" and mid < entry * (1 - be_buf / 100) and pnl < 0:
-                self._close_paper(mid, now, "give")
-                return
-            if side == "short" and mid > entry * (1 + be_buf / 100) and pnl < 0:
-                self._close_paper(mid, now, "give")
-                return
+            peak = float(pos.get("peak_pnl_pct") or 0)
+            peak_need = max(
+                float(self.giveback_min_peak_pct or 0),
+                fee_need,
+                soft_arm_need,
+            )
+            give_buf = max(be_buf, float(self.giveback_buffer_pct or 0))
+            if peak >= peak_need and pnl < 0:
+                if side == "long" and mid < entry * (1 - give_buf / 100):
+                    self._close_paper(mid, now, "give")
+                    return
+                if side == "short" and mid > entry * (1 + give_buf / 100):
+                    self._close_paper(mid, now, "give")
+                    return
 
         # Hard exits — during grace, ignore SL unless adverse move is clearly wrong
         emergency = min_sl * 1.75
@@ -3258,8 +3292,10 @@ class BookState:
             self._rsi_filter_chip(),
             self._adx_filter_chip(),
             self._smc_filter_chip(),
+            self._vol_filter_chip(),
             self._dca_filter_chip(),
             self._obtp_filter_chip(),
+            self._give_filter_chip(),
         ]
 
     def _build_filter_bar(
@@ -3392,9 +3428,69 @@ class BookState:
             self._rsi_filter_chip(cand_side),
             self._adx_filter_chip(cand_side),
             self._smc_filter_chip(cand_side),
+            self._vol_filter_chip(),
             self._dca_filter_chip(),
             self._obtp_filter_chip(),
+            self._give_filter_chip(),
         ]
+
+    def _vol_filter_chip(self) -> dict[str, Any]:
+        flags = self.filter_flags()
+        w = self._vol_width_pct()
+        val = "—" if w is None else f"{w:.2f}%"
+        if not flags["vol"]:
+            return self._filter_chip(
+                fid="vol", label="Volatility", value=val, enabled=False,
+                state="off", status="BB width gate off",
+            )
+        if w is None:
+            return self._filter_chip(
+                fid="vol", label="Volatility", value=val, enabled=True,
+                state="wait", status="warmup",
+            )
+        if w < self.vol_min_pct:
+            return self._filter_chip(
+                fid="vol", label="Volatility", value=val, enabled=True,
+                state="block", status=f"too quiet <{self.vol_min_pct:g}%",
+            )
+        if w > self.vol_max_pct:
+            return self._filter_chip(
+                fid="vol", label="Volatility", value=val, enabled=True,
+                state="block", status=f"too wild >{self.vol_max_pct:g}%",
+            )
+        return self._filter_chip(
+            fid="vol", label="Volatility", value=val, enabled=True,
+            state="ok", status=f"{self.vol_min_pct:g}–{self.vol_max_pct:g}% BB",
+        )
+
+    def _give_filter_chip(self) -> dict[str, Any]:
+        flags = self.filter_flags()
+        pos = self._paper
+        buf = max(float(self.be_buffer_pct or 0), float(self.giveback_buffer_pct or 0))
+        if not flags["give"]:
+            return self._filter_chip(
+                fid="give", label="Giveback", value="off", enabled=False,
+                state="off", status="disabled",
+            )
+        if not pos:
+            return self._filter_chip(
+                fid="give", label="Giveback", value="on", enabled=True,
+                state="wait",
+                status=f"after fee-peak · break entry ±{buf:g}%",
+            )
+        peak = float(pos.get("peak_pnl_pct") or 0)
+        fee_need = self._fee_cover_need(pos)
+        peak_need = max(float(self.giveback_min_peak_pct or 0), fee_need)
+        if peak < peak_need:
+            return self._filter_chip(
+                fid="give", label="Giveback", value=f"pk {peak:+.2f}%",
+                enabled=True, state="wait",
+                status=f"need peak ≥{peak_need:.2f}%",
+            )
+        return self._filter_chip(
+            fid="give", label="Giveback", value="armed", enabled=True,
+            state="ok", status=f"exit if lose entry ±{buf:g}%",
+        )
 
     def _rsi_filter_chip(self, cand_side: str = "long") -> dict[str, Any]:
         flags = self.filter_flags()
@@ -3710,6 +3806,13 @@ class BookState:
             if self.smc_filter and not self._smc_allows(side):
                 lab = (self._structure or {}).get("label") or "?"
                 self._block_reason = f"smc {lab} blocks {side}"
+                return False
+            if self.vol_filter and not self._vol_allows():
+                w = self._vol_width_pct()
+                self._block_reason = (
+                    f"vol {float(w or 0):.2f}% outside "
+                    f"{self.vol_min_pct:g}–{self.vol_max_pct:g}%"
+                )
                 return False
             self._open_paper(
                 side, mid, wall["price"], now, why,
@@ -4083,8 +4186,16 @@ def main() -> None:
                    help="close while green when imbalance flips against position")
     p.add_argument("--rev-exit", action=argparse.BooleanOptionalAction, default=True,
                    help="close while green on pullback from peak")
-    p.add_argument("--giveback-exit", action=argparse.BooleanOptionalAction, default=True,
-                   help="if was green then mid crosses entry, close immediately")
+    p.add_argument("--giveback-exit", action=argparse.BooleanOptionalAction, default=False,
+                   help="after fee-covered peak, close if mid breaks entry by giveback buffer (default off)")
+    p.add_argument("--giveback-buffer-pct", type=float, default=0.12,
+                   help="giveback requires mid beyond entry by this %% (default 0.12)")
+    p.add_argument("--vol-filter", action=argparse.BooleanOptionalAction, default=False,
+                   help="block entries when BB width outside --vol-min/--vol-max (default off)")
+    p.add_argument("--vol-min-pct", type=float, default=0.12,
+                   help="min BB width %% to allow entry when vol filter on")
+    p.add_argument("--vol-max-pct", type=float, default=2.5,
+                   help="max BB width %% to allow entry when vol filter on")
     p.add_argument("--fee-rt-pct", type=float, default=0.08,
                    help="fallback round-trip fee %% if Binance commissionRate unavailable")
     p.add_argument("--fee-mode", choices=("taker", "maker", "mixed"), default="taker",
@@ -4196,6 +4307,11 @@ def main() -> None:
     state.adx_filter = bool(args.adx_filter)
     state.adx_min = float(args.adx_min)
     state.smc_filter = bool(args.smc_filter)
+    state.vol_filter = bool(args.vol_filter)
+    state.vol_min_pct = float(args.vol_min_pct)
+    state.vol_max_pct = float(args.vol_max_pct)
+    state.giveback_exit = bool(args.giveback_exit)
+    state.giveback_buffer_pct = float(args.giveback_buffer_pct)
     state.osc_interval = str(args.osc_interval)
     state.structure_interval = str(args.structure_interval)
     # Pull Binance commission rates immediately (needs API keys in .env)
