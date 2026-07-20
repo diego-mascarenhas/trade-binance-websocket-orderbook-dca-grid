@@ -1266,7 +1266,7 @@ class BookState:
         self.sl_to_dry = 3
         self.sl_hits = 0
         # Oscillator / SMC filters (UI toggles)
-        self.rsi_filter = True
+        self.rsi_filter = False
         self.adx_filter = True
         self.smc_filter = False
         self.osc_interval = "5m"
@@ -4048,8 +4048,8 @@ def main() -> None:
                    help="when fees covered, snap TP to opposite OB and close on touch")
     p.add_argument("--sl-to-dry", type=int, default=3,
                    help="after N session SL hits while LIVE → PAPER (0=never; default 3)")
-    p.add_argument("--rsi-filter", action=argparse.BooleanOptionalAction, default=True,
-                   help="block long in RSI overbought / short in oversold")
+    p.add_argument("--rsi-filter", action=argparse.BooleanOptionalAction, default=False,
+                   help="block long in RSI overbought / short in oversold (default off)")
     p.add_argument("--adx-filter", action=argparse.BooleanOptionalAction, default=True,
                    help="require ADX≥min and DI aligned with side")
     p.add_argument("--adx-min", type=float, default=20.0,
