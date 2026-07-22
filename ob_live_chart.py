@@ -551,7 +551,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="pos-box empty" id="confBox">—</div>
       <h2>Imbalance (band)</h2>
       <div class="bar-wrap"><div class="bar-bid" id="imbBid"></div><div class="bar-ask" id="imbAsk"></div></div>
-      <div class="meta" style="margin-top:6px" id="imbDetail">—</div>
+      <div class="meta" style="margin-top:6px;white-space:pre-line" id="imbDetail">—</div>
       <h2>Recent trades <span class="meta" id="tradesCount"></span></h2>
       <table>
         <thead><tr><th>side</th><th>qty</th><th>exit</th><th>why</th><th>pnl%</th></tr></thead>
@@ -970,7 +970,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           `band bid vol ${fmt(s.bid_vol, 2)} · ask vol ${fmt(s.ask_vol, 2)}`;
         if (bookMeta.pressure != null) {
           imbDetail +=
-            `<br>ladder ${bookMeta.label || "—"} ` +
+            `\nladder ${bookMeta.label || "—"} ` +
             `${(Number(bookMeta.pressure)*100).toFixed(0)}% bid` +
             ` · ${bookMeta.trend || ""}` +
             ` · ${fmt(bookMeta.bid_usdt, 0)}/${fmt(bookMeta.ask_usdt, 0)} USDT`;
