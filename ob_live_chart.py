@@ -327,13 +327,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .pos-box.empty { color: var(--muted); }
     .pos-head {
       display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 4px;
     }
-    .pos-head h2 { margin: 14px 0 8px; }
+    .pos-head h2 { margin: 14px 0 4px; }
+    .pos-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      margin-top: 0;
+    }
+    .pos-actions .btn-close { margin-top: 0; }
     .btn-close {
-      margin-top: 6px;
       padding: 4px 10px;
       border: 1px solid #f8514988;
       border-radius: 4px;
@@ -349,8 +356,38 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .btn-close:hover { border-color: #f85149; background: #3d1518; }
     .btn-close:disabled { opacity: 0.45; cursor: wait; }
     .btn-close[hidden] { display: none; }
-    .pos-actions { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
-    .pos-actions .btn-close { margin-top: 0; }
+    .btn-open-long {
+      padding: 4px 10px;
+      border: 1px solid #3fb95088;
+      border-radius: 4px;
+      background: #12261a;
+      color: var(--bid);
+      font: inherit;
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .btn-open-long:hover { border-color: #3fb950; background: #163221; }
+    .btn-open-long:disabled { opacity: 0.45; cursor: wait; }
+    .btn-open-long[hidden] { display: none; }
+    .btn-open-short {
+      padding: 4px 10px;
+      border: 1px solid #f8514988;
+      border-radius: 4px;
+      background: #2a1214;
+      color: var(--ask);
+      font: inherit;
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .btn-open-short:hover { border-color: #f85149; background: #3d1518; }
+    .btn-open-short:disabled { opacity: 0.45; cursor: wait; }
+    .btn-open-short[hidden] { display: none; }
     .btn-live {
       padding: 4px 10px;
       border: 1px solid var(--line);
@@ -435,6 +472,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     .btn-feed.on:hover { border-color: #f85149; background: #3d1518; }
     .btn-feed:disabled { opacity: 0.45; cursor: wait; }
+    .side-select {
+      padding: 4px 6px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #161b22;
+      color: var(--text);
+      font: inherit;
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+      max-width: 88px;
+    }
+    .side-select:hover { border-color: #58a6ff88; }
+    .side-select:disabled { opacity: 0.45; cursor: wait; }
     #trades td { font-size: 0.65rem; }
     .win { color: var(--bid); }
     .loss { color: var(--ask); }
@@ -475,9 +528,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="pos-actions">
           <button type="button" class="btn-live" id="btnLive" title="Toggle LIVE orders">LIVE</button>
           <button type="button" class="btn-feed" id="btnFeed" title="Pause Binance REST polling">FEED</button>
+          <select id="sideMode" class="side-select" title="Entry side mode">
+            <option value="both">BOTH</option>
+            <option value="auto">AUTO</option>
+            <option value="long">LONG</option>
+            <option value="short">SHORT</option>
+          </select>
           <button type="button" class="btn-sl" id="btnSl" title="Toggle stop-loss">SL</button>
           <button type="button" class="btn-last" id="btnLast" title="Last trade — no new entries">LAST</button>
-          <button type="button" class="btn-close" id="btnClose" hidden>Close</button>
+        </div>
+        <div class="pos-actions">
+          <button type="button" class="btn-open-long" id="btnOpenLong" title="Market open LONG at mid">Open Long</button>
+          <button type="button" class="btn-open-short" id="btnOpenShort" title="Market open SHORT at mid">Open Short</button>
+          <button type="button" class="btn-close" id="btnCloseLong" hidden title="Close LONG leg">Close Long</button>
+          <button type="button" class="btn-close" id="btnCloseShort" hidden title="Close SHORT leg">Close Short</button>
         </div>
       </div>
       <div class="pos-box empty" id="paperPos">flat — waiting for wall bounce</div>
@@ -595,16 +659,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
     }
     let closing = false;
-    async function closePosition() {
-      const btn = document.getElementById("btnClose");
+    async function closePosition(side) {
       if (closing) return;
       closing = true;
-      if (btn) btn.disabled = true;
+      const btnL = document.getElementById("btnCloseLong");
+      const btnS = document.getElementById("btnCloseShort");
+      if (btnL) btnL.disabled = true;
+      if (btnS) btnS.disabled = true;
       try {
         const r = await fetch("/api/close", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: "{}",
+          body: JSON.stringify(side ? { side } : {}),
         });
         const data = await r.json().catch(() => ({}));
         if (!r.ok || !data.ok) throw new Error(data.error || ("HTTP " + r.status));
@@ -613,11 +679,43 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         alert("Close failed: " + (e.message || e));
       } finally {
         closing = false;
-        if (btn) btn.disabled = false;
+        if (btnL) btnL.disabled = false;
+        if (btnS) btnS.disabled = false;
       }
     }
-    const btnCloseEl = document.getElementById("btnClose");
-    if (btnCloseEl) btnCloseEl.addEventListener("click", closePosition);
+    const btnCloseLongEl = document.getElementById("btnCloseLong");
+    const btnCloseShortEl = document.getElementById("btnCloseShort");
+    if (btnCloseLongEl) btnCloseLongEl.addEventListener("click", () => closePosition("long"));
+    if (btnCloseShortEl) btnCloseShortEl.addEventListener("click", () => closePosition("short"));
+    let opening = false;
+    async function openSide(side) {
+      if (opening) return;
+      opening = true;
+      const btnL = document.getElementById("btnOpenLong");
+      const btnS = document.getElementById("btnOpenShort");
+      if (btnL) btnL.disabled = true;
+      if (btnS) btnS.disabled = true;
+      try {
+        const r = await fetch("/api/open", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ side }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) throw new Error(data.error || ("HTTP " + r.status));
+      } catch (e) {
+        console.warn("open failed", e);
+        alert("Open " + side + " failed: " + (e.message || e));
+      } finally {
+        opening = false;
+        if (btnL) btnL.disabled = false;
+        if (btnS) btnS.disabled = false;
+      }
+    }
+    const btnOpenLongEl = document.getElementById("btnOpenLong");
+    const btnOpenShortEl = document.getElementById("btnOpenShort");
+    if (btnOpenLongEl) btnOpenLongEl.addEventListener("click", () => openSide("long"));
+    if (btnOpenShortEl) btnOpenShortEl.addEventListener("click", () => openSide("short"));
     let togglingLive = false;
     function syncLiveBtn(dryRun) {
       const btn = document.getElementById("btnLive");
@@ -694,6 +792,46 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     const btnFeedEl = document.getElementById("btnFeed");
     if (btnFeedEl) btnFeedEl.addEventListener("click", toggleFeed);
+    let settingSide = false;
+    function syncSideMode(mode) {
+      const el = document.getElementById("sideMode");
+      if (!el || settingSide) return;
+      const m = mode || "both";
+      if (el.value !== m) el.value = m;
+      const tips = {
+        both: "BOTH — long or short as signals appear (one position at a time)",
+        auto: "AUTO — lock to EMA trend side only (bull→long, bear→short)",
+        long: "LONG only — block short entries",
+        short: "SHORT only — block long entries",
+      };
+      el.title = tips[m] || tips.both;
+    }
+    async function setSideMode(mode) {
+      const el = document.getElementById("sideMode");
+      if (settingSide || !el) return;
+      settingSide = true;
+      el.disabled = true;
+      try {
+        const r = await fetch("/api/side", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) throw new Error(data.error || ("HTTP " + r.status));
+        syncSideMode(data.side_mode || mode);
+      } catch (e) {
+        console.warn("side mode failed", e);
+        alert("Side mode failed: " + (e.message || e));
+      } finally {
+        settingSide = false;
+        el.disabled = false;
+      }
+    }
+    const sideModeEl = document.getElementById("sideMode");
+    if (sideModeEl) {
+      sideModeEl.addEventListener("change", () => setSideMode(sideModeEl.value));
+    }
     let togglingSl = false;
     function syncSlBtn(slOn, slHits, slToDry) {
       const btn = document.getElementById("btnSl");
@@ -933,6 +1071,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         syncFeedBtn(!!s.feed_paused);
         syncSlBtn(s.sl_enabled !== false, s.sl_hits, s.sl_to_dry);
         syncLastBtn(!!s.last_trade);
+        syncSideMode(s.side_mode || "both");
         if (s.feed_paused) {
           modeEl.textContent = (s.dry_run ? "DRY" : "LIVE") + "+PAUSE";
           modePill.className = "pill off";
@@ -962,7 +1101,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const feeSrc = sess.fee_source === "binance"
           ? `Binance ${sess.fee_mode || "taker"} (m ${(Number(sess.maker_pct||0)).toFixed(4)}% · t ${(Number(sess.taker_pct||0)).toFixed(4)}%)`
           : `fallback (no API keys)`;
-        const openN = (s.paper && s.paper.side) ? 1 : 0;
+        const legs = s.legs || {};
+        const hasLong = !!(legs.long && legs.long.side);
+        const hasShort = !!(legs.short && legs.short.side);
+        const openN = Number(sess.open_count != null ? sess.open_count : ((hasLong ? 1 : 0) + (hasShort ? 1 : 0)));
         const tradesCountEl = document.getElementById("tradesCount");
         if (tradesCountEl) {
           tradesCountEl.textContent = n ? `(${n})` : "";
@@ -975,9 +1117,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           sessBox.className = "pos-box";
           const u = sess.unrealized_pct || 0;
           const uCls = u >= 0 ? "win" : "loss";
+          const lp = sess.leg_pnls || {};
+          let openBit = "";
+          if (openN) {
+            openBit = ` · <span class="entry">${openN} open</span>`;
+            const bits = [];
+            if (lp.long != null) bits.push(`<span class="bid">L ${Number(lp.long) >= 0 ? "+" : ""}${Number(lp.long).toFixed(3)}%</span>`);
+            if (lp.short != null) bits.push(`<span class="ask">S ${Number(lp.short) >= 0 ? "+" : ""}${Number(lp.short).toFixed(3)}%</span>`);
+            if (bits.length) openBit += ` (${bits.join(" · ")})`;
+          }
           sessBox.innerHTML =
             `trades <strong>${n}</strong> closed` +
-            (openN ? ` · <span class="entry">1 open</span>` : "") +
+            openBit +
             ` · W/L ${sess.wins || 0}/${sess.losses || 0}<br>` +
             `gross <span class="${(sess.gross_pct||0) >= 0 ? "win" : "loss"}">${(sess.gross_pct||0) >= 0 ? "+" : ""}${Number(sess.gross_pct||0).toFixed(3)}%</span>` +
             ` · fees −${Number(sess.fees_pct||0).toFixed(3)}%<br>` +
@@ -988,14 +1139,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             `<br><span class="meta">fees ${Number(sess.fee_rt_pct||0).toFixed(4)}%/RT · ${feeSrc}</span>`;
         }
 
-        const paper = s.paper || {};
         const paperBox = document.getElementById("paperPos");
-        const btnClose = document.getElementById("btnClose");
-        if (btnClose && !closing) btnClose.hidden = !paper.side;
-        if (paper.side) {
+        const btnCloseLong = document.getElementById("btnCloseLong");
+        const btnCloseShort = document.getElementById("btnCloseShort");
+        const btnOpenLong = document.getElementById("btnOpenLong");
+        const btnOpenShort = document.getElementById("btnOpenShort");
+        if (btnCloseLong && !closing) btnCloseLong.hidden = !hasLong;
+        if (btnCloseShort && !closing) btnCloseShort.hidden = !hasShort;
+        if (btnOpenLong && !opening) btnOpenLong.hidden = hasLong;
+        if (btnOpenShort && !opening) btnOpenShort.hidden = hasShort;
+        function renderLeg(paper) {
+          if (!paper || !paper.side) return "";
           const pnl = paper.pnl_pct;
           const pnlCls = pnl >= 0 ? "win" : "loss";
-          paperBox.className = "pos-box";
           const peak = paper.peak_pnl_pct != null ? paper.peak_pnl_pct : pnl;
           const beOn = !!paper.be_locked;
           const dcaN = paper.dca_count != null ? Number(paper.dca_count) : 0;
@@ -1012,7 +1168,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           const slBit = slOn
             ? `SL ${fmt(paper.sl, pd)}`
             : `<span class="meta">SL OFF</span>`;
-          paperBox.innerHTML =
+          return (
             `<span class="${paper.side === "long" ? "bid" : "ask"}">${paper.side.toUpperCase()}</span>` +
             ` avg <span class="entry">${fmt(paper.entry, pd)}</span>` +
             ` <span class="meta">[${src}]</span>${qtyBit}${dcaBit}<br>` +
@@ -1020,8 +1176,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             ` <span class="meta">(${paper.exits || "wall"})</span><br>` +
             `${beLine}<br>` +
             `wall ${fmt(paper.wall_price, pd)} · ` +
-            `pnl <span class="${pnlCls}">${pnl >= 0 ? "+" : ""}${pnl.toFixed(3)}%</span>` +
-            ` · peak ${peak >= 0 ? "+" : ""}${Number(peak).toFixed(3)}%`;
+            `pnl <span class="${pnlCls}">${pnl >= 0 ? "+" : ""}${Number(pnl).toFixed(3)}%</span>` +
+            ` · peak ${peak >= 0 ? "+" : ""}${Number(peak).toFixed(3)}%`
+          );
+        }
+        const legHtml = [renderLeg(legs.long), renderLeg(legs.short)].filter(Boolean);
+        if (legHtml.length) {
+          paperBox.className = "pos-box";
+          paperBox.innerHTML = legHtml.join('<hr style="border:0;border-top:1px solid #30363d;margin:8px 0">');
         } else {
           paperBox.className = "pos-box empty";
           let flatMsg = s.block_reason
@@ -1096,19 +1258,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           const a = 0.22 + 0.35 * (w.notional / maxN);
           addLine(w.price, `rgba(248,81,73,${a})`, "", 1, LightweightCharts.LineStyle.Dotted);
         }
-        if (paper.side) {
-          addLine(paper.entry, "#d2a8ff", "E", 1);
-          // BE line only when actually locked
-          if (paper.be_locked) {
-            addLine(paper.entry, "#e3b341", "BE", 1, LightweightCharts.LineStyle.Solid);
+        function addLegLines(leg, tag) {
+          if (!leg || !leg.side) return;
+          const prefix = tag || (leg.side === "long" ? "L" : "S");
+          addLine(leg.entry, "#d2a8ff", prefix + "E", 1);
+          if (leg.be_locked) {
+            addLine(leg.entry, "#e3b341", prefix + "BE", 1, LightweightCharts.LineStyle.Solid);
           }
-          addLine(paper.tp, "#3fb950", "TP", 1, LightweightCharts.LineStyle.Dashed);
+          addLine(leg.tp, "#3fb950", prefix + "TP", 1, LightweightCharts.LineStyle.Dashed);
           if (s.sl_enabled !== false) {
-            const slLabel = paper.be_locked && Math.abs(paper.sl - paper.entry) / paper.entry < 1e-8
-              ? "BE" : "SL";
-            addLine(paper.sl, "#f85149", slLabel, 1, LightweightCharts.LineStyle.Dashed);
+            const slLabel = leg.be_locked && Math.abs(leg.sl - leg.entry) / leg.entry < 1e-8
+              ? (prefix + "BE") : (prefix + "SL");
+            addLine(leg.sl, "#f85149", slLabel, 1, LightweightCharts.LineStyle.Dashed);
           }
         }
+        addLegLines(legs.long, "L");
+        addLegLines(legs.short, "S");
         if (live.side && live.entry) {
           addLine(live.entry, "#ffa657", "L", 1, LightweightCharts.LineStyle.SparseDotted);
         }
@@ -1375,6 +1540,7 @@ class BookState:
         self.bb_filter = True
         self.mom_filter = True
         self.conf_filter = True
+        self.imb_filter = True
         self.ratio_filter = min_wall_ratio > 0
         self.dca_enabled = True
         self.dca_max = 8
@@ -1388,6 +1554,8 @@ class BookState:
         self.sl_enabled = True
         # Last trade: manage open position, block new entries
         self.last_trade = False
+        # Entry side gate: both | auto | long | short
+        self.side_mode = "both"
         # After N session SL hits while LIVE → force PAPER (0 = never)
         self.sl_to_dry = 3
         self.sl_hits = 0
@@ -1431,7 +1599,9 @@ class BookState:
             "dry_run": dry_run,
             "started_at": time.time(),
         }
-        self._paper: dict[str, Any] | None = None
+        # Dual legs: up to one LONG and one SHORT at the same time (paper always;
+        # LIVE needs Binance hedge mode).
+        self._legs: dict[str, dict[str, Any]] = {}
         self._live: dict[str, Any] = {}
         self._bb: dict[str, Any] = {"label": "n/a", "tradeable": True}
         self._trend: dict[str, Any] = {"label": "n/a", "detail": ""}
@@ -1504,6 +1674,7 @@ class BookState:
             "sl_hits": self.sl_hits,
             "sl_to_dry": self.sl_to_dry,
             "last_trade": self.last_trade,
+            "side_mode": self.side_mode,
             "trend": dict(self._trend),
             "structure": dict(self._structure),
             "osc": dict(self._osc),
@@ -1511,6 +1682,7 @@ class BookState:
             "confidence": dict(self._confidence),
             "filters": [],
             "paper": {},
+            "legs": {},
             "live": {},
             "live_enabled": self.live_enabled,
             "markers": [],
@@ -1521,6 +1693,51 @@ class BookState:
             "error": None,
         }
 
+    def _primary_leg(self) -> dict[str, Any] | None:
+        """Single-leg view for chips: worst PnL if dual, else the open one."""
+        if not self._legs:
+            return None
+        if len(self._legs) == 1:
+            return next(iter(self._legs.values()))
+        return min(
+            self._legs.values(),
+            key=lambda p: float(p.get("pnl_pct") or 0),
+        )
+
+    def _pub_legs(self) -> dict[str, Any]:
+        return {s: dict(p) for s, p in self._legs.items()}
+
+    def _pub_paper(self) -> dict[str, Any]:
+        """Legacy single `paper` field (primary leg) for older UI paths."""
+        p = self._primary_leg()
+        return dict(p) if p else {}
+
+    def _refresh_session_notional(self) -> None:
+        total = 0.0
+        for p in self._legs.values():
+            q = float(p.get("qty") or 0)
+            e = float(p.get("entry") or 0)
+            if q > 0 and e > 0:
+                total += q * e
+        if total > 0:
+            self._session["notional"] = total
+
+    def _legs_unrealized(self) -> tuple[float, dict[str, float]]:
+        """Notional-weighted average uPnL% across open legs + per-side map."""
+        details: dict[str, float] = {}
+        wsum = 0.0
+        nsum = 0.0
+        for side, p in self._legs.items():
+            pnl = float(p.get("pnl_pct") or 0)
+            details[side] = pnl
+            n = float(p.get("qty") or 0) * float(p.get("entry") or 0)
+            if n <= 0:
+                n = 1.0
+            wsum += pnl * n
+            nsum += n
+        avg = (wsum / nsum) if nsum else 0.0
+        return avg, details
+
     def set_filter(self, fid: str, enabled: bool) -> dict[str, Any]:
         """Toggle a runtime filter from the UI. Returns updated filter flags."""
         key = {
@@ -1530,6 +1747,7 @@ class BookState:
             "mom": "mom_filter",
             "bounce": "require_bounce",
             "ratio": "ratio_filter",
+            "imb": "imb_filter",
             "conf": "conf_filter",
             "bb_strict": "bb_strict",
             "dca": "dca_enabled",
@@ -1582,15 +1800,16 @@ class BookState:
     def set_last_trade(self, enabled: bool) -> dict[str, Any]:
         """Finish current trade then stop new entries (UI LAST button)."""
         self.last_trade = bool(enabled)
-        if self.last_trade and not self._paper:
+        if self.last_trade and not self._legs:
             self._block_reason = "last trade — no new entries"
         elif not self.last_trade and self._block_reason.startswith("last trade"):
             self._block_reason = "entries resumed"
         with self._lock:
             self._snapshot["last_trade"] = self.last_trade
             self._snapshot["block_reason"] = self._block_reason
-            self._snapshot["paper"] = dict(self._paper) if self._paper else {}
-        note = "manage open only" if self._paper else "no new entries"
+            self._snapshot["paper"] = self._pub_paper()
+            self._snapshot["legs"] = self._pub_legs()
+        note = "manage open only" if self._legs else "no new entries"
         print(
             f"LAST → {'ON' if self.last_trade else 'OFF'} {self.symbol} · {note}",
             flush=True,
@@ -1598,40 +1817,167 @@ class BookState:
         return {
             "ok": True,
             "last_trade": self.last_trade,
-            "in_position": bool(self._paper),
+            "in_position": bool(self._legs),
+            "open_count": len(self._legs),
             "note": note,
         }
 
-    def manual_close(self) -> dict[str, Any]:
-        """Market-close open position from the UI (paper or LIVE)."""
-        if not self._paper:
+    def set_side_mode(self, mode: str) -> dict[str, Any]:
+        """UI selector: both | auto | long | short (dual legs when both/auto)."""
+        m = str(mode or "").strip().lower()
+        if m not in ("both", "auto", "long", "short"):
+            return {"ok": False, "error": "mode must be both|auto|long|short"}
+        self.side_mode = m
+        with self._lock:
+            self._snapshot["side_mode"] = self.side_mode
+        print(f"SIDE → {self.side_mode.upper()} {self.symbol}", flush=True)
+        return {"ok": True, "side_mode": self.side_mode}
+
+    def _side_allowed(self, side: str) -> bool:
+        """Whether new entries on this side are permitted by side_mode."""
+        mode = self.side_mode
+        if mode == "long":
+            return side == "long"
+        if mode == "short":
+            return side == "short"
+        if mode == "both":
+            return True
+        # auto: lock to EMA trend; flat/unknown → no new entries
+        trend = str((self._trend or {}).get("label") or "")
+        if trend == "bullish":
+            return side == "long"
+        if trend == "bearish":
+            return side == "short"
+        return False
+
+    def manual_close(self, side: str | None = None) -> dict[str, Any]:
+        """Market-close one leg (side=long|short) or all open legs."""
+        if not self._legs:
             return {"ok": False, "error": "no open position"}
+        s = str(side or "").strip().lower() or None
+        if s is not None and s not in ("long", "short"):
+            return {"ok": False, "error": "side must be long|short"}
+        if s is not None and s not in self._legs:
+            return {"ok": False, "error": f"no open {s}"}
+        mid = float((self._snapshot or {}).get("mid") or 0)
+        if mid <= 0 and self._trail:
+            mid = float(self._trail[-1]["mid"])
+        targets = [s] if s else list(self._legs.keys())
+        if mid <= 0:
+            for t in targets:
+                mid = float((self._legs.get(t) or {}).get("entry") or 0)
+                if mid > 0:
+                    break
+        if mid <= 0:
+            return {"ok": False, "error": "no mark price"}
+        now = time.time()
+        closed: list[str] = []
+        for t in targets:
+            if t not in self._legs:
+                continue
+            self._close_paper(mid, now, "manual", side=t)
+            if t in self._legs:
+                return {
+                    "ok": False,
+                    "error": self._last_order_error or f"close {t} failed",
+                    "closed": closed,
+                }
+            closed.append(t)
+        unreal, _ = self._legs_unrealized()
+        with self._lock:
+            self._snapshot["paper"] = self._pub_paper()
+            self._snapshot["legs"] = self._pub_legs()
+            self._snapshot["trades"] = list(self._trades)
+            self._snapshot["markers"] = list(self._markers)
+            self._snapshot["session"] = self._session_view(unreal)
+            self._snapshot["signal"] = self._signal
+            self._snapshot["block_reason"] = self._block_reason
+        return {"ok": True, "why": "manual", "mark": mid, "closed": closed}
+
+    def manual_open(self, side: str) -> dict[str, Any]:
+        """Market-open LONG/SHORT from the UI (bypasses entry filters)."""
+        s = str(side or "").strip().lower()
+        if s not in ("long", "short"):
+            return {"ok": False, "error": "side must be long|short"}
+        if s in self._legs:
+            return {"ok": False, "error": f"{s} already open"}
+        if (
+            not self.dry_run
+            and not self.hedge
+            and self._legs
+            and s not in self._legs
+        ):
+            return {
+                "ok": False,
+                "error": "dual LIVE needs Binance hedge mode (one-way can't hold both)",
+            }
         mid = float((self._snapshot or {}).get("mid") or 0)
         if mid <= 0 and self._trail:
             mid = float(self._trail[-1]["mid"])
         if mid <= 0:
-            mid = float(self._paper.get("entry") or 0)
-        if mid <= 0:
             return {"ok": False, "error": "no mark price"}
+        snap = self._snapshot or {}
+        bid_walls = list(snap.get("bid_walls") or [])
+        ask_walls = list(snap.get("ask_walls") or [])
+        best_bid = snap.get("best_bid")
+        best_ask = snap.get("best_ask")
+        wall_price = mid
+        if s == "long" and bid_walls:
+            try:
+                wall_price = float(bid_walls[0]["price"])
+            except (TypeError, ValueError, KeyError, IndexError):
+                wall_price = mid
+        elif s == "short" and ask_walls:
+            try:
+                wall_price = float(ask_walls[0]["price"])
+            except (TypeError, ValueError, KeyError, IndexError):
+                wall_price = mid
         now = time.time()
-        self._close_paper(mid, now, "manual")
-        if self._paper is not None:
+        self._last_order_error = None
+        self._open_paper(
+            s,
+            mid,
+            wall_price,
+            now,
+            "manual",
+            bid_walls=bid_walls,
+            ask_walls=ask_walls,
+            best_bid=float(best_bid) if best_bid else None,
+            best_ask=float(best_ask) if best_ask else None,
+        )
+        if s not in self._legs:
             return {
                 "ok": False,
-                "error": self._last_order_error or "close failed",
+                "error": self._last_order_error or "open failed",
             }
+        pos = self._legs[s]
+        unreal, _ = self._legs_unrealized()
         with self._lock:
-            self._snapshot["paper"] = {}
+            self._snapshot["paper"] = self._pub_paper()
+            self._snapshot["legs"] = self._pub_legs()
             self._snapshot["trades"] = list(self._trades)
             self._snapshot["markers"] = list(self._markers)
-            self._snapshot["session"] = self._session_view(0.0)
+            self._snapshot["session"] = self._session_view(unreal)
             self._snapshot["signal"] = self._signal
             self._snapshot["block_reason"] = self._block_reason
-        return {"ok": True, "why": "manual", "mark": mid}
+        print(
+            f"MANUAL OPEN {s.upper()} {self.symbol} @ {mid:g} "
+            f"({'PAPER' if self.dry_run else 'LIVE'}) · legs={list(self._legs.keys())}",
+            flush=True,
+        )
+        return {
+            "ok": True,
+            "side": s,
+            "entry": mid,
+            "source": pos.get("source"),
+            "open_count": len(self._legs),
+            "legs": list(self._legs.keys()),
+        }
 
     def _pos_is_live(self, pos: dict[str, Any] | None = None) -> bool:
-        p = pos if pos is not None else self._paper
-        return bool(p) and str(p.get("source") or "") == "live"
+        if pos is not None:
+            return bool(pos) and str(pos.get("source") or "") == "live"
+        return any(str(p.get("source") or "") == "live" for p in self._legs.values())
 
     def _fetch_exchange_position(self) -> dict[str, Any] | None:
         """Open Binance Futures position for this symbol, if any."""
@@ -1696,7 +2042,7 @@ class BookState:
         else:
             tp, sl = self._pct_tp_sl(side, entry)
             exits_note = "pct"
-        self._paper = {
+        self._legs[side] = {
             "side": side,
             "entry": entry,
             "tp": tp,
@@ -1720,7 +2066,9 @@ class BookState:
             "be_locked": False,
         }
         self._last_order_error = None
-        self._session["notional"] = qty * entry
+        self._refresh_session_notional()
+        if qty > 0 and entry > 0 and not self._session.get("notional"):
+            self._session["notional"] = qty * entry
         self._markers.append(
             {
                 "t": int(now),
@@ -1802,7 +2150,7 @@ class BookState:
                 print(f"MODE → LIVE {self.symbol} · {note}", flush=True)
                 ex = None
             if ex:
-                local = self._paper
+                local = self._legs.get(str(ex["side"]))
                 same = (
                     local
                     and str(local.get("side")) == ex["side"]
@@ -1817,8 +2165,8 @@ class BookState:
                 else:
                     adopted = self._adopt_exchange_position(now)
                     note = "adopted exchange position" if adopted else "adopt failed"
-            elif self._paper and not self._pos_is_live(self._paper):
-                note = "kept paper position; new entries LIVE"
+            elif self._legs and not self._pos_is_live():
+                note = "kept paper position(s); new entries LIVE"
             else:
                 note = "LIVE armed (flat)"
             print(f"MODE → LIVE {self.symbol} · {note}", flush=True)
@@ -1827,8 +2175,8 @@ class BookState:
             self.live_enabled = bool(self.api_key and self.api_secret)
             if self._pos_is_live():
                 note = "PAPER mode; still managing open LIVE position until flat"
-            elif self._paper:
-                note = "PAPER mode; managing paper position"
+            elif self._legs:
+                note = "PAPER mode; managing paper position(s)"
             else:
                 note = "PAPER armed (flat)"
             print(f"MODE → PAPER {self.symbol} · {note}", flush=True)
@@ -1837,10 +2185,11 @@ class BookState:
             self._snapshot["live_enabled"] = self.live_enabled
             self._snapshot["sl_hits"] = self.sl_hits
             self._snapshot["sl_to_dry"] = self.sl_to_dry
-            self._snapshot["paper"] = dict(self._paper) if self._paper else {}
+            self._snapshot["paper"] = self._pub_paper()
+            self._snapshot["legs"] = self._pub_legs()
             self._snapshot["trades"] = list(self._trades)
             self._snapshot["markers"] = list(self._markers)
-            unreal = float((self._paper or {}).get("pnl_pct") or 0)
+            unreal, _ = self._legs_unrealized()
             self._snapshot["session"] = self._session_view(unreal)
             self._snapshot["signal"] = self._signal
             self._snapshot["block_reason"] = self._block_reason
@@ -1863,6 +2212,7 @@ class BookState:
             "mom": bool(self.mom_filter),
             "bounce": bool(self.require_bounce),
             "ratio": bool(self.ratio_filter),
+            "imb": bool(self.imb_filter),
             "conf": bool(self.conf_filter),
             "bb_strict": bool(self.bb_strict),
             "dca": bool(self.dca_enabled),
@@ -1877,7 +2227,7 @@ class BookState:
 
     def _fee_cover_need(self, pos: dict[str, Any] | None = None) -> float:
         """Gross %% needed to cover estimated fees (scales with DCA legs)."""
-        dca_n = int((pos or self._paper or {}).get("dca_count") or 0)
+        dca_n = int((pos or self._primary_leg() or {}).get("dca_count") or 0)
         return self.fee_rt_pct * (2 + dca_n) / 2.0
 
     def _nearest_reward_ob(
@@ -1937,10 +2287,13 @@ class BookState:
     def _session_view(self, unrealized_pct: float = 0.0) -> dict[str, Any]:
         net = float(self._session["net_pct"])
         self._session["fee_rt_pct"] = self.fee_rt_pct
+        _, leg_pnls = self._legs_unrealized()
         return {
             **self._session,
             "unrealized_pct": unrealized_pct,
             "total_pct": net + unrealized_pct,
+            "open_count": len(self._legs),
+            "leg_pnls": leg_pnls,
         }
 
     def _refresh_ema(self, now: float) -> None:
@@ -2681,6 +3034,18 @@ class BookState:
         best_bid: float | None = None,
         best_ask: float | None = None,
     ) -> None:
+        if side in self._legs:
+            self._block_reason = f"{side} already open"
+            self._last_order_error = self._block_reason
+            return
+        if (
+            not self.dry_run
+            and not self.hedge
+            and self._legs
+        ):
+            self._block_reason = "dual LIVE needs hedge mode"
+            self._last_order_error = self._block_reason
+            return
         fill_entry = entry
         qty = 0.0
         qty_str = ""
@@ -2692,7 +3057,29 @@ class BookState:
                 self._block_reason = "live needs API keys + filters"
                 self._last_order_error = self._block_reason
                 return
-            if not self._exchange_flat():
+            # Hedge: only block if THIS side already has exchange qty.
+            # One-way: any open position blocks a new entry.
+            if self.hedge:
+                try:
+                    from orderbook_dca_grid import get_position_meta
+
+                    meta = get_position_meta(
+                        self.symbol,
+                        side == "long",
+                        self.hedge,
+                        self.api_key,
+                        self.api_secret,
+                        self.recv_window,
+                    )
+                    if float(meta["qty"]) > 0:
+                        self._block_reason = f"exchange already has {side}"
+                        self._last_order_error = self._block_reason
+                        return
+                except Exception as exc:  # noqa: BLE001
+                    self._block_reason = f"position check failed: {exc}"
+                    self._last_order_error = self._block_reason
+                    return
+            elif not self._exchange_flat():
                 self._block_reason = "exchange already has a position"
                 self._last_order_error = self._block_reason
                 return
@@ -2754,7 +3141,7 @@ class BookState:
         else:
             tp, sl = self._pct_tp_sl(side, fill_entry)
             exits_note = "pct"
-        self._paper = {
+        self._legs[side] = {
             "side": side,
             "entry": fill_entry,
             "tp": tp,
@@ -2777,8 +3164,7 @@ class BookState:
             "adverse_mid": fill_entry,  # worst mid since entry (for DCA direction)
         }
         self._last_order_error = None
-        if qty > 0 and fill_entry > 0:
-            self._session["notional"] = qty * fill_entry
+        self._refresh_session_notional()
         self._markers.append(
             {
                 "t": int(now),
@@ -2791,11 +3177,16 @@ class BookState:
         if len(self._markers) > 80:
             self._markers = self._markers[-80:]
 
-    def _close_paper(self, mark: float, now: float, why: str) -> None:
-        pos = self._paper
+    def _close_paper(
+        self, mark: float, now: float, why: str, *, side: str | None = None
+    ) -> None:
+        if side:
+            pos = self._legs.get(side)
+        else:
+            pos = self._primary_leg()
         if not pos:
             return
-        side = pos["side"]
+        side = str(pos["side"])
         # Exit on exchange only for adopted/opened LIVE legs (mode toggle must not orphan)
         if self._pos_is_live(pos) and self.api_key and self.filt:
             try:
@@ -2873,14 +3264,18 @@ class BookState:
         )
         if len(self._markers) > 80:
             self._markers = self._markers[-80:]
-        self._paper = None
+        self._legs.pop(side, None)
+        self._refresh_session_notional()
         # After SL: longer cooldown; after N session SLs → force PAPER
         cd = self.cooldown_sec
         if why == "sl":
             cd = max(cd, 12.0)
             self.sl_hits += 1
         self._cooldown_until = now + cd
-        self._signal = "flat"
+        if self._legs:
+            self._signal = "+".join(sorted(self._legs.keys()))
+        else:
+            self._signal = "flat"
         lim = int(self.sl_to_dry or 0)
         if why == "sl" and not self.dry_run and lim > 0 and self.sl_hits >= lim:
             self.set_live(False)
@@ -2893,6 +3288,10 @@ class BookState:
             self._block_reason = f"cooldown {cd:g}s after sl{left}"
         else:
             self._block_reason = f"cooldown {cd:g}s after {why}"
+        if self._legs:
+            self._block_reason = (
+                f"{self._block_reason} · still open {','.join(sorted(self._legs.keys()))}"
+            )
 
     def _dca_space(self) -> float:
         return max(0.08, float(self.dca_space_pct), float(self.touch_pct) * 0.5)
@@ -2997,12 +3396,13 @@ class BookState:
         ask_walls: list[dict[str, float]],
         best_bid: float | None,
         best_ask: float | None,
+        side: str | None = None,
     ) -> bool:
         """Add size at wall, rebase avg entry, recalculate TP/SL."""
-        pos = self._paper
+        pos = self._legs.get(side) if side else self._primary_leg()
         if not pos:
             return False
-        side = pos["side"]
+        side = str(pos["side"])
         old_entry = float(pos["entry"])
         old_qty = float(pos.get("qty") or 0)
         add_qty = float(pos.get("base_qty") or old_qty or 0)
@@ -3087,8 +3487,7 @@ class BookState:
         pos["tp"] = tp
         pos["sl"] = sl  # full reset after DCA (not ratchet-tight)
         pos["exits"] = f"dca{pos['dca_count']}+{note}"
-        if new_qty > 0 and new_avg > 0:
-            self._session["notional"] = new_qty * new_avg
+        self._refresh_session_notional()
         self._markers.append(
             {
                 "t": int(now),
@@ -3117,8 +3516,9 @@ class BookState:
         ask_walls: list[dict[str, float]],
         best_bid: float | None,
         best_ask: float | None,
+        side: str | None = None,
     ) -> bool:
-        pos = self._paper
+        pos = self._legs.get(side) if side else self._primary_leg()
         if not pos or not self.dca_enabled:
             return False
         if pnl >= -self.dca_min_loss_pct:
@@ -3128,7 +3528,7 @@ class BookState:
         last_dca = float(pos.get("last_dca_at") or 0)
         if last_dca > 0 and (now - last_dca) < self.dca_cooldown_sec:
             return False
-        side = pos["side"]
+        side = str(pos["side"])
         entry = float(pos["entry"])
         # Only DCA on adverse extension — never while recovering toward entry
         if not self._dca_still_adverse(side, mid, pos):
@@ -3154,6 +3554,7 @@ class BookState:
             mid, wall, now,
             bid_walls=bid_walls, ask_walls=ask_walls,
             best_bid=best_bid, best_ask=best_ask,
+            side=side,
         )
 
     def _manage_paper(
@@ -3167,10 +3568,33 @@ class BookState:
         best_bid: float | None,
         best_ask: float | None,
     ) -> None:
-        if not self._paper:
+        for leg_side in list(self._legs.keys()):
+            self._manage_leg(
+                leg_side,
+                mid,
+                now,
+                imb,
+                bid_walls=bid_walls,
+                ask_walls=ask_walls,
+                best_bid=best_bid,
+                best_ask=best_ask,
+            )
+
+    def _manage_leg(
+        self,
+        side: str,
+        mid: float,
+        now: float,
+        imb: float,
+        *,
+        bid_walls: list[dict[str, float]],
+        ask_walls: list[dict[str, float]],
+        best_bid: float | None,
+        best_ask: float | None,
+    ) -> None:
+        pos = self._legs.get(side)
+        if not pos:
             return
-        pos = self._paper
-        side = pos["side"]
         entry = float(pos["entry"])
 
         pnl = self._pnl_pct(entry, mid, side)
@@ -3189,6 +3613,7 @@ class BookState:
             mid, now, pnl,
             bid_walls=bid_walls, ask_walls=ask_walls,
             best_bid=best_bid, best_ask=best_ask,
+            side=side,
         ):
             entry = float(pos["entry"])
             pnl = self._pnl_pct(entry, mid, side)
@@ -3322,32 +3747,32 @@ class BookState:
                     or (side == "short" and (bp >= 0.55 or btr == "building-bid"))
                 )
                 if through or touch:
-                    self._close_paper(mid, now, "ob")
+                    self._close_paper(mid, now, "ob", side=side)
                     return
                 if near_ob and (imb_against or book_against):
-                    self._close_paper(mid, now, "ob-rev")
+                    self._close_paper(mid, now, "ob-rev", side=side)
                     return
 
         # Proactive: lock green when sense flips or price reverses from peak
         if pos.get("armed") and pnl > 0 and can_soft and not in_grace:
             if self.flip_exit:
                 if side == "long" and imb < 0.5:
-                    self._close_paper(mid, now, "flip")
+                    self._close_paper(mid, now, "flip", side=side)
                     return
                 if side == "short" and imb > 0.5:
-                    self._close_paper(mid, now, "flip")
+                    self._close_paper(mid, now, "flip", side=side)
                     return
             if self.rev_exit:
                 peak_mid = float(pos["peak_mid"])
                 if side == "long" and peak_mid > 0:
                     dd = (peak_mid - mid) / peak_mid * 100
                     if dd >= self.rev_pct:
-                        self._close_paper(mid, now, "rev")
+                        self._close_paper(mid, now, "rev", side=side)
                         return
                 if side == "short" and peak_mid > 0:
                     dd = (mid - peak_mid) / peak_mid * 100
                     if dd >= self.rev_pct:
-                        self._close_paper(mid, now, "rev")
+                        self._close_paper(mid, now, "rev", side=side)
                         return
 
         # Giveback: was meaningfully green, then clear break beyond entry (not a tick)
@@ -3361,28 +3786,28 @@ class BookState:
             give_buf = max(be_buf, float(self.giveback_buffer_pct or 0))
             if peak >= peak_need and pnl < 0:
                 if side == "long" and mid < entry * (1 - give_buf / 100):
-                    self._close_paper(mid, now, "give")
+                    self._close_paper(mid, now, "give", side=side)
                     return
                 if side == "short" and mid > entry * (1 + give_buf / 100):
-                    self._close_paper(mid, now, "give")
+                    self._close_paper(mid, now, "give", side=side)
                     return
 
         # Hard exits — during grace, ignore SL unless adverse move is clearly wrong
         emergency = min_sl * 1.75
         if side == "long":
             if mid >= pos["tp"]:
-                self._close_paper(mid, now, "tp")
+                self._close_paper(mid, now, "tp", side=side)
             elif self.sl_enabled and mid <= pos["sl"]:
                 adverse = (entry - mid) / entry * 100 if entry else 0.0
                 if (not in_grace) or adverse >= emergency:
-                    self._close_paper(mid, now, "sl")
+                    self._close_paper(mid, now, "sl", side=side)
         else:
             if mid <= pos["tp"]:
-                self._close_paper(mid, now, "tp")
+                self._close_paper(mid, now, "tp", side=side)
             elif self.sl_enabled and mid >= pos["sl"]:
                 adverse = (mid - entry) / entry * 100 if entry else 0.0
                 if (not in_grace) or adverse >= emergency:
-                    self._close_paper(mid, now, "sl")
+                    self._close_paper(mid, now, "sl", side=side)
 
     def _nearest_wall(
         self, walls: list[dict[str, float]], *, below: bool, mid: float
@@ -3444,8 +3869,10 @@ class BookState:
                 state="wait", status=why, toggle=False,
             ),
             self._filter_chip(
-                fid="imb", label="Imbalance", value="—", enabled=True,
-                state="wait", status=why, toggle=False,
+                fid="imb", label="Imbalance", value="—",
+                enabled=flags.get("imb", True),
+                state="off" if not flags.get("imb", True) else "wait",
+                status=why,
             ),
             self._filter_chip(
                 fid="bb", label="Bollinger", value=str(self._bb.get("label") or "—"),
@@ -3531,12 +3958,16 @@ class BookState:
             wall_st = f"need ≤{self.touch_pct:g}%"
 
         if cand_side == "long":
-            imb_ok = imb >= self.imb_long
+            imb_ok = (not flags.get("imb", True)) or imb >= self.imb_long
             imb_st = f"≥{self.imb_long*100:.0f}%"
         else:
-            imb_ok = imb <= self.imb_short
+            imb_ok = (not flags.get("imb", True)) or imb <= self.imb_short
             imb_st = f"≤{self.imb_short*100:.0f}%"
-        imb_state = "ok" if imb_ok else ("block" if near else "wait")
+        if not flags.get("imb", True):
+            imb_state = "off"
+            imb_st = "off=wall only"
+        else:
+            imb_state = "ok" if imb_ok else ("block" if near else "wait")
 
         bb_lab = str(self._bb.get("label") or "—")
         bb_ok = bool(self._bb.get("tradeable", True))
@@ -3585,8 +4016,10 @@ class BookState:
                 state=wall_state, status=wall_st, toggle=False,
             ),
             self._filter_chip(
-                fid="imb", label="Imbalance", value=f"{imb*100:.1f}%", enabled=True,
-                state=imb_state, status=f"{cand_side} {imb_st}", toggle=False,
+                fid="imb", label="Imbalance", value=f"{imb*100:.1f}%",
+                enabled=flags.get("imb", True),
+                state=imb_state,
+                status=f"{cand_side} {imb_st}",
             ),
             self._filter_chip(
                 fid="bb", label="Bollinger", value=bb_lab, enabled=flags["bb"],
@@ -3660,7 +4093,7 @@ class BookState:
 
     def _give_filter_chip(self) -> dict[str, Any]:
         flags = self.filter_flags()
-        pos = self._paper
+        pos = self._primary_leg()
         buf = max(float(self.be_buffer_pct or 0), float(self.giveback_buffer_pct or 0))
         if not flags["give"]:
             return self._filter_chip(
@@ -3796,7 +4229,7 @@ class BookState:
 
     def _dca_filter_chip(self) -> dict[str, Any]:
         flags = self.filter_flags()
-        pos = self._paper
+        pos = self._primary_leg()
         n = int((pos or {}).get("dca_count") or 0)
         val = f"{n}/{self.dca_max}"
         if not flags["dca"]:
@@ -3822,7 +4255,7 @@ class BookState:
 
     def _obtp_filter_chip(self) -> dict[str, Any]:
         flags = self.filter_flags()
-        pos = self._paper
+        pos = self._primary_leg()
         if not flags["obtp"]:
             return self._filter_chip(
                 fid="obtp", label="OB take-profit", value="off", enabled=False,
@@ -3887,8 +4320,9 @@ class BookState:
                 mom_pct=mom,
             )
 
-        if self._paper:
-            cand_side = str(self._paper["side"])
+        prim = self._primary_leg()
+        if prim:
+            cand_side = str(prim["side"])
             cand_wall = bid_w if cand_side == "long" else ask_w
         elif near_bid or (imb >= self.imb_long and bid_w):
             cand_side, cand_wall = "long", bid_w
@@ -3912,11 +4346,14 @@ class BookState:
         if not self.paper_enabled:
             self._block_reason = "paper off"
             return "flat"
-        if self._paper:
+        if len(self._legs) >= 2:
             self._block_reason = (
-                "in position · LAST — no re-entry" if self.last_trade else "in position"
+                "both open · LAST — no re-entry" if self.last_trade else "both sides open"
             )
-            return self._paper["side"]
+            return "long+short"
+        if self.last_trade and self._legs:
+            self._block_reason = "last trade — manage open only"
+            return "+".join(sorted(self._legs.keys()))
         if self.last_trade:
             self._block_reason = "last trade — no new entries"
             return "flat"
@@ -3930,6 +4367,9 @@ class BookState:
             return "flat"
 
         def _try_open(side: str, wall: dict[str, float], why: str) -> bool:
+            if side in self._legs:
+                self._block_reason = f"{side} already open"
+                return False
             conf = _conf(side, wall)
             self._confidence = conf
             self._filters = self._build_filter_bar(
@@ -4022,24 +4462,33 @@ class BookState:
             self._block_reason = ""
             return True
 
-        if near_bid and imb >= self.imb_long:
-            if _try_open("long", bid_w, "bid-wall+imb"):
+        if near_bid and ((not self.imb_filter) or imb >= self.imb_long):
+            if not self._side_allowed("long"):
+                self._block_reason = f"side-mode {self.side_mode} blocks long"
+            elif _try_open("long", bid_w, "bid-wall+imb" if self.imb_filter else "bid-wall"):
                 return "long"
-            if self._block_reason:
+            if self._block_reason and self._side_allowed("long"):
                 return "flat"
-        if near_ask and imb <= self.imb_short:
-            if _try_open("short", ask_w, "ask-wall+imb"):
+        if near_ask and ((not self.imb_filter) or imb <= self.imb_short):
+            if not self._side_allowed("short"):
+                if not self._block_reason or "blocks long" in self._block_reason:
+                    self._block_reason = f"side-mode {self.side_mode} blocks short"
+            elif _try_open("short", ask_w, "ask-wall+imb" if self.imb_filter else "ask-wall"):
                 return "short"
-            if self._block_reason:
+            if self._block_reason and self._side_allowed("short"):
                 return "flat"
 
         reasons = []
+        if not self._side_allowed("long") and not self._side_allowed("short"):
+            reasons.append(f"side-mode {self.side_mode} (no side allowed)")
         if not near_bid and not near_ask:
             reasons.append(f"no wall≥{self.min_wall_usdt/1000:.0f}k within {self.touch_pct:g}%")
-        elif near_bid and imb < self.imb_long:
+        elif self.imb_filter and near_bid and imb < self.imb_long:
             reasons.append(f"imb {imb*100:.1f}% < long {self.imb_long*100:.0f}%")
-        elif near_ask and imb > self.imb_short:
+        elif self.imb_filter and near_ask and imb > self.imb_short:
             reasons.append(f"imb {imb*100:.1f}% > short {self.imb_short*100:.0f}%")
+        elif (not self.imb_filter) and not near_bid and not near_ask:
+            reasons.append("need wall touch (imb off)")
         if near_bid and long_tp is None:
             reasons.append(f"TP via pct (no ask wall ≥{need:g}%)")
         if near_ask and short_tp is None:
@@ -4139,13 +4588,12 @@ class BookState:
                     spread=float(snap.get("spread") or 0),
                 )
                 unreal = 0.0
-                if self._paper:
-                    unreal = self._pnl_pct(
-                        self._paper["entry"], mid, self._paper["side"]
-                    )
-                    self._paper["pnl_pct"] = unreal
-                    # Show open pnl net of half fee already paid conceptually (entry leg)
-                    self._paper["net_pct"] = unreal - self.fee_rt_pct / 2
+                if self._legs:
+                    for _leg in self._legs.values():
+                        lp = self._pnl_pct(_leg["entry"], mid, _leg["side"])
+                        _leg["pnl_pct"] = lp
+                        _leg["net_pct"] = lp - self.fee_rt_pct / 2
+                    unreal, _ = self._legs_unrealized()
 
                 with self._lock:
                     t_sec = int(now)
@@ -4178,6 +4626,7 @@ class BookState:
                         "sl_hits": self.sl_hits,
                         "sl_to_dry": self.sl_to_dry,
                         "last_trade": self.last_trade,
+                        "side_mode": self.side_mode,
                         "order_error": self._last_order_error,
                         "trend": dict(self._trend),
                         "structure": dict(self._structure),
@@ -4185,7 +4634,8 @@ class BookState:
                         "book": dict(self._book),
                         "confidence": dict(self._confidence),
                         "filters": list(self._filters),
-                        "paper": dict(self._paper) if self._paper else {},
+                        "paper": self._pub_paper(),
+                        "legs": self._pub_legs(),
                         "live": dict(self._live),
                         "live_enabled": self.live_enabled,
                         "markers": list(self._markers),
@@ -4241,10 +4691,25 @@ def make_handler(state: BookState, ui_poll_ms: int):
             if path == "/api/close":
                 try:
                     n = int(self.headers.get("Content-Length") or 0)
-                    if n > 0:
-                        self.rfile.read(n)
-                    result = state.manual_close()
+                    raw = self.rfile.read(n) if n > 0 else b"{}"
+                    data = json.loads(raw.decode("utf-8") or "{}")
+                    side = data.get("side")
+                    result = state.manual_close(str(side) if side else None)
                     self._json(200 if result.get("ok") else 400, result)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._json(400, {"ok": False, "error": str(exc)})
+                except Exception as exc:  # noqa: BLE001
+                    self._json(500, {"ok": False, "error": str(exc)})
+                return
+            if path == "/api/open":
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    raw = self.rfile.read(n) if n > 0 else b"{}"
+                    data = json.loads(raw.decode("utf-8") or "{}")
+                    result = state.manual_open(str(data.get("side") or ""))
+                    self._json(200 if result.get("ok") else 400, result)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._json(400, {"ok": False, "error": str(exc)})
                 except Exception as exc:  # noqa: BLE001
                     self._json(500, {"ok": False, "error": str(exc)})
                 return
@@ -4302,6 +4767,18 @@ def make_handler(state: BookState, ui_poll_ms: int):
                         self._json(400, {"ok": False, "error": "missing enabled"})
                         return
                     result = state.set_last_trade(bool(data.get("enabled")))
+                    self._json(200 if result.get("ok") else 400, result)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._json(400, {"ok": False, "error": str(exc)})
+                except Exception as exc:  # noqa: BLE001
+                    self._json(500, {"ok": False, "error": str(exc)})
+                return
+            if path == "/api/side":
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    raw = self.rfile.read(n) if n > 0 else b"{}"
+                    data = json.loads(raw.decode("utf-8") or "{}")
+                    result = state.set_side_mode(str(data.get("mode") or ""))
                     self._json(200 if result.get("ok") else 400, result)
                 except (ValueError, json.JSONDecodeError) as exc:
                     self._json(400, {"ok": False, "error": str(exc)})
@@ -4400,6 +4877,8 @@ def main() -> None:
                    help="min ADX for trend filter (default 20)")
     p.add_argument("--smc-filter", action=argparse.BooleanOptionalAction, default=False,
                    help="block entries against SMC structure bias (pill always shown)")
+    p.add_argument("--side-mode", choices=("both", "auto", "long", "short"), default="both",
+                   help="entry side: both|auto(EMA lock)|long|short (default both)")
     p.add_argument("--osc-interval", default="5m",
                    help="RSI/ADX kline interval")
     p.add_argument("--structure-interval", default="5m",
@@ -4571,6 +5050,7 @@ def main() -> None:
     state.vol_max_pct = float(args.vol_max_pct)
     state.giveback_exit = bool(args.giveback_exit)
     state.giveback_buffer_pct = float(args.giveback_buffer_pct)
+    state.side_mode = str(args.side_mode)
     state.osc_interval = str(args.osc_interval)
     state.structure_interval = str(args.structure_interval)
     # Pull Binance commission rates immediately (needs API keys in .env)
