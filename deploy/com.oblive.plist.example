@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent — OB live chart (PAPER by default).
+
+  1) Copy and edit paths / symbol / port:
+       cp deploy/com.oblive.plist.example ~/Library/LaunchAgents/com.oblive.solusdt.plist
+  2) Load:
+       launchctl load ~/Library/LaunchAgents/com.oblive.solusdt.plist
+  3) Stop:
+       launchctl unload ~/Library/LaunchAgents/com.oblive.solusdt.plist
+
+  Starts with --dry-run (PAPER). Enable LIVE from the dashboard button when ready.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.oblive.solusdt</string>
+  <key>WorkingDirectory</key>
+  <string>/Volumes/Extreme/Development/trade-binance-websocket-orderbook-dca-grid</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Volumes/Extreme/Development/trade-binance-websocket-orderbook-dca-grid/.venv/bin/python</string>
+    <string>-u</string>
+    <string>ob_live_chart.py</string>
+    <string>SOLUSDT</string>
+    <string>--dry-run</string>
+    <string>--port</string>
+    <string>8765</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/oblive-solusdt.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/oblive-solusdt.err</string>
+</dict>
+</plist>

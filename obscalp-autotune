@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# ML autotuner — optimizes scalp params and restarts bot periodically.
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+PY="$ROOT/.venv/bin/python"
+if [[ ! -x "$PY" ]]; then
+  echo "Run: python3 -m venv .venv && .venv/bin/pip install -r requirements-ml.txt" >&2
+  exit 1
+fi
+exec "$PY" -u "$ROOT/ob_scalp_autotune.py" "$@"

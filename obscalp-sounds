@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Mute/unmute trade sounds (live) or play a test sound.
+#   ./obscalp-sounds mute
+#   ./obscalp-sounds unmute
+#   ./obscalp-sounds status
+#   ./obscalp-sounds tp
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 -u "$ROOT/trade_sounds.py" "$@"

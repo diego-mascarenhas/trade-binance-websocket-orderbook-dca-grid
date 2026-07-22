@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Short wrapper: dca SYMBOL [long|short|auto|stop|status|cleanup]
+set -euo pipefail
+
+# Resolve symlinks so PATH installs (e.g. ~/bin/dca → repo/dca) find the repo.
+_SRC="${BASH_SOURCE[0]}"
+while [[ -L "$_SRC" ]]; do
+  _DIR="$(cd "$(dirname "$_SRC")" && pwd)"
+  _SRC="$(readlink "$_SRC")"
+  [[ "$_SRC" != /* ]] && _SRC="$_DIR/$_SRC"
+done
+ROOT="$(cd "$(dirname "$_SRC")" && pwd)"
+cd "$ROOT"
+
+usage() {
+    echo "Usage: dca SYMBOL [long|short|auto|stop|status|cleanup]"
+    echo "  dca 1000PEPEUSDT          # AUTO supervisor (default)"
+    echo "  dca 1000PEPEUSDT short    # SHORT supervisor"
+    echo "  dca SKLUSDT stop          # stop supervisor (orders stay on Binance)"
+    echo "  dca SKLUSDT status        # process + trading state"
+    echo "  dca SKLUSDT cleanup       # cancel obstage* Stop/TP algos"
+    exit 1
+}
+
+[[ $# -lt 1 || $# -gt 2 ]] && usage
+
+SYMBOL="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+ACTION="$(printf '%s' "${2:-auto}" | tr '[:upper:]' '[:lower:]')"
+
+case "$ACTION" in
+    stop | status | cleanup)
+        exec python3 "$ROOT/botctl.py" "$ACTION" "$SYMBOL"
+        ;;
+    long | short | auto)
+        exec python3 -u "$ROOT/orderbook_dca_grid.py" "$SYMBOL" \
+            --supervise \
+            --direction "$ACTION" \
+            --recv-window 15000
+        ;;
+    *)
+        echo "Second arg must be long, short, auto, stop, status, or cleanup (got: $2)" >&2
+        exit 1
+        ;;
+esac

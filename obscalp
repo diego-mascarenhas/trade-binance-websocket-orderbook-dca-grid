@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Short wrapper: obscalp SYMBOL [--dry-run | --execute] ...
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 -u "$ROOT/orderbook_ob_scalp.py" "$@"
