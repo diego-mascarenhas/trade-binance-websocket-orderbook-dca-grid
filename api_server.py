@@ -212,8 +212,6 @@ def chart_payload(symbol: str, *, interval: str = "15m", limit: int = 120) -> di
     """Candles + OPEN / LIMIT / TP / SL levels for the lightweight chart."""
     sym = symbol.upper()
     api, sec = load_keys(None)
-    if not api or not sec:
-        raise RuntimeError("No API keys in .env (BINANCE_API_KEY / BINANCE_SECRET_KEY)")
     recv = int(_env("RECV_WINDOW", "15000") or "15000")
     base = _env("FAPI_BASE", futures_scan.FAPI_BASE) or futures_scan.FAPI_BASE
 
@@ -236,32 +234,44 @@ def chart_payload(symbol: str, *, interval: str = "15m", limit: int = 120) -> di
     mark = 0.0
     notional = 0.0
     unrealized_pnl = 0.0
-    rows = _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": sym}, api, sec, recv)
-    for r in rows if isinstance(rows, list) else []:
-        amt = float(r.get("positionAmt", 0) or 0)
-        if abs(amt) <= 0:
-            continue
-        pos_side = str(r.get("positionSide", "BOTH")).upper()
-        if pos_side == "LONG" or (pos_side == "BOTH" and amt > 0):
-            side = "LONG"
-        else:
-            side = "SHORT"
-        entry = float(r.get("entryPrice", 0) or 0)
-        mark = float(r.get("markPrice", 0) or 0)
-        unrealized_pnl = float(r.get("unRealizedProfit", 0) or 0)
-        raw_n = r.get("notional", "")
-        if raw_n not in ("", None):
-            notional = abs(float(raw_n))
-        else:
-            notional = abs(amt) * (mark if mark > 0 else entry)
-        if entry > 0:
-            levels.append(_level("open", "OPEN", entry, "#c084fc"))
-        if mark > 0:
-            levels.append(_level("mark", "MARK", mark, "#8b949e"))
-        liq = _f(r.get("liquidationPrice"))
-        if liq:
-            levels.append(_level("liq", "LIQ", liq, "#fb923c"))
-        break
+    # Signed account data is optional: candles (public) must still render if
+    # keys are missing or Binance rejects them (IP whitelist, permissions, etc.).
+    if not api or not sec:
+        sys.stderr.write(f"chart {sym}: no API keys — candles only\n")
+    try:
+        if not api or not sec:
+            raise RuntimeError("No API keys in .env")
+        rows = _signed_request(
+            "GET", "/fapi/v2/positionRisk", {"symbol": sym}, api, sec, recv
+        )
+        for r in rows if isinstance(rows, list) else []:
+            amt = float(r.get("positionAmt", 0) or 0)
+            if abs(amt) <= 0:
+                continue
+            pos_side = str(r.get("positionSide", "BOTH")).upper()
+            if pos_side == "LONG" or (pos_side == "BOTH" and amt > 0):
+                side = "LONG"
+            else:
+                side = "SHORT"
+            entry = float(r.get("entryPrice", 0) or 0)
+            mark = float(r.get("markPrice", 0) or 0)
+            unrealized_pnl = float(r.get("unRealizedProfit", 0) or 0)
+            raw_n = r.get("notional", "")
+            if raw_n not in ("", None):
+                notional = abs(float(raw_n))
+            else:
+                notional = abs(amt) * (mark if mark > 0 else entry)
+            if entry > 0:
+                levels.append(_level("open", "OPEN", entry, "#c084fc"))
+            if mark > 0:
+                levels.append(_level("mark", "MARK", mark, "#8b949e"))
+            liq = _f(r.get("liquidationPrice"))
+            if liq:
+                levels.append(_level("liq", "LIQ", liq, "#fb923c"))
+            break
+    except Exception as exc:
+        sys.stderr.write(f"chart {sym}: positionRisk skipped: {exc}\n")
+
     pnl_pct = (unrealized_pnl / notional * 100) if notional > 0 else 0.0
 
     quote_volume = 0.0
@@ -272,37 +282,45 @@ def chart_payload(symbol: str, *, interval: str = "15m", limit: int = 120) -> di
     except Exception:
         pass
 
-    oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, recv) or []
-    limit_i = 0
-    for o in oo if isinstance(oo, list) else []:
-        otype = str(o.get("type", "")).upper()
-        price = _f(o.get("price"))
-        if not price:
-            continue
-        reduce_only = str(o.get("reduceOnly", "false")).lower() in ("true", "1")
-        o_side = str(o.get("side", "")).upper()
-        if otype in ("LIMIT", "LIMIT_MAKER"):
-            if reduce_only:
-                # Closing LIMIT often used as manual TP
-                kind, label, color = "tp", "TP", "#3fb950"
-                if side == "LONG" and o_side == "SELL":
-                    pass
-                elif side == "SHORT" and o_side == "BUY":
-                    pass
+    try:
+        oo = (
+            _signed_request(
+                "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, recv
+            )
+            or []
+        )
+        limit_i = 0
+        for o in oo if isinstance(oo, list) else []:
+            otype = str(o.get("type", "")).upper()
+            price = _f(o.get("price"))
+            if not price:
+                continue
+            reduce_only = str(o.get("reduceOnly", "false")).lower() in ("true", "1")
+            o_side = str(o.get("side", "")).upper()
+            if otype in ("LIMIT", "LIMIT_MAKER"):
+                if reduce_only:
+                    # Closing LIMIT often used as manual TP
+                    kind, label, color = "tp", "TP", "#3fb950"
+                    if side == "LONG" and o_side == "SELL":
+                        pass
+                    elif side == "SHORT" and o_side == "BUY":
+                        pass
+                    else:
+                        kind, label, color = "limit", "LIMIT", "#58a6ff"
                 else:
-                    kind, label, color = "limit", "LIMIT", "#58a6ff"
-            else:
-                limit_i += 1
-                kind, label, color = "limit", f"LIMIT {limit_i}", "#58a6ff"
-            levels.append(_level(kind, label, price, color))
-        elif otype in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET"):
-            tp = _f(o.get("stopPrice")) or price
-            if tp:
-                levels.append(_level("tp", "TP", tp, "#3fb950"))
-        elif otype in ("STOP", "STOP_MARKET"):
-            sl = _f(o.get("stopPrice")) or price
-            if sl:
-                levels.append(_level("sl", "SL", sl, "#f85149"))
+                    limit_i += 1
+                    kind, label, color = "limit", f"LIMIT {limit_i}", "#58a6ff"
+                levels.append(_level(kind, label, price, color))
+            elif otype in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET"):
+                tp = _f(o.get("stopPrice")) or price
+                if tp:
+                    levels.append(_level("tp", "TP", tp, "#3fb950"))
+            elif otype in ("STOP", "STOP_MARKET"):
+                sl = _f(o.get("stopPrice")) or price
+                if sl:
+                    levels.append(_level("sl", "SL", sl, "#f85149"))
+    except Exception as exc:
+        sys.stderr.write(f"chart {sym}: openOrders skipped: {exc}\n")
 
     try:
         from orderbook_staged_exit import list_open_algo_orders, _algo_client_id
@@ -311,35 +329,38 @@ def chart_payload(symbol: str, *, interval: str = "15m", limit: int = 120) -> di
         _algo_client_id = None  # type: ignore[assignment]
 
     if list_open_algo_orders is not None:
-        for o in list_open_algo_orders(sym, api, sec, recv):
-            otype = str(o.get("orderType") or o.get("type") or "").upper()
-            trig = (
-                _f(o.get("triggerPrice"))
-                or _f(o.get("stopPrice"))
-                or _f(o.get("activatePrice"))
-                or _f(o.get("price"))
-            )
-            if not trig:
-                continue
-            cid = ""
-            if _algo_client_id is not None:
-                try:
-                    cid = str(_algo_client_id(o) or "")
-                except Exception:
-                    cid = str(o.get("clientAlgoId") or o.get("clientOrderId") or "")
-            tag = cid.upper()
-            if "TP1" in tag or otype.startswith("TAKE_PROFIT"):
-                levels.append(_level("tp", "TP", trig, "#3fb950"))
-            elif "BE" in tag or tag.endswith("SL") or "SL" in tag or otype in (
-                "STOP", "STOP_MARKET", "STOP_LOSS", "STOP_LOSS_MARKET",
-            ):
-                levels.append(_level("sl", "SL", trig, "#f85149"))
-            elif "TR" in tag or "TRAIL" in otype or otype == "TRAILING_STOP_MARKET":
-                levels.append(_level("trail", "TRAIL", trig, "#fbbf24"))
-            elif otype.startswith("TAKE_PROFIT"):
-                levels.append(_level("tp", "TP", trig, "#3fb950"))
-            else:
-                levels.append(_level("limit", "ALGO", trig, "#58a6ff"))
+        try:
+            for o in list_open_algo_orders(sym, api, sec, recv):
+                otype = str(o.get("orderType") or o.get("type") or "").upper()
+                trig = (
+                    _f(o.get("triggerPrice"))
+                    or _f(o.get("stopPrice"))
+                    or _f(o.get("activatePrice"))
+                    or _f(o.get("price"))
+                )
+                if not trig:
+                    continue
+                cid = ""
+                if _algo_client_id is not None:
+                    try:
+                        cid = str(_algo_client_id(o) or "")
+                    except Exception:
+                        cid = str(o.get("clientAlgoId") or o.get("clientOrderId") or "")
+                tag = cid.upper()
+                if "TP1" in tag or otype.startswith("TAKE_PROFIT"):
+                    levels.append(_level("tp", "TP", trig, "#3fb950"))
+                elif "BE" in tag or tag.endswith("SL") or "SL" in tag or otype in (
+                    "STOP", "STOP_MARKET", "STOP_LOSS", "STOP_LOSS_MARKET",
+                ):
+                    levels.append(_level("sl", "SL", trig, "#f85149"))
+                elif "TR" in tag or "TRAIL" in otype or otype == "TRAILING_STOP_MARKET":
+                    levels.append(_level("trail", "TRAIL", trig, "#fbbf24"))
+                elif otype.startswith("TAKE_PROFIT"):
+                    levels.append(_level("tp", "TP", trig, "#3fb950"))
+                else:
+                    levels.append(_level("limit", "ALGO", trig, "#58a6ff"))
+        except Exception as exc:
+            sys.stderr.write(f"chart {sym}: algo orders skipped: {exc}\n")
 
     # Deduplicate near-identical prices per kind
     deduped: list[dict[str, Any]] = []
