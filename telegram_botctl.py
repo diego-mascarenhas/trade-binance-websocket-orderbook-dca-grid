@@ -76,7 +76,7 @@ def handle_command(cmd: str, args: list[str]) -> str:
     if cmd in ("/help", "/start_help"):
         return (
             "Bot control commands:\n"
-            "/start SYMBOL — start DCA supervisor\n"
+            "/start SYMBOL [long|short|auto] [gate] — start DCA supervisor\n"
             "/fib SYMBOL [long|short|auto] — start FIB micro-grid\n"
             "/stop SYMBOL — stop DCA and/or FIB (orders & position stay)\n"
             "/status SYMBOL — process + trading state\n"
@@ -84,6 +84,7 @@ def handle_command(cmd: str, args: list[str]) -> str:
             "/sweep [SYMBOL] — cancel orphan bot limits/algos when flat\n"
             "/review SYMBOL — DeepSeek situational review\n"
             "/list — all running bots\n"
+            "gate: SHORT only if mid>gate · LONG only if mid<gate\n"
             f"Backend: {backend}"
         )
 
@@ -105,7 +106,21 @@ def handle_command(cmd: str, args: list[str]) -> str:
             return f"Usage: {cmd} SYMBOL  (e.g. {cmd} SXTUSDT)"
         sym = args[0].upper()
         if action == "start":
-            return botctl.start(sym, backend)
+            direction = None
+            gate = None
+            for tok in args[1:]:
+                low = tok.lower()
+                if low in ("long", "short", "auto"):
+                    direction = low
+                    continue
+                try:
+                    gate = float(tok)
+                except ValueError:
+                    return (
+                        "Usage: /start SYMBOL [long|short|auto] [gate]\n"
+                        "e.g. /start REUSDT short 0.0125"
+                    )
+            return botctl.start(sym, backend, direction=direction, gate_price=gate)
         if action == "stop":
             return botctl.stop(sym, backend)
         return botctl.status(sym, backend)

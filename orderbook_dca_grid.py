@@ -426,6 +426,48 @@ def cancel_all_symbol_orders(symbol: str, api: str, sec: str, recv: int) -> None
     )
 
 
+def gate_price_blocks(
+    gate: float | None,
+    is_long: bool,
+    mid: float,
+    *,
+    verbose: bool = True,
+) -> bool:
+    """True = do not place new orders.
+
+    SHORT: only arm when mid > gate. LONG: only arm when mid < gate.
+    """
+    if gate is None:
+        return False
+    try:
+        g = float(gate)
+    except (TypeError, ValueError):
+        return False
+    if g <= 0 or mid <= 0:
+        return False
+    ok = mid < g if is_long else mid > g
+    if not ok and verbose:
+        side = "LONG" if is_long else "SHORT"
+        need = f"mid < {g:g}" if is_long else f"mid > {g:g}"
+        print(
+            f"{YELLOW}Gate {g:g}: skip {side} "
+            f"(mid {price_fmt(mid)}, need {need}).{RESET}",
+        )
+    return not ok
+
+
+def _live_mid(symbol: str, limit: int = 5) -> float | None:
+    try:
+        depth = fetch_depth(symbol, limit)
+        bids = depth.get("bids") or []
+        asks = depth.get("asks") or []
+        if not bids or not asks:
+            return None
+        return (float(bids[0][0]) + float(asks[0][0])) / 2
+    except Exception:
+        return None
+
+
 def cancel_dca_grid_orders(symbol: str, api: str, sec: str, recv: int) -> int:
     """Cancel obdca* limit orders (entry + DCA safety grid)."""
     sym = symbol.upper()
@@ -1156,6 +1198,9 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
     else:
         is_long = dir_choice == "long"
 
+    if gate_price_blocks(getattr(args, "gate_price", None), is_long, mid, verbose=verbose):
+        return False
+
     entry = args.price if args.price is not None else mid
     base_size = args.base_size
     if base_size <= 0:
@@ -1321,8 +1366,17 @@ def supervise_loop(args: argparse.Namespace) -> None:
     hedge = _resolve_hedge(args, api, sec)
     exit_mode = resolve_exit_mode(args)
     ttl_note = f", grid refresh {args.grid_ttl:g}s" if args.grid_ttl > 0 else ""
+    gate = getattr(args, "gate_price", None)
+    gate_note = ""
+    if gate is not None and float(gate) > 0:
+        if args.direction == "short":
+            gate_note = f", gate mid>{float(gate):g}"
+        elif args.direction == "long":
+            gate_note = f", gate mid<{float(gate):g}"
+        else:
+            gate_note = f", gate {float(gate):g} (long mid< · short mid>)"
     print(f"\n{BOLD}{CYAN}Supervising {args.symbol.upper()} "
-          f"(auto re-arm grid + exit: {exit_mode_label(exit_mode)}, poll {args.tp_poll_sec:g}s{ttl_note}). "
+          f"(auto re-arm grid + exit: {exit_mode_label(exit_mode)}, poll {args.tp_poll_sec:g}s{ttl_note}{gate_note}). "
           f"Ctrl+C to stop.{RESET}")
     import telegram_notify as telegram
     import trade_sounds
@@ -1538,6 +1592,36 @@ def supervise_loop(args: argparse.Namespace) -> None:
                                 print(f"{RED}Cancel leftover DCA failed: {exc}{RESET}")
                             else:
                                 oo = []
+                        # Armed flat grid past the gate → cancel so it cannot fill.
+                        if oo and getattr(args, "gate_price", None):
+                            mid_now = _live_mid(sym, min(int(args.limit), 20))
+                            if mid_now is not None:
+                                if args.direction == "auto":
+                                    try:
+                                        depth = fetch_depth(sym, min(int(args.limit), 100))
+                                        b = [[float(p), float(q)] for p, q in depth["bids"]]
+                                        a = [[float(p), float(q)] for p, q in depth["asks"]]
+                                        d = decide_direction(b, a, mid_now, args.auto_range)
+                                        side_long = d["direction"] == "long"
+                                    except Exception:
+                                        side_long = None
+                                else:
+                                    side_long = args.direction == "long"
+                                if side_long is not None and gate_price_blocks(
+                                    args.gate_price, side_long, mid_now, verbose=False,
+                                ):
+                                    armed_log_state = None
+                                    print(
+                                        f"{YELLOW}Gate {float(args.gate_price):g}: mid "
+                                        f"{price_fmt(mid_now)} out of range → cancelling armed grid…{RESET}",
+                                    )
+                                    try:
+                                        cancel_dca_grid_orders(sym, api, sec, args.recv_window)
+                                    except Exception as exc:
+                                        print(f"{RED}Gate cancel failed: {exc}{RESET}")
+                                    else:
+                                        oo = []
+                                    sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
                         if oo:
                             state = f"armed:{len(oo)}"
                             if state != armed_log_state:
@@ -1616,6 +1700,16 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_optional_float(name: str) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name, "")
     if not raw:
@@ -1646,6 +1740,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="DCA grid anchored to real order-book walls")
     p.add_argument("symbol", nargs="?", default=None, help="Symbol, e.g. MORPHOUSDT")
     p.add_argument("--price", type=float, default=None, help="Entry price (default: live mid)")
+    p.add_argument(
+        "--gate-price",
+        type=float,
+        default=_env_optional_float("GATE_PRICE"),
+        help="Optional: only place/re-arm when mid is on the trade side of this price — "
+             "SHORT if mid > gate, LONG if mid < gate. Env: GATE_PRICE",
+    )
     p.add_argument("--direction", choices=["long", "short", "auto"], default=_env_direction(),
                    help="auto = decide from bid/ask imbalance in the book (Env: DIRECTION)")
     p.add_argument("--auto-range", type=float, default=1.0, help="%% band around mid for auto-direction imbalance")
@@ -1971,6 +2072,9 @@ def main() -> None:
               f"· bid share {d['imbalance']*100:.1f}%){RESET}")
     else:
         is_long = args.direction == "long"
+
+    if gate_price_blocks(args.gate_price, is_long, mid):
+        return
 
     entry = args.price if args.price is not None else mid
 

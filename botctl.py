@@ -300,12 +300,25 @@ def list_running(backend: str | None = None) -> list[str]:
     return sorted(out)
 
 
-def start(symbol: str, backend: str | None = None, direction: str | None = None) -> str:
+def start(
+    symbol: str,
+    backend: str | None = None,
+    direction: str | None = None,
+    gate_price: float | None = None,
+) -> str:
     sym = symbol.upper()
     backend = backend or detect_backend()
     dir_arg = (direction or "").lower()
     if dir_arg and dir_arg not in ("long", "short", "auto"):
         dir_arg = ""
+    gate: float | None = None
+    if gate_price is not None:
+        try:
+            gate = float(gate_price)
+        except (TypeError, ValueError):
+            gate = None
+        if gate is not None and gate <= 0:
+            gate = None
     allow = allowed_symbols()
     if allow is not None and sym not in allow:
         return f"⛔ {sym} is not in FUTURES_PAIRS."
@@ -320,7 +333,13 @@ def start(symbol: str, backend: str | None = None, direction: str | None = None)
             if proc.returncode != 0:
                 err = (proc.stderr or proc.stdout or "systemctl failed").strip()
                 return f"❌ Could not start {sym}: {err}"
-        return f"▶️ {sym} supervisor started (systemd). Position and orders unchanged."
+        note = ""
+        if gate is not None:
+            note = (
+                f"\n⚠️ systemd start ignores --gate-price; set GATE_PRICE in the unit env "
+                f"or use pidfile backend."
+            )
+        return f"▶️ {sym} supervisor started (systemd). Position and orders unchanged.{note}"
 
     if not GRID_SCRIPT.is_file():
         return f"❌ Cannot find {GRID_SCRIPT.name}."
@@ -333,6 +352,8 @@ def start(symbol: str, backend: str | None = None, direction: str | None = None)
     ]
     if dir_arg:
         cmd.extend(["--direction", dir_arg])
+    if gate is not None:
+        cmd.extend(["--gate-price", str(gate)])
 
     with open(log, "a", encoding="utf-8") as logfh:
         logfh.write(f"\n--- start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
@@ -348,8 +369,12 @@ def start(symbol: str, backend: str | None = None, direction: str | None = None)
     if proc.poll() is not None:
         pid_file.unlink(missing_ok=True)
         return f"❌ {sym} exited on start — check {log}"
-    return f"▶️ {sym} supervisor started (pid {proc.pid}). Position and orders unchanged."
-
+    gate_txt = f" gate={gate:g}" if gate is not None else ""
+    dir_txt = f" {dir_arg}" if dir_arg else ""
+    return (
+        f"▶️ {sym} supervisor started (pid {proc.pid}){dir_txt}{gate_txt}. "
+        f"Position and orders unchanged."
+    )
 
 def stop(symbol: str, backend: str | None = None) -> str:
     sym = symbol.upper()
@@ -810,7 +835,13 @@ def parse_args() -> argparse.Namespace:
         choices=["start", "stop", "status", "cleanup", "sweep", "list", "running", "fib", "fib-stop"],
     )
     p.add_argument("symbol", nargs="?", help="Symbol e.g. SXTUSDT (optional for sweep)")
-    p.add_argument("direction", nargs="?", help="For fib: long|short|auto")
+    p.add_argument("direction", nargs="?", help="For start/fib: long|short|auto")
+    p.add_argument(
+        "--gate-price",
+        type=float,
+        default=None,
+        help="For start: only arm SHORT if mid>price, LONG if mid<price",
+    )
     p.add_argument("--backend", choices=["auto", "systemd", "pidfile"], default="auto")
     return p.parse_args()
 
@@ -827,7 +858,11 @@ def main() -> None:
         sys.exit(1)
 
     if args.command == "start":
-        print(start(args.symbol, backend))
+        print(start(
+            args.symbol, backend,
+            direction=args.direction,
+            gate_price=args.gate_price,
+        ))
     elif args.command == "stop":
         print(stop(args.symbol, backend))
     elif args.command == "fib":
