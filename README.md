@@ -54,6 +54,7 @@ trade-binance-websocket-orderbook-dca-grid/
 └── deploy/
     ├── dca-futures@.service       # Futures supervisor (--supervise)
     ├── dca-telegram-ctl.service   # Telegram start/stop/status daemon
+    ├── dca-api.service            # HTTP API for Orderbook Trading (Flutter)
     ├── dca-futures-tp@.service    # Futures: trailing TP only (--tp-only)
     ├── dca-staged-exit@.service   # Legacy — do not use with dca-futures@
     ├── dca-spot@.service
@@ -89,19 +90,30 @@ API_PORT=8787
 ```
 
 ```bash
+# Local / foreground
 python3 api_server.py
-# GET  /health
-# GET  /scan                    # Hot / Gainers / Losers (Bearer token)
-# GET  /scan/BTCUSDT
-# GET  /positions               # open Futures positions + PnL
-# GET  /chart/SYMBOL            # candles + OPEN/LIMIT/TP/SL levels
-# GET  /bots · GET /bots/SYMBOL
-# POST /bots/SYMBOL/start       # JSON: {direction, gate_price?, dry_run?}
-# POST /bots/SYMBOL/stop
+
+# Production (systemd) — once
+sudo cp deploy/dca-api.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dca-api
+sudo systemctl status dca-api
+sudo journalctl -u dca-api -f
+```
+
+```text
+GET  /health
+GET  /scan                    # Hot / Gainers / Losers (Bearer token)
+GET  /scan/BTCUSDT
+GET  /positions               # open Futures positions + PnL
+GET  /chart/SYMBOL            # candles + OPEN/LIMIT/TP/SL levels
+GET  /bots · GET /bots/SYMBOL
+POST /bots/SYMBOL/start       # JSON: {direction, gate_price?, dry_run?}
+POST /bots/SYMBOL/stop
 ```
 
 Local Chrome/simulator: app Settings → `http://127.0.0.1:8787` + the same token.  
-Physical iPhone: use the Mac LAN IP. VPS later: same server behind HTTPS; only change the app URL.
+Physical iPhone: use the Mac LAN IP. VPS: `http://SERVER_IP:8787` (open firewall) or prefer HTTPS reverse proxy; only change the app URL.
 
 Preview without sending orders:
 
@@ -462,11 +474,15 @@ python3 orderbook_dca_grid.py BTCUSDT --dry-run
 
 # 4. Install systemd units (once)
 sudo cp deploy/dca-futures@.service deploy/dca-spot@.service \
-        deploy/dca-telegram-ctl.service /etc/systemd/system/
+        deploy/dca-telegram-ctl.service deploy/dca-api.service \
+        /etc/systemd/system/
 sudo systemctl daemon-reload
 
 # 5. Start Telegram remote control (optional)
 sudo systemctl enable --now dca-telegram-ctl
+
+# 5b. Start Orderbook Trading API (Flutter)
+sudo systemctl enable --now dca-api
 
 # 6. Start trading fleet from FUTURES_PAIRS
 python3 deploy/sync_pairs.py --dry-run
@@ -480,9 +496,10 @@ What to run after each type of change:
 
 | Situation | Commands |
 |-----------|----------|
-| **First install** | Steps above (units + `sync_pairs.py` + optional `dca-telegram-ctl`) |
+| **First install** | Steps above (units + `sync_pairs.py` + optional `dca-telegram-ctl` / `dca-api`) |
 | **Code update** (`git pull`) | `git pull` then `python3 deploy/sync_pairs.py --restart` |
 | **Telegram ctl code only** | `sudo systemctl restart dca-telegram-ctl` |
+| **API code / `.env` API_* only** | `sudo systemctl restart dca-api` |
 | **`.env` changed (same pairs)** | `sync_pairs.py --restart` (reload config in running bots) |
 | **Add/remove symbol in `FUTURES_PAIRS`** | Edit `.env`, then `python3 deploy/sync_pairs.py` (starts new, stops removed) |
 | **One symbol manually** | Telegram `/start SYMBOL` or `/stop SYMBOL` |
@@ -496,6 +513,7 @@ cd /opt/trade-binance-websocket-orderbook-dca-grid
 git checkout dev && git pull
 python3 deploy/sync_pairs.py --restart
 sudo systemctl restart dca-telegram-ctl
+sudo systemctl restart dca-api
 ```
 
 ### systemd units
@@ -504,6 +522,7 @@ sudo systemctl restart dca-telegram-ctl
 |------|---------|----------|
 | `dca-futures@SYMBOL` | `--supervise` | **Main bot**: grid + staged exit (defaults from `.env`/code) |
 | `dca-telegram-ctl` | `telegram_botctl.py` | Telegram `/start` `/stop` `/status` (24/7) |
+| `dca-api` | `api_server.py` | HTTP API for Orderbook Trading Flutter app (`:8787`) |
 | `dca-futures-tp@SYMBOL` | `--tp-only` | Exit only (manual/other entry) |
 | `dca-spot@SYMBOL` | `--supervise` | Spot grid + OCO |
 
