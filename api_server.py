@@ -24,6 +24,7 @@ from orderbook_dca_grid import (  # noqa: E402
     _signed_request,
     load_env_file,
     load_keys,
+    preview_grid_payload,
 )
 
 SYM_RE = re.compile(r"^[A-Z0-9]{4,32}$")
@@ -471,32 +472,6 @@ def _normalize_symbol(raw: str) -> str | None:
     return sym
 
 
-def _dry_run_preview(symbol: str, direction: str | None) -> str:
-    cmd = [
-        sys.executable,
-        "-u",
-        str(ROOT / "orderbook_dca_grid.py"),
-        symbol,
-        "--dry-run",
-        "--recv-window",
-        os.getenv("RECV_WINDOW", "15000"),
-    ]
-    if direction:
-        cmd.extend(["--direction", direction])
-    proc = subprocess.run(
-        cmd,
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    out = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
-    out = out.strip()
-    if proc.returncode != 0:
-        return f"❌ Dry-run failed (exit {proc.returncode}).\n{out or '(no output)'}"
-    return out or "Dry-run completed (no output)."
-
-
 class Handler(BaseHTTPRequestHandler):
     server_version = "OrderbookTradingAPI/1.0"
 
@@ -761,11 +736,27 @@ class Handler(BaseHTTPRequestHandler):
         dry_run = bool(body.get("dry_run", False))
 
         if dry_run:
-            msg = _dry_run_preview(sym, direction)
+            preview = preview_grid_payload(
+                sym, direction=direction, gate_price=gate_price,
+            )
+            ok = bool(preview.get("ok"))
             _json_response(
                 self,
-                200,
-                {"ok": True, "dry_run": True, "symbol": sym, "message": msg},
+                200 if ok else 400,
+                {
+                    "ok": ok,
+                    "dry_run": True,
+                    "symbol": sym,
+                    "message": preview.get("message")
+                    or preview.get("error")
+                    or "Dry-run preview",
+                    "direction": preview.get("direction"),
+                    "levels": preview.get("levels") or [],
+                    "entry": preview.get("entry"),
+                    "tp_price": preview.get("tp_price"),
+                    "notional": preview.get("notional"),
+                    "dca_count": preview.get("dca_count"),
+                },
             )
             return
 

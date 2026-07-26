@@ -1725,14 +1725,14 @@ def _env_direction(default: str = "auto") -> str:
     return raw if raw in ("long", "short", "auto") else default
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Load .env early so config vars (e.g. WALLET_PCT) can drive the defaults.
     # --env-file is honoured on the second pass inside load_keys().
     env_file = None
-    argv = sys.argv[1:]
-    for i, a in enumerate(argv):
-        if a == "--env-file" and i + 1 < len(argv):
-            env_file = argv[i + 1]
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    for i, a in enumerate(raw_argv):
+        if a == "--env-file" and i + 1 < len(raw_argv):
+            env_file = raw_argv[i + 1]
         elif a.startswith("--env-file="):
             env_file = a.split("=", 1)[1]
     load_env_file(env_file)
@@ -1842,10 +1842,144 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--audit-symbols", default=None,
                    help="With --audit: comma-separated symbols (e.g. LINKUSDT,DOGEUSDT)")
     p.add_argument("--keep-sl", action="store_true", help="Do NOT auto-cancel foreign STOP_MARKET SLs (e.g. Finandy's)")
-    args = p.parse_args()
+    args = p.parse_args(raw_argv)
     # Executes by default; --dry-run flips it off.
     args.execute = not args.dry_run
     return args
+
+
+def preview_grid_payload(
+    symbol: str,
+    *,
+    direction: str | None = None,
+    gate_price: float | None = None,
+) -> dict:
+    """Dry-run grid as structured levels for the Flutter / TradingView chart."""
+    argv = [symbol.upper(), "--dry-run"]
+    if direction in ("long", "short", "auto"):
+        argv.extend(["--direction", direction])
+    args = parse_args(argv)
+    if gate_price is not None and gate_price > 0:
+        args.gate_price = float(gate_price)
+
+    try:
+        depth = fetch_depth(args.symbol, args.limit)
+    except Exception as exc:
+        return {"ok": False, "error": f"Depth fetch failed: {exc}", "levels": []}
+
+    bids = [[float(p), float(q)] for p, q in depth["bids"]]
+    asks = [[float(p), float(q)] for p, q in depth["asks"]]
+    if not bids or not asks:
+        return {"ok": False, "error": "Empty order book", "levels": []}
+
+    mid = (bids[0][0] + asks[0][0]) / 2
+    if args.direction == "auto":
+        d = decide_direction(bids, asks, mid, args.auto_range)
+        args.direction = d["direction"]
+        is_long = d["direction"] == "long"
+        book_note = f"auto→{args.direction.upper()} (bid {d['bid_vol']:,.0f} / ask {d['ask_vol']:,.0f})"
+    else:
+        is_long = args.direction == "long"
+        book_note = args.direction.upper()
+
+    if gate_price_blocks(args.gate_price, is_long, mid, verbose=False):
+        return {
+            "ok": False,
+            "error": "Gate blocks this direction at current mid",
+            "direction": args.direction,
+            "mid": mid,
+            "levels": [],
+        }
+
+    entry = args.price if args.price is not None else mid
+    api, sec = load_keys(args.env_file)
+    if args.base_size <= 0:
+        if not api or not sec:
+            return {"ok": False, "error": "API keys required to size from wallet %", "levels": []}
+        try:
+            bal = get_wallet_balance(api, sec, args.recv_window)
+            args.base_size = bal * args.wallet_pct / 100.0
+        except Exception as exc:
+            return {"ok": False, "error": f"Wallet balance failed: {exc}", "levels": []}
+
+    if not args.no_max_leverage and args.set_leverage <= 0 and api and sec:
+        try:
+            args.leverage = get_max_leverage(args.symbol, api, sec, args.recv_window)
+        except Exception:
+            pass
+
+    book_side = bids if is_long else asks
+    walls = select_walls(
+        book_side, entry, is_long, args.so_count, args.min_gap, args.min_dist, args.max_range,
+    )
+    if not walls:
+        return {
+            "ok": False,
+            "error": "No qualifying walls found",
+            "direction": args.direction,
+            "mid": mid,
+            "levels": [],
+        }
+
+    orders = build_grid(
+        entry,
+        is_long,
+        walls,
+        args.base_size,
+        args.tp,
+        args.size_mode,
+        args.comp_factor,
+        args.so_size,
+        args.volume_scale,
+    )
+
+    levels: list[dict] = []
+    for o in orders:
+        name = str(o.get("name") or "")
+        price = float(o.get("price") or 0)
+        if price <= 0:
+            continue
+        if name.startswith("Base") or name.upper() == "ENTRY":
+            kind, label, color = "preview_entry", "ENTRY", "#c084fc"
+        else:
+            kind, label, color = "preview_dca", name.upper().replace(" ", ""), "#58a6ff"
+        levels.append({"kind": kind, "label": label, "price": price, "color": color})
+
+    tp_price = float(orders[-1].get("tp") or 0)
+    if tp_price > 0:
+        levels.append(
+            {"kind": "preview_tp", "label": "TP", "price": tp_price, "color": "#3fb950"}
+        )
+
+    if args.gate_price is not None and float(args.gate_price) > 0:
+        levels.append(
+            {
+                "kind": "preview_gate",
+                "label": "GATE",
+                "price": float(args.gate_price),
+                "color": "#f472b6",
+            }
+        )
+
+    full_notional = float(orders[-1].get("cum_usdt") or 0)
+    n_dca = max(0, len(orders) - 1)
+    summary = (
+        f"Preview {book_note} · {n_dca} DCA · "
+        f"grid {full_notional:,.2f} USDT · TP {args.tp:g}% from avg"
+    )
+    return {
+        "ok": True,
+        "symbol": args.symbol.upper(),
+        "direction": args.direction,
+        "mid": mid,
+        "entry": entry,
+        "leverage": float(args.leverage or 0),
+        "dca_count": n_dca,
+        "notional": full_notional,
+        "tp_price": tp_price,
+        "message": summary,
+        "levels": levels,
+    }
 
 
 def _parse_symbol_list(raw: str) -> list[str]:
