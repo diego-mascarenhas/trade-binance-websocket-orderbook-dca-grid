@@ -273,6 +273,85 @@ def print_table(title: str, rows: list[TickerRow], insights: dict[str, SymbolIns
         )
 
 
+VALID_SECTIONS = frozenset({"gainers", "losers", "hots", "volatile"})
+
+
+def ticker_row_dict(t: TickerRow) -> dict:
+    return {
+        "symbol": t.symbol,
+        "last": t.last,
+        "change_pct": t.change_pct,
+        "quote_volume": t.quote_volume,
+        "high": t.high,
+        "low": t.low,
+        "trades": t.trades,
+        "range_pct": t.range_pct,
+    }
+
+
+def insight_dict(ins: SymbolInsight) -> dict:
+    return asdict(ins)
+
+
+def scan_sections(
+    *,
+    base: str = FAPI_BASE,
+    top: int = 15,
+    min_volume: float = 5_000_000,
+    sections: set[str] | None = None,
+    with_trend: bool = False,
+) -> dict[str, list[dict]]:
+    """Return Hot / Gainers / Losers (and optional volatile) as JSON-ready dicts."""
+    base = base.rstrip("/")
+    wanted = sections or {"gainers", "losers", "hots"}
+    wanted = {s.strip().lower() for s in wanted if s and s.strip()}
+    bad = wanted - VALID_SECTIONS
+    if bad:
+        raise ValueError(f"Unknown section(s): {', '.join(sorted(bad))}")
+
+    allowed = trading_usdt_perps(base)
+    tickers = fetch_tickers(base, allowed)
+    liquid = [t for t in tickers if t.quote_volume >= min_volume]
+    n = max(int(top), 0)
+    buckets: dict[str, list[TickerRow]] = {
+        "gainers": sorted(liquid, key=lambda t: t.change_pct, reverse=True)[:n],
+        "losers": sorted(liquid, key=lambda t: t.change_pct)[:n],
+        "hots": sorted(liquid, key=lambda t: t.quote_volume, reverse=True)[:n],
+        "volatile": sorted(liquid, key=lambda t: t.range_pct, reverse=True)[:n],
+    }
+
+    insights: dict[str, SymbolInsight] = {}
+    if with_trend:
+        seen: set[str] = set()
+        for key in wanted:
+            for r in buckets[key]:
+                if r.symbol in seen:
+                    continue
+                seen.add(r.symbol)
+                try:
+                    insights[r.symbol] = build_insight(base, r.symbol, r)
+                except urllib.error.URLError:
+                    pass
+
+    def row_json(t: TickerRow) -> dict:
+        if t.symbol in insights:
+            return insight_dict(insights[t.symbol])
+        return ticker_row_dict(t)
+
+    out: dict[str, list[dict]] = {}
+    for key in ("gainers", "losers", "hots", "volatile"):
+        if key in wanted:
+            out[key] = [row_json(t) for t in buckets[key]]
+    return out
+
+
+def symbol_insight_json(symbol: str, *, base: str = FAPI_BASE) -> dict:
+    """Build a single-symbol insight as a JSON-ready dict."""
+    base = base.rstrip("/")
+    sym = symbol.upper()
+    return insight_dict(build_insight(base, sym))
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Binance USDT-M futures: gainers, losers, hots, volatility & trend.",
@@ -311,12 +390,27 @@ def main() -> None:
         return
 
     sections = {s.strip().lower() for s in args.sections.split(",") if s.strip()}
-    valid = {"gainers", "losers", "hots", "volatile"}
-    bad = sections - valid
-    if bad:
-        print(f"Unknown section(s): {', '.join(sorted(bad))}", file=sys.stderr)
+    try:
+        out_data = scan_sections(
+            base=base,
+            top=args.top,
+            min_volume=args.min_volume,
+            sections=sections,
+            with_trend=args.with_trend,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as exc:
+        print(f"{RED}API error: {exc}{RESET}", file=sys.stderr)
         sys.exit(1)
 
+    if args.json:
+        print(json.dumps(out_data, indent=2))
+        return
+
+    # Rebuild ticker rows for pretty tables from the JSON payload is awkward;
+    # re-fetch buckets for display when not using --json.
     try:
         allowed = trading_usdt_perps(base)
         tickers = fetch_tickers(base, allowed)
@@ -325,38 +419,22 @@ def main() -> None:
         sys.exit(1)
 
     liquid = [t for t in tickers if t.quote_volume >= args.min_volume]
-    gainers = sorted(liquid, key=lambda t: t.change_pct, reverse=True)[: max(args.top, 0)]
-    losers = sorted(liquid, key=lambda t: t.change_pct)[: max(args.top, 0)]
-    hots = sorted(liquid, key=lambda t: t.quote_volume, reverse=True)[: max(args.top, 0)]
-    volatile = sorted(liquid, key=lambda t: t.range_pct, reverse=True)[: max(args.top, 0)]
+    n = max(args.top, 0)
+    gainers = sorted(liquid, key=lambda t: t.change_pct, reverse=True)[:n]
+    losers = sorted(liquid, key=lambda t: t.change_pct)[:n]
+    hots = sorted(liquid, key=lambda t: t.quote_volume, reverse=True)[:n]
+    volatile = sorted(liquid, key=lambda t: t.range_pct, reverse=True)[:n]
 
     insights: dict[str, SymbolInsight] = {}
     if args.with_trend:
-        seen: set[str] = set()
         for bucket in (gainers, losers, hots, volatile):
             for r in bucket:
-                if r.symbol in seen:
+                if r.symbol in insights:
                     continue
-                seen.add(r.symbol)
                 try:
                     insights[r.symbol] = build_insight(base, r.symbol, r)
                 except urllib.error.URLError:
                     pass
-
-    if args.json:
-        def row_json(t: TickerRow) -> dict:
-            return asdict(insights[t.symbol]) if t.symbol in insights else t.__dict__
-        out: dict = {}
-        if "gainers" in sections:
-            out["gainers"] = [row_json(t) for t in gainers]
-        if "losers" in sections:
-            out["losers"] = [row_json(t) for t in losers]
-        if "hots" in sections:
-            out["hots"] = [row_json(t) for t in hots]
-        if "volatile" in sections:
-            out["volatile"] = [row_json(t) for t in volatile]
-        print(json.dumps(out, indent=2))
-        return
 
     print(f"{BOLD}Binance USDT-M Futures · 24h scan{RESET}")
     print(f"{DIM}Range% = volatility · fscan SYMBOL = live trend + book{RESET}")

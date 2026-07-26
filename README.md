@@ -41,6 +41,8 @@ trade-binance-websocket-orderbook-dca-grid/
 ├── obmicro-grid                 # Same bot, flags passthrough
 ├── dca                          # Short wrapper → DCA supervise
 ├── botctl.py                    # CLI: start/stop/status/fib per symbol
+├── api_server.py                # HTTP API for Orderbook Trading (Flutter)
+├── futures_scan.py              # Hot / Gainers / Losers scanner (+ JSON helpers)
 ├── telegram_botctl.py           # Telegram remote control (/start /fib /stop)
 ├── telegram_notify.py           # Telegram alerts (DCA + #FIB)
 ├── OBMICRO_GRID_COMMANDS.md     # Fib micro-grid full guide
@@ -75,6 +77,31 @@ chmod 600 .env
 ```
 
 Keys are read from environment variables first, then `.env` (cwd or next to the script). No `pip install` is required to run.
+
+### Orderbook Trading API (Flutter / iOS)
+
+HTTP control plane for the sibling Flutter app (`../orderbook_trading`). Add to `.env`:
+
+```env
+API_TOKEN=change-me-to-a-long-secret
+API_HOST=0.0.0.0
+API_PORT=8787
+```
+
+```bash
+python3 api_server.py
+# GET  /health
+# GET  /scan                    # Hot / Gainers / Losers (Bearer token)
+# GET  /scan/BTCUSDT
+# GET  /positions               # open Futures positions + PnL
+# GET  /chart/SYMBOL            # candles + OPEN/LIMIT/TP/SL levels
+# GET  /bots · GET /bots/SYMBOL
+# POST /bots/SYMBOL/start       # JSON: {direction, gate_price?, dry_run?}
+# POST /bots/SYMBOL/stop
+```
+
+Local Chrome/simulator: app Settings → `http://127.0.0.1:8787` + the same token.  
+Physical iPhone: use the Mac LAN IP. VPS later: same server behind HTTPS; only change the app URL.
 
 Preview without sending orders:
 

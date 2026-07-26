@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import signal
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 RUN_DIR = ROOT / ".run" / "pids"
@@ -185,12 +188,27 @@ def _pid_alive(pid: int) -> bool:
 def _pgrep_supervisors() -> list[str]:
     """Fallback when systemctl list is empty but python supervisors are running."""
     try:
-        proc = subprocess.run(["pgrep", "-af", "orderbook_dca_grid.py"], text=True, capture_output=True)
+        proc = subprocess.run(
+            ["pgrep", "-f", "orderbook_dca_grid.py"],
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return []
+    pids = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip().isdigit()]
+    if not pids:
+        return []
+    try:
+        ps = subprocess.run(
+            ["ps", "-p", ",".join(pids), "-ww", "-o", "args="],
+            text=True,
+            capture_output=True,
+        )
     except FileNotFoundError:
         return []
     found: list[str] = []
-    for line in proc.stdout.splitlines():
-        if "--supervise" not in line:
+    for line in ps.stdout.splitlines():
+        if "--supervise" not in line or "orderbook_dca_grid.py" not in line:
             continue
         parts = line.split()
         for i, part in enumerate(parts):
@@ -211,9 +229,196 @@ def _pid_path(symbol: str) -> Path:
     return RUN_DIR / f"{symbol.upper()}.pid"
 
 
+def _meta_path(symbol: str) -> Path:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    return RUN_DIR / f"{symbol.upper()}.meta.json"
+
+
 def _log_path(symbol: str) -> Path:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     return LOG_DIR / f"{symbol.upper()}.log"
+
+
+def write_run_meta(
+    symbol: str,
+    *,
+    direction: str | None = None,
+    gate_price: float | None = None,
+    gate_enabled: bool | None = None,
+    clear_gate: bool = False,
+) -> dict[str, Any]:
+    """Persist start args so the app can restore Gate / direction after reopen."""
+    sym = symbol.upper()
+    path = _meta_path(sym)
+    payload: dict[str, Any] = {}
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                payload.update(raw)
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    payload["symbol"] = sym
+    payload["updated_at"] = int(time.time())
+    dir_arg = (direction or "").lower()
+    if dir_arg in ("long", "short", "auto"):
+        payload["direction"] = dir_arg
+    if clear_gate:
+        payload.pop("gate_price", None)
+        payload["gate_enabled"] = False
+    elif gate_price is not None:
+        try:
+            g = float(gate_price)
+        except (TypeError, ValueError):
+            g = None
+        if g is not None and g > 0:
+            payload["gate_price"] = g
+            payload["gate_enabled"] = True if gate_enabled is None else bool(gate_enabled)
+    if gate_enabled is not None and not clear_gate:
+        payload["gate_enabled"] = bool(gate_enabled)
+        if not payload["gate_enabled"]:
+            payload.pop("gate_price", None)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def clear_run_meta(symbol: str) -> None:
+    _meta_path(symbol).unlink(missing_ok=True)
+
+
+def _parse_gate_direction_from_cmdline(cmdline: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    m = re.search(r"--gate-price[= ]+(\S+)", cmdline)
+    if m:
+        try:
+            g = float(m.group(1))
+            if g > 0:
+                out["gate_price"] = g
+        except ValueError:
+            pass
+    m = re.search(r"--direction[= ]+(\w+)", cmdline)
+    if m:
+        d = m.group(1).lower()
+        if d in ("long", "short", "auto"):
+            out["direction"] = d
+    return out
+
+
+def _cmdline_for_symbol(symbol: str) -> str:
+    """Best-effort cmdline of a running orderbook_dca_grid.py for symbol.
+
+    macOS `pgrep -af` often returns only PIDs, so resolve args via `ps`.
+    """
+    pids = _pgrep_pids(symbol)
+    if not pids:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", ",".join(str(p) for p in pids), "-ww", "-o", "args="],
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return ""
+    for line in proc.stdout.splitlines():
+        if "orderbook_dca_grid.py" in line:
+            return line.strip()
+    return ""
+
+
+def run_meta(symbol: str) -> dict[str, Any]:
+    """Return saved/inferred supervisor config: direction, gate_price, gate_enabled."""
+    sym = symbol.upper()
+    meta: dict[str, Any] = {"symbol": sym}
+    path = _meta_path(sym)
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                meta.update(raw)
+        except (OSError, json.JSONDecodeError):
+            pass
+    # Fill gaps from live process cmdline (covers bots started before meta existed).
+    # Do not resurrect a gate the user explicitly cleared.
+    if meta.get("gate_enabled") is not False:
+        parsed = _parse_gate_direction_from_cmdline(_cmdline_for_symbol(sym))
+        for k, v in parsed.items():
+            meta.setdefault(k, v)
+        if "gate_price" in meta and "gate_enabled" not in meta:
+            meta["gate_enabled"] = True
+    return meta
+
+
+def _gates_match(a: float | None, b: float | None) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    return abs(float(a) - float(b)) <= max(1e-12, abs(float(a)) * 1e-9)
+
+
+def apply_gate_config(
+    symbol: str,
+    *,
+    direction: str | None = None,
+    gate_price: float | None = None,
+    gate_enabled: bool = False,
+    restart_if_running: bool = True,
+) -> str:
+    """Persist gate/direction; restart live supervisor only when args actually change."""
+    sym = symbol.upper()
+    dir_arg = (direction or "").lower()
+    if dir_arg and dir_arg not in ("long", "short", "auto"):
+        dir_arg = ""
+
+    if gate_enabled:
+        if gate_price is None:
+            return "❌ Activate gate requires a positive gate_price."
+        try:
+            g = float(gate_price)
+        except (TypeError, ValueError):
+            return "❌ Invalid gate_price."
+        if g <= 0:
+            return "❌ gate_price must be > 0."
+        write_run_meta(sym, direction=dir_arg or None, gate_price=g, gate_enabled=True)
+        gate_for_start: float | None = g
+    else:
+        write_run_meta(sym, direction=dir_arg or None, clear_gate=True)
+        gate_for_start = None
+
+    saved = (
+        f"✅ Gate saved @ {gate_for_start:g}{f' ({dir_arg})' if dir_arg else ''}."
+        if gate_enabled
+        else "✅ Gate cleared."
+    )
+
+    if not restart_if_running or not is_running(sym):
+        # Activate alone never auto-starts a stopped bot — use Start for that.
+        return saved
+
+    live = _parse_gate_direction_from_cmdline(_cmdline_for_symbol(sym))
+    live_gate = live.get("gate_price")
+    live_dir = (live.get("direction") or "").lower()
+    want_dir = dir_arg or live_dir or "auto"
+    same_gate = _gates_match(live_gate, gate_for_start)
+    same_dir = (not dir_arg) or (live_dir == dir_arg) or (live_dir == want_dir and not dir_arg)
+    if same_gate and same_dir:
+        return f"{saved} Supervisor already running with this config."
+
+    # Restart supervisor with the new gate (stop keeps meta).
+    stop_msg = stop(sym, clear_meta=False)
+    for _ in range(10):
+        if not is_running(sym):
+            break
+        time.sleep(0.2)
+    start_msg = start(sym, direction=dir_arg or None, gate_price=gate_for_start)
+    time.sleep(0.4)
+    if not is_running(sym):
+        return (
+            f"{stop_msg}\n{start_msg}\n"
+            f"❌ {sym} did not stay running after applying gate — check logs."
+        )
+    return f"{saved}\n{stop_msg}\n{start_msg}"
 
 
 def is_running(symbol: str, backend: str | None = None) -> bool:
@@ -268,13 +473,17 @@ def list_running(backend: str | None = None) -> list[str]:
         out.extend(sorted(running))
     else:
         RUN_DIR.mkdir(parents=True, exist_ok=True)
+        seen: set[str] = set()
         for path in RUN_DIR.glob("*.pid"):
             stem = path.stem.upper()
             if stem.startswith("FIB-"):
                 continue
-            sym = stem
-            if is_running(sym, "pidfile"):
-                out.append(sym)
+            if is_running(stem, "pidfile"):
+                seen.add(stem)
+        # Also include supervisors started without a pidfile (e.g. via `dca` CLI).
+        for sym in _pgrep_supervisors():
+            seen.add(sym.upper())
+        out.extend(sorted(seen))
     # Fib bots (any backend)
     seen_fib: set[str] = set()
     for path in RUN_DIR.glob("fib-*.pid"):
@@ -333,6 +542,10 @@ def start(
             if proc.returncode != 0:
                 err = (proc.stderr or proc.stdout or "systemctl failed").strip()
                 return f"❌ Could not start {sym}: {err}"
+        if gate is not None:
+            write_run_meta(sym, direction=dir_arg or None, gate_price=gate, gate_enabled=True)
+        else:
+            write_run_meta(sym, direction=dir_arg or None, clear_gate=True)
         note = ""
         if gate is not None:
             note = (
@@ -368,7 +581,12 @@ def start(
     time.sleep(0.4)
     if proc.poll() is not None:
         pid_file.unlink(missing_ok=True)
+        clear_run_meta(sym)
         return f"❌ {sym} exited on start — check {log}"
+    if gate is not None:
+        write_run_meta(sym, direction=dir_arg or None, gate_price=gate, gate_enabled=True)
+    else:
+        write_run_meta(sym, direction=dir_arg or None, clear_gate=True)
     gate_txt = f" gate={gate:g}" if gate is not None else ""
     dir_txt = f" {dir_arg}" if dir_arg else ""
     return (
@@ -376,7 +594,7 @@ def start(
         f"Position and orders unchanged."
     )
 
-def stop(symbol: str, backend: str | None = None) -> str:
+def stop(symbol: str, backend: str | None = None, *, clear_meta: bool = False) -> str:
     sym = symbol.upper()
     backend = backend or detect_backend()
     stopped: list[str] = []
@@ -400,6 +618,8 @@ def stop(symbol: str, backend: str | None = None) -> str:
     pid_file = _pid_path(sym)
     if pid_file.exists():
         pid_file.unlink(missing_ok=True)
+    if clear_meta:
+        clear_run_meta(sym)
 
     fib_pids = _pgrep_fib_pids(sym)
     if fib_pids:
