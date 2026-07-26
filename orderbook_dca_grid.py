@@ -1822,7 +1822,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tp-fee-buffer", type=float, default=0.12, help="Extra profit margin %% (fees+buffer) to stay green")
     p.add_argument("--tp-wall-min-mult", type=float, default=3.0, help="Min wall size vs median book qty to count as a wall")
     p.add_argument("--tp-wall-pick", choices=["nearest", "strongest"], default="nearest", help="Which opposite wall to target")
-    p.add_argument("--tp-poll-sec", type=float, default=5.0, help="Position/TP re-sync interval (manage-tp)")
+    p.add_argument(
+        "--tp-poll-sec",
+        type=float,
+        default=_env_float("TP_POLL_SEC", 15.0),
+        help="Position/TP re-sync interval (supervise / manage-tp). Env: TP_POLL_SEC (default 15)",
+    )
     p.add_argument("--rearm-backoff", type=float, default=_env_float("REARM_BACKOFF", 60.0),
                    help="When flat but a grid can't be armed (imbalance/no walls), wait this "
                         "long before retrying instead of --tp-poll-sec. Env: REARM_BACKOFF")

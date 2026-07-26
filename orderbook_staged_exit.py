@@ -1577,7 +1577,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cancel-dca", action="store_true",
                    help="On takeover: cancel obdca* grid limits (default: keep DCA running)")
     p.add_argument("--limit", type=int, default=100, help="Order book depth limit")
-    p.add_argument("--poll-sec", type=float, default=_env_float("STAGED_POLL_SEC", 5.0))
+    p.add_argument(
+        "--poll-sec",
+        type=float,
+        default=_env_float("STAGED_POLL_SEC", _env_float("TP_POLL_SEC", 15.0)),
+    )
     p.add_argument("--position-mode", choices=["auto", "hedge", "oneway"], default="auto")
     p.add_argument("--recv-window", type=int, default=_env_int("RECV_WINDOW", 15000),
                    help="Binance recvWindow ms. Env: RECV_WINDOW")

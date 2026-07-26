@@ -41,7 +41,10 @@ def _staged_args(grid_args: argparse.Namespace) -> argparse.Namespace:
         sl_wall=False,
         cancel_dca=False,
         limit=getattr(grid_args, "limit", 100),
-        poll_sec=staged._env_float("STAGED_POLL_SEC", 5.0),
+        poll_sec=float(
+            getattr(grid_args, "tp_poll_sec", None)
+            or staged._env_float("STAGED_POLL_SEC", staged._env_float("TP_POLL_SEC", 15.0))
+        ),
         position_mode=getattr(grid_args, "position_mode", "auto"),
         recv_window=getattr(grid_args, "recv_window", 15000),
         env_file=getattr(grid_args, "env_file", None),

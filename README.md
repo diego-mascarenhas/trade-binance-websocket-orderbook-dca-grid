@@ -204,7 +204,8 @@ python3 orderbook_staged_exit.py LINKUSDT
 | `TP1_PROFIT_PCT` | `0.3` | First partial trigger (%) |
 | `BE_PROFIT_PCT` | `0.1` | Runner SL profit lock after TP1 (%) |
 | `TP_PARTIAL_PCT` | `70` | First partial size (%) |
-| `STAGED_POLL_SEC` | `5` | Staged state poll (via grid `--tp-poll-sec` loop) |
+| `TP_POLL_SEC` | `15` | Supervise loop poll (`--tp-poll-sec`); raise if you hit HTTP 429 |
+| `STAGED_POLL_SEC` | *(same as TP_POLL_SEC)* | Staged standalone poll; grid uses `TP_POLL_SEC` |
 
 Add new exit strategies under `exits/` and register them in `exits/__init__.py`.
 
