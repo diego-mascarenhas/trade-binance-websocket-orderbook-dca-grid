@@ -81,6 +81,7 @@ def handle_command(cmd: str, args: list[str]) -> str:
             "/stop SYMBOL — stop DCA and/or FIB (orders & position stay)\n"
             "/status SYMBOL — process + trading state\n"
             "/cleanup SYMBOL — cancel obstage* Stop/TP algos\n"
+            "/sweep [SYMBOL] — cancel orphan bot limits/algos when flat\n"
             "/review SYMBOL — DeepSeek situational review\n"
             "/list — all running bots\n"
             f"Backend: {backend}"
@@ -122,6 +123,10 @@ def handle_command(cmd: str, args: list[str]) -> str:
         if not args:
             return "Usage: /cleanup SYMBOL  (e.g. /cleanup HEIUSDT)"
         return botctl.cleanup(args[0].upper())
+
+    if cmd == "/sweep":
+        sym = args[0].upper() if args else None
+        return botctl.sweep(sym)
 
     return "Unknown command. Try /help"
 

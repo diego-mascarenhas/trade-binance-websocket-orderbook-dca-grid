@@ -579,6 +579,149 @@ def cleanup(symbol: str) -> str:
     return f"{msg}\n\n{body}"
 
 
+def _bot_order_cid(order: dict) -> str:
+    return str(order.get("clientOrderId") or order.get("origClientOrderId") or "")
+
+
+def _bot_algo_cid(order: dict) -> str:
+    return str(
+        order.get("clientAlgoId")
+        or order.get("clientOrderId")
+        or order.get("newClientOrderId")
+        or ""
+    )
+
+
+def _is_our_limit(cid: str) -> bool:
+    """DCA / FIB limit client ids (not scalp)."""
+    return cid.startswith("obdca") or cid.startswith("obmg")
+
+
+def _is_our_algo(cid: str) -> bool:
+    return cid.startswith("obstage") or cid.startswith("obmg")
+
+
+def _symbol_is_flat(symbol: str, api: str, sec: str, recv: int) -> bool:
+    from orderbook_dca_grid import _detect_open_side, _resolve_hedge
+
+    class _A:
+        pass
+
+    args = _A()
+    args.env_file = None
+    args.recv_window = recv
+    args.position_mode = "auto"
+    hedge = _resolve_hedge(args, api, sec)
+    side, _qty, _entry = _detect_open_side(symbol, hedge, api, sec, recv)
+    return side is None
+
+
+def _sweep_symbol(symbol: str, api: str, sec: str, recv: int) -> str:
+    """Cancel bot limits/algos on SYMBOL only if the position is flat."""
+    from orderbook_dca_grid import _signed_request, cancel_dca_grid_orders
+    from orderbook_micro_grid import cancel_our_exits, cancel_our_grid
+    from orderbook_staged_exit import cancel_all_staged_algos
+
+    sym = symbol.upper()
+    if not _symbol_is_flat(sym, api, sec, recv):
+        return f"⏭ {sym}: position open — left orders alone."
+
+    oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, recv) or []
+    our_limits = [o for o in oo if _is_our_limit(_bot_order_cid(o))]
+    try:
+        algos = _signed_request(
+            "GET", "/fapi/v1/openAlgoOrders", {"symbol": sym}, api, sec, recv,
+        ) or []
+    except Exception:
+        algos = []
+    our_algos = [o for o in algos if _is_our_algo(_bot_algo_cid(o))]
+
+    if not our_limits and not our_algos:
+        return f"ℹ️ {sym}: flat, no orphan bot orders."
+
+    n_dca = cancel_dca_grid_orders(sym, api, sec, recv)
+    n_fib = cancel_our_grid(sym, api, sec, recv)
+    n_fib_algo = cancel_our_exits(sym, api, sec, recv)
+    n_stage = cancel_all_staged_algos(sym, api, sec, recv)
+    killed = n_dca + n_fib + n_fib_algo + n_stage
+
+    bits = []
+    if n_dca:
+        bits.append(f"{n_dca} DCA limit(s)")
+    if n_fib:
+        bits.append(f"{n_fib} FIB limit(s)")
+    if n_fib_algo:
+        bits.append(f"{n_fib_algo} FIB algo(s)")
+    if n_stage:
+        bits.append(f"{n_stage} staged algo(s)")
+    detail = ", ".join(bits) if bits else f"{killed} order(s)"
+
+    warn = ""
+    if is_running(sym) or fib_is_running(sym):
+        warn = (
+            f"\n⚠️ Supervisor still running — may re-arm. "
+            f"Use: python3 botctl.py stop {sym}"
+        )
+    return f"🧹 {sym}: flat → cancelled {detail}.{warn}"
+
+
+def sweep(symbol: str | None = None) -> str:
+    """Cancel bot limit/algo orders on flat symbols (orphans after manual close).
+
+    With SYMBOL: only that pair.
+    Without: scan all open orders/algos account-wide.
+    Never cancels when a position is still open.
+    """
+    try:
+        from orderbook_dca_grid import _signed_request, load_keys
+    except ImportError as exc:
+        return f"❌ Could not load bot modules: {exc}"
+
+    api, sec = load_keys(None)
+    if not api or not sec:
+        return "❌ No API keys in .env."
+
+    recv = int(_env("RECV_WINDOW", "15000") or "15000")
+
+    if symbol:
+        try:
+            return _sweep_symbol(symbol.upper(), api, sec, recv)
+        except Exception as exc:
+            return f"❌ Sweep failed for {symbol.upper()}: {exc}"
+
+    # Account-wide: discover symbols that still have our tags.
+    try:
+        oo = _signed_request("GET", "/fapi/v1/openOrders", {}, api, sec, recv) or []
+    except Exception as exc:
+        return f"❌ Could not list open orders: {exc}"
+    try:
+        algos = _signed_request("GET", "/fapi/v1/openAlgoOrders", {}, api, sec, recv) or []
+    except Exception:
+        algos = []
+
+    symbols: set[str] = set()
+    for o in oo:
+        cid = _bot_order_cid(o)
+        if _is_our_limit(cid):
+            symbols.add(str(o.get("symbol", "")).upper())
+    for o in algos:
+        cid = _bot_algo_cid(o)
+        if _is_our_algo(cid):
+            symbols.add(str(o.get("symbol", "")).upper())
+    symbols.discard("")
+
+    if not symbols:
+        return "ℹ️ Sweep: no bot open orders/algos found."
+
+    lines: list[str] = [f"Sweep scan · {len(symbols)} symbol(s) with bot orders:"]
+    for sym in sorted(symbols):
+        try:
+            lines.append(_sweep_symbol(sym, api, sec, recv))
+        except Exception as exc:
+            lines.append(f"❌ {sym}: {exc}")
+    return "\n".join(lines)
+
+
 def trading_status(symbol: str) -> str:
     """Short trading summary for Telegram (no ANSI)."""
     sym = symbol.upper()
@@ -664,9 +807,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Control DCA/FIB bots per symbol (no position close on stop)")
     p.add_argument(
         "command",
-        choices=["start", "stop", "status", "cleanup", "list", "running", "fib", "fib-stop"],
+        choices=["start", "stop", "status", "cleanup", "sweep", "list", "running", "fib", "fib-stop"],
     )
-    p.add_argument("symbol", nargs="?", help="Symbol e.g. SXTUSDT")
+    p.add_argument("symbol", nargs="?", help="Symbol e.g. SXTUSDT (optional for sweep)")
     p.add_argument("direction", nargs="?", help="For fib: long|short|auto")
     p.add_argument("--backend", choices=["auto", "systemd", "pidfile"], default="auto")
     return p.parse_args()
@@ -695,6 +838,8 @@ def main() -> None:
         print(status(args.symbol, backend))
     elif args.command == "cleanup":
         print(cleanup(args.symbol))
+    elif args.command == "sweep":
+        print(sweep(args.symbol))
     elif args.command in ("list", "running"):
         print(list_status(backend))
 
