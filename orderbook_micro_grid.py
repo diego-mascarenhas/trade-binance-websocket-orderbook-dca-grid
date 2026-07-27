@@ -323,9 +323,15 @@ FIB_TP_EXT = 1.272  # extension beyond impulse end (legacy / swing-mode helper)
 FIB_SL_BUF = 0.15   # % beyond swing origin
 FVG_MIN_PCT = 0.08  # min FVG height % (1m majors rarely clear 0.25%)
 # TP after fills: avg = from live average (+ tp_pct net + fees); swing = impulse extreme
+# structure = soft-close when LONG near EQH / SHORT near EQL once already in profit
 TP_MODE_DEFAULT = "avg"
 TP_PCT_DEFAULT = 0.30          # net profit target % (after fees)
 TP_FEE_RT_DEFAULT = 0.08       # approx round-trip fee % added on top of net TP
+STRUCTURE_TP_MODES = frozenset({"structure", "eq", "eqh", "eql", "eqh_eql"})
+
+
+def is_structure_tp_mode(tp_mode: str | None) -> bool:
+    return (tp_mode or "").strip().lower() in STRUCTURE_TP_MODES
 
 
 def _fib_px(swing: SwingImpulse, ratio: float, *, is_long: bool) -> float:
@@ -389,9 +395,12 @@ def resolve_tp_price(
     - ``swing``: always impulse extreme.
     - ``avg`` (default): always ``entry ± (tp_pct + fee_rt)`` — **no Fib cap**.
       ``tp_pct`` is net; fees added via ``fee_rt_pct``. Recalculate on every DCA.
+    - ``structure`` / ``eq``: no exchange TP price (soft-close on EQH/EQL) → ``0``.
     """
     _ = first_fill  # kept for call-site compat; avg always uses live average
     mode = (tp_mode or TP_MODE_DEFAULT).strip().lower()
+    if is_structure_tp_mode(mode):
+        return 0.0
     swing_tp = 0.0
     if plan is not None:
         swing_tp = float(plan.tp_price)
@@ -1759,6 +1768,7 @@ def adopt_existing_position(
             tp, sl = place_exchange_exits(
                 symbol, is_long, qty, entry, mark or entry,
                 tp, sl, filt, hedge, api, sec, recv,
+                skip_tp=is_structure_tp_mode(tp_mode),
             )
             exits_armed = True
             append_journal(
@@ -1844,8 +1854,13 @@ def place_exchange_exits(
     recv: int,
     *,
     fee_buffer_pct: float = 0.04,
+    skip_tp: bool = False,
 ) -> tuple[float, float]:
-    """Arm TAKE_PROFIT_MARKET + STOP_MARKET for current (or planned) qty."""
+    """Arm TAKE_PROFIT_MARKET + STOP_MARKET for current (or planned) qty.
+
+    When ``skip_tp`` (structure TP mode), only the stop is armed — close is
+    done locally when EQH/EQL fires while already in profit.
+    """
     tick = filt["tick_size"]
     step = filt["step_size"]
     price_dp = _dec_places(tick)
@@ -1856,30 +1871,31 @@ def place_exchange_exits(
     qty_str = f"{qty_d:.{qty_dp}f}"
 
     tp, sl = float(tp_price), float(sl_price)
+    place_tp = (not skip_tp) and tp > 0
     # Soft floor: keep TP at least ~1× one-way fee away from entry (gross TP
     # already includes round-trip via resolve_tp_price).
     min_tp = max(fee_buffer_pct, 0.05)
-    if entry > 0 and abs(tp - entry) / entry * 100 < min_tp:
+    if place_tp and entry > 0 and abs(tp - entry) / entry * 100 < min_tp:
         tp = entry * (1 + min_tp / 100) if is_long else entry * (1 - min_tp / 100)
 
     # Nudge off mark
     pad = max(float(tick) * 2, mark * max(fee_buffer_pct, 0.05) / 100.0)
     if is_long:
-        if mark >= tp - pad:
+        if place_tp and mark >= tp - pad:
             tp = mark + pad
         if mark <= sl + pad:
             sl = mark - pad
-        tp_d = _round_to(tp, tick, ROUND_UP)
+        tp_d = _round_to(tp, tick, ROUND_UP) if place_tp else Decimal("0")
         sl_d = _round_to(sl, tick, ROUND_DOWN)
     else:
-        if mark <= tp + pad:
+        if place_tp and mark <= tp + pad:
             tp = mark - pad
         if mark >= sl - pad:
             sl = mark + pad
-        tp_d = _round_to(tp, tick, ROUND_DOWN)
+        tp_d = _round_to(tp, tick, ROUND_DOWN) if place_tp else Decimal("0")
         sl_d = _round_to(sl, tick, ROUND_UP)
 
-    tp_str = f"{tp_d:.{price_dp}f}"
+    tp_str = f"{tp_d:.{price_dp}f}" if place_tp else ""
     sl_str = f"{sl_d:.{price_dp}f}"
     close_side = "SELL" if is_long else "BUY"
 
@@ -1902,11 +1918,17 @@ def place_exchange_exits(
             params["reduceOnly"] = "true"
         return _signed_request("POST", "/fapi/v1/algoOrder", params, api, sec, recv)
 
-    tp_resp = _one("TAKE_PROFIT_MARKET", tp_str, "TP")
-    print(f"{GREEN}✓ Exchange TP {close_side} {qty_str} @ {tp_str} (algoId={tp_resp.get('algoId')}){RESET}")
+    if place_tp:
+        tp_resp = _one("TAKE_PROFIT_MARKET", tp_str, "TP")
+        print(
+            f"{GREEN}✓ Exchange TP {close_side} {qty_str} @ {tp_str} "
+            f"(algoId={tp_resp.get('algoId')}){RESET}"
+        )
+    else:
+        print(f"{DIM}TP skipped (structure mode — EQH/EQL soft close){RESET}")
     sl_resp = _one("STOP_MARKET", sl_str, "SL")
     print(f"{GREEN}✓ Exchange SL {close_side} {qty_str} @ {sl_str} (algoId={sl_resp.get('algoId')}){RESET}")
-    return float(tp_d), float(sl_d)
+    return (float(tp_d) if place_tp else 0.0), float(sl_d)
 
 
 # ── cycle state ──────────────────────────────────────────────────────────────
@@ -1934,6 +1956,7 @@ class CycleState:
     last_notional: float = 0.0
     last_upnl: float = 0.0
     last_leverage: int = 0
+    close_reason: str = ""  # e.g. structure TP · EQH@…
 
 
 def arm_cycle(
@@ -2038,6 +2061,7 @@ def arm_cycle(
     tp, sl = place_exchange_exits(
         symbol, plan.is_long, qty, entry, mark or entry,
         tp_target, plan.sl_price, filt, hedge, api, sec, recv,
+        skip_tp=is_structure_tp_mode(tp_mode),
     )
     append_journal(symbol, f"EXITS tp={tp:.8g} sl={sl:.8g} qty={qty:g} tp_mode={tp_mode}")
     tg = _tg()
@@ -2297,15 +2321,24 @@ def tick_pending(
             tp_mode=tp_mode, tp_pct=tp_pct, fee_rt_pct=fee_rt,
         )
         sl_target = state.plan.sl_price
-        print(
-            f"{GREEN}✓ Pullback fill qty={qty:g} @ {price_fmt(entry)} — "
-            f"arming TP {price_fmt(tp_target)} "
-            f"(avg+{tp_pct:g}% net +{fee_rt:g}% fees) / SL {price_fmt(sl_target)}{RESET}"
-        )
+        struct = is_structure_tp_mode(tp_mode)
+        if struct:
+            print(
+                f"{GREEN}✓ Pullback fill qty={qty:g} @ {price_fmt(entry)} — "
+                f"arming SL {price_fmt(sl_target)} · TP=structure "
+                f"(LONG→EQH / SHORT→EQL when green){RESET}"
+            )
+        else:
+            print(
+                f"{GREEN}✓ Pullback fill qty={qty:g} @ {price_fmt(entry)} — "
+                f"arming TP {price_fmt(tp_target)} "
+                f"(avg+{tp_pct:g}% net +{fee_rt:g}% fees) / SL {price_fmt(sl_target)}{RESET}"
+            )
         try:
             tp, sl = place_exchange_exits(
                 symbol, state.is_long, qty, entry, mark or entry,
                 tp_target, sl_target, filt, hedge, api, sec, recv,
+                skip_tp=struct,
             )
             state.tp, state.sl = tp, sl
             state.exits_armed = True
@@ -2348,6 +2381,7 @@ def close_cycle_cleanup(symbol: str, state: CycleState, api: str, sec: str, recv
             vol_usdt=state.last_notional or None,
             leverage=state.last_leverage or None,
             pnl_usdt=state.last_upnl,
+            reason=state.close_reason or None,
         )
     state.active = False
     state.pending = False
@@ -2357,11 +2391,77 @@ def close_cycle_cleanup(symbol: str, state: CycleState, api: str, sec: str, recv
     state.last_qty = 0.0
     state.last_notional = 0.0
     state.last_upnl = 0.0
+    state.close_reason = ""
     state.filled_levels.clear()
 
 
 # keep name used elsewhere
 open_cycle = arm_cycle
+
+
+def maybe_structure_tp_close(
+    symbol: str,
+    state: CycleState,
+    mark: float,
+    qty: float,
+    entry: float,
+    upnl: float,
+    filt: dict[str, Decimal],
+    hedge: bool,
+    api: str,
+    sec: str,
+    recv: int,
+    args: argparse.Namespace,
+) -> bool:
+    """Soft-close when structure TP mode and LONG→EQH / SHORT→EQL while green.
+
+    Returns True if the position was closed (caller should run cleanup).
+    """
+    tp_mode, _, _ = _tp_args(args)
+    if not is_structure_tp_mode(tp_mode):
+        return False
+    if qty <= 0 or entry <= 0 or mark <= 0:
+        return False
+
+    from ob_signals import estimated_net_pct
+    from ob_structure import (
+        fetch_structure,
+        should_structure_tp,
+        structure_config_from_args,
+    )
+
+    gross = mark_profit_pct(state.is_long, entry, mark)
+    fee_buf = float(getattr(args, "tp_fee_pct", TP_FEE_RT_DEFAULT) or 0.0)
+    in_profit = gross > 0 and estimated_net_pct(gross, fee_buf) > 0
+    try:
+        snap = fetch_structure(symbol, cfg=structure_config_from_args(args))
+    except Exception as exc:
+        print(f"{YELLOW}Structure TP fetch skip: {exc}{RESET}")
+        return False
+    fire, reason = should_structure_tp(state.is_long, in_profit=in_profit, snap=snap)
+    if not fire:
+        return False
+
+    side = "LONG" if state.is_long else "SHORT"
+    print(
+        f"{GREEN}✓ Structure TP {side} · {reason} · "
+        f"pnl={gross:+.3f}% upnl={upnl:+.4f} @ {price_fmt(mark)}{RESET}"
+    )
+    append_journal(symbol, f"STRUCTURE_TP {reason} pnl={gross:+.4f} mark={mark:.8g}")
+    try:
+        cancel_our_grid(symbol, api, sec, recv)
+        cancel_our_exits(symbol, api, sec, recv)
+        closed = market_close_position(
+            symbol, state.is_long, qty, hedge, filt, api, sec, recv,
+        )
+        print(f"{GREEN}✓ Market-closed {closed:g} ({reason}){RESET}")
+        state.last_upnl = upnl
+        state.close_reason = f"structure TP · {reason}"
+        return True
+    except Exception as exc:
+        print(f"{RED}Structure TP close failed: {exc}{RESET}")
+        append_journal(symbol, f"ERROR structure_tp {exc}")
+        return False
 
 
 def refresh_exits_if_grown(
@@ -2423,14 +2523,19 @@ def refresh_exits_if_grown(
                 tp_mode=tp_mode, tp_pct=tp_pct, fee_rt_pct=fee_rt,
             )
             sl = state.plan.sl_price if state.plan else state.sl
-            print(
-                f"{DIM}TP → {price_fmt(tp)} "
-                f"(avg {price_fmt(entry)} · net {tp_pct:g}% + fees {fee_rt:g}%){RESET}"
-            )
+            struct = is_structure_tp_mode(tp_mode)
+            if struct:
+                print(f"{DIM}Structure TP · refreshing SL only @ {price_fmt(sl)}{RESET}")
+            else:
+                print(
+                    f"{DIM}TP → {price_fmt(tp)} "
+                    f"(avg {price_fmt(entry)} · net {tp_pct:g}% + fees {fee_rt:g}%){RESET}"
+                )
             try:
                 tp, sl = place_exchange_exits(
                     symbol, state.is_long, qty, entry, mark or entry,
                     tp, sl, filt, hedge, api, sec, recv,
+                    skip_tp=struct,
                 )
                 state.tp, state.sl = tp, sl
                 state.entry = entry
@@ -2666,6 +2771,16 @@ def run(args: argparse.Namespace) -> int:
                         open_idxs, filled_idxs, filt, hedge,
                         api, sec, args.recv_window, args,
                     )
+                    if maybe_structure_tp_close(
+                        sym, state, mark, qty, entry, upnl,
+                        filt, hedge, api, sec, args.recv_window, args,
+                    ):
+                        clear_live_table(state)
+                        print(f"{GREEN}Position flat — structure TP{RESET}")
+                        close_cycle_cleanup(sym, state, api, sec, args.recv_window)
+                        cooldown_until = time.time() + args.cooldown_sec
+                        time.sleep(args.sample_sec)
+                        continue
                     print_live_table(
                         state,
                         render_live_table(
@@ -2844,13 +2959,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-max-leverage", action="store_true",
                    default=_env_bool("OB_MG_NO_MAX_LEVERAGE", False),
                    help="Do not raise leverage to symbol max before arming")
-    p.add_argument("--tp-mode", choices=("avg", "swing"),
-                   default=(os.getenv("OB_MG_TP_MODE", TP_MODE_DEFAULT).strip().lower() or TP_MODE_DEFAULT),
-                   help="TP: avg=live average ± (net%%+fees), refreshed each DCA (default); swing=impulse extreme")
+    _tp_mode_env = (os.getenv("OB_MG_TP_MODE", TP_MODE_DEFAULT).strip().lower() or TP_MODE_DEFAULT)
+    if _tp_mode_env in STRUCTURE_TP_MODES:
+        _tp_mode_env = "structure"
+    p.add_argument("--tp-mode", choices=("avg", "swing", "structure"),
+                   default=_tp_mode_env,
+                   help="TP: avg=live average ± (net%%+fees); swing=impulse extreme; "
+                        "structure=soft-close LONG→EQH / SHORT→EQL when already green")
     p.add_argument("--tp-pct", type=float, default=_env_float("OB_MG_TP_PCT", TP_PCT_DEFAULT),
                    help="Net take-profit %% from live average after fees (default 0.30)")
     p.add_argument("--tp-fee-pct", type=float, default=_env_float("OB_MG_TP_FEE_PCT", TP_FEE_RT_DEFAULT),
-                   help="Round-trip fee %% added on top of --tp-pct (default 0.08)")
+                   help="Round-trip fee %% added on top of --tp-pct (default 0.08); "
+                        "also min net for structure TP")
+    p.add_argument(
+        "--structure-interval",
+        default=os.getenv("OB_MG_STRUCTURE_INTERVAL", os.getenv("STRUCTURE_INTERVAL", "5m")),
+        help="[--tp-mode structure] Kline interval for EQH/EQL (default 5m)",
+    )
+    p.add_argument(
+        "--equal-tol-pct",
+        type=float,
+        default=_env_float("OB_MG_EQUAL_TOL_PCT", _env_float("EQUAL_TOL_PCT", 0.12)),
+        help="[--tp-mode structure] EQH/EQL match tolerance %% (default 0.12)",
+    )
+    p.add_argument(
+        "--near-pct",
+        type=float,
+        default=_env_float("OB_MG_NEAR_PCT", _env_float("NEAR_PCT", 0.35)),
+        help="[--tp-mode structure] Max distance %% to EQH/EQL to fire (default 0.35)",
+    )
     p.add_argument("--sl-pct", type=float, default=_env_float("OB_MG_SL_PCT", 0.50))
     p.add_argument(
         "--protect-trail",

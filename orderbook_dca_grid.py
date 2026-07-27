@@ -1360,8 +1360,9 @@ def supervise_loop(args: argparse.Namespace) -> None:
     except Exception as exc:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
-    from exits import EXIT_STAGED, exit_mode_label, resolve_exit_mode, run_exit_once, run_exit_when_flat
+    from exits import EXIT_STAGED, EXIT_STRUCTURE, exit_mode_label, resolve_exit_mode, run_exit_once, run_exit_when_flat
     from exits.staged import dca_rearm_allowed, staged_phase
+    from exits.structure import pop_close_reason
 
     hedge = _resolve_hedge(args, api, sec)
     exit_mode = resolve_exit_mode(args)
@@ -1468,14 +1469,23 @@ def supervise_loop(args: argparse.Namespace) -> None:
                         lev = int(last_pos_meta.get("leverage", 0) or 0) or get_symbol_leverage(
                             sym, api, sec, args.recv_window,
                         )
+                        close_reason = None
+                        if exit_mode == EXIT_STRUCTURE:
+                            close_reason = pop_close_reason(sym)
+                        elif after_runner:
+                            close_reason = "runner / trail"
                         telegram.notify_position_closed(
                             sym, last_direction,
                             after_runner=after_runner,
                             vol_usdt=float(last_pos_meta.get("notional", 0) or 0),
                             leverage=lev,
                             pnl_usdt=float(last_pos_meta.get("unrealized_pnl", 0) or 0),
+                            reason=close_reason,
                         )
                         trade_sounds.play_close_sound(float(last_pos_meta.get("unrealized_pnl", 0) or 0))
+                    elif exit_mode == EXIT_STRUCTURE:
+                        # Drop stale reason if we somehow flattened without notifying.
+                        pop_close_reason(sym)
                     last_position_qty = 0.0
                     last_direction = None
                     last_pos_meta = {}
@@ -1805,9 +1815,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--recv-window", type=int, default=_env_int("RECV_WINDOW", 15000),
                    help="Binance recvWindow ms (use 15000 on Mac if -1021). Env: RECV_WINDOW")
     p.add_argument("--env-file", default=None, help="Path to .env with API keys (default: project root)")
-    # Exit strategy (plugins in exits/ — default trailing TP on opposite OB wall)
-    p.add_argument("--exit", dest="exit_mode", choices=["trailing", "staged", "none"], default=None,
-                   help="Exit strategy with open position (default: staged; override with EXIT_MODE env)")
+    # Exit strategy (plugins in exits/ — default staged TP1 + trail)
+    p.add_argument(
+        "--exit", dest="exit_mode",
+        choices=["trailing", "staged", "structure", "none"],
+        default=None,
+        help="Exit strategy with open position: trailing | staged | structure (LONG→EQH / SHORT→EQL) | none "
+             "(default: staged; override with EXIT_MODE env)",
+    )
     p.add_argument("--no-tp", action="store_true",
                    help="Legacy alias for --exit none (skip automatic exit management)")
     p.add_argument("--tp1-profit-pct", type=float, default=None,
@@ -1816,6 +1831,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="[--exit staged] Runner SL profit lock %% after TP1. Env: BE_PROFIT_PCT")
     p.add_argument("--tp-partial-pct", type=float, default=None,
                    help="[--exit staged] First partial size %%. Env: TP_PARTIAL_PCT")
+    p.add_argument(
+        "--structure-interval",
+        default=os.getenv("STRUCTURE_INTERVAL", os.getenv("OB_STRUCT_INTERVAL", "5m")),
+        help="[--exit structure] Kline interval for EQH/EQL (default 5m). Env: STRUCTURE_INTERVAL",
+    )
+    p.add_argument(
+        "--equal-tol-pct",
+        type=float,
+        default=_env_float("EQUAL_TOL_PCT", 0.12),
+        help="[--exit structure] EQH/EQL match tolerance %% (default 0.12). Env: EQUAL_TOL_PCT",
+    )
+    p.add_argument(
+        "--near-pct",
+        type=float,
+        default=_env_float("NEAR_PCT", 0.35),
+        help="[--exit structure] Max distance %% to EQH/EQL to fire TP (default 0.35). Env: NEAR_PCT",
+    )
     p.add_argument("--tp-only", action="store_true", help="Skip the grid; only auto-manage the trailing TP for the position")
     p.add_argument("--supervise", action="store_true", help="Autonomous: re-arm the grid when flat + manage the trailing TP (loop)")
     p.add_argument("--tp-callback", type=float, default=0.2, help="Trailing callback rate %% (0.1..10)")

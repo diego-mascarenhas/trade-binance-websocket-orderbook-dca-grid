@@ -46,7 +46,7 @@ trade-binance-websocket-orderbook-dca-grid/
 ├── telegram_botctl.py           # Telegram remote control (/start /fib /stop)
 ├── telegram_notify.py           # Telegram alerts (DCA + #FIB)
 ├── OBMICRO_GRID_COMMANDS.md     # Fib micro-grid full guide
-├── exits/                       # Exit plugins (staged, trailing)
+├── exits/                       # Exit plugins (staged, trailing, structure)
 ├── .state/                      # Staged exit state per symbol (gitignored)
 ├── .run/                        # PID files + logs (Mac pidfile backend; gitignored)
 ├── pyproject.toml
@@ -195,9 +195,10 @@ python3 orderbook_staged_exit.py LINKUSDT
 
 | Flag / env | Default | Description |
 |------------|---------|-------------|
-| `EXIT_MODE` | `staged` | `staged` \| `trailing` \| `none` |
+| `EXIT_MODE` | `staged` | `staged` \| `trailing` \| `structure` \| `none` |
 | `--exit staged` | *(env default)* | Staged exit plugin |
 | `--exit trailing` | — | Trailing TP @ OB wall |
+| `--exit structure` | — | Soft-close LONG→EQH / SHORT→EQL once already green |
 | `--exit none` / `--no-tp` | — | Grid only |
 | `DIRECTION` | `auto` | `auto` \| `long` \| `short` |
 | `RECV_WINDOW` | `15000` | Binance recvWindow ms |
@@ -337,7 +338,7 @@ TELEGRAM_CHAT_ID=...
 ### Futures defaults (optional — already coded as defaults)
 
 ```env
-EXIT_MODE=staged          # staged | trailing | none
+EXIT_MODE=staged          # staged | trailing | structure | none
 DIRECTION=auto            # auto | long | short
 RECV_WINDOW=15000         # raise if you see -1021 timestamp errors
 WALLET_PCT=10
@@ -362,7 +363,7 @@ REARM_BACKOFF=60
 |----------|---------|------------|-------------|
 | `BINANCE_API_KEY` | — | both | API key |
 | `BINANCE_SECRET_KEY` | — | both | Secret |
-| `EXIT_MODE` | `staged` | futures | Exit plugin: `staged`, `trailing`, `none` |
+| `EXIT_MODE` | `staged` | futures | Exit plugin: `staged`, `trailing`, `structure`, `none` |
 | `DIRECTION` | `auto` | futures | Grid direction: `auto`, `long`, `short` |
 | `RECV_WINDOW` | `15000` | futures | Binance recvWindow (ms) |
 | `WALLET_PCT` | `10` | both | Entry size as % of wallet/free USDT |

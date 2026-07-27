@@ -165,7 +165,7 @@ fib LTCUSDT --cooldown-sec 300
 | `--level-size` | `8` | Deeper rung notional USDT |
 | `--set-leverage` | `0` | Force leverage (`0` = symbol max) |
 | `--no-max-leverage` | off | Do not raise to symbol max |
-| `--tp-mode` | `avg` | `avg` = live avg ± (net%+fees), refresh each DCA \| `swing` |
+| `--tp-mode` | `avg` | `avg` = live avg ± (net%+fees), refresh each DCA \| `swing` = impulse extreme \| `structure` = soft-close LONG→EQH / SHORT→EQL when already green |
 | `--tp-pct` | `0.30` | **Net** take-profit % from average (after fees) |
 | `--tp-fee-pct` | `0.08` | Round-trip fee % added on top of `--tp-pct` (gross ≈ 0.38%) |
 | `--sl-pct` | `0.50` | SL % from entry/mark |
@@ -300,6 +300,7 @@ OB_MG_RAISE_MIN_PCT=0.05
 
 # Exits / protect / cooldown
 OB_MG_TP_MODE=avg
+# avg | swing | structure  (structure = LONG→EQH / SHORT→EQL when already green)
 OB_MG_TP_PCT=0.30
 OB_MG_TP_FEE_PCT=0.08
 OB_MG_SL_PCT=0.50

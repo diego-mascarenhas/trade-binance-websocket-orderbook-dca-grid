@@ -666,6 +666,8 @@ class Handler(BaseHTTPRequestHandler):
             direction = str(direction).lower()
             if direction not in ("long", "short", "auto"):
                 direction = None
+        from exits import normalize_exit_mode
+        exit_mode = normalize_exit_mode(meta.get("exit_mode"))
         _json_response(
             self,
             200,
@@ -678,6 +680,7 @@ class Handler(BaseHTTPRequestHandler):
                 "direction": direction,
                 "gate_price": gate_f if gate_enabled else None,
                 "gate_enabled": gate_enabled,
+                "exit_mode": exit_mode,
                 "dry_run": False if running else None,
             },
         )
@@ -696,12 +699,15 @@ class Handler(BaseHTTPRequestHandler):
         else:
             gate_price = None
         restart = bool(body.get("restart_if_running", True))
+        from exits import normalize_exit_mode
+        exit_mode = normalize_exit_mode(body.get("exit_mode") or body.get("tp_mode"))
         msg = botctl.apply_gate_config(
             sym,
             direction=direction,
             gate_price=gate_price,
             gate_enabled=gate_enabled,
             restart_if_running=restart,
+            exit_mode=exit_mode,
         )
         ok = not msg.startswith("❌")
         meta = botctl.run_meta(sym)
@@ -716,6 +722,7 @@ class Handler(BaseHTTPRequestHandler):
                 "direction": meta.get("direction"),
                 "gate_price": meta.get("gate_price") if meta.get("gate_enabled") else None,
                 "gate_enabled": bool(meta.get("gate_enabled")),
+                "exit_mode": normalize_exit_mode(meta.get("exit_mode")),
             },
         )
 
@@ -734,6 +741,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             gate_price = None
         dry_run = bool(body.get("dry_run", False))
+        from exits import normalize_exit_mode
+        exit_mode = normalize_exit_mode(body.get("exit_mode") or body.get("tp_mode"))
 
         if dry_run:
             preview = preview_grid_payload(
@@ -756,11 +765,14 @@ class Handler(BaseHTTPRequestHandler):
                     "tp_price": preview.get("tp_price"),
                     "notional": preview.get("notional"),
                     "dca_count": preview.get("dca_count"),
+                    "exit_mode": exit_mode,
                 },
             )
             return
 
-        msg = botctl.start(sym, direction=direction, gate_price=gate_price)
+        msg = botctl.start(
+            sym, direction=direction, gate_price=gate_price, exit_mode=exit_mode,
+        )
         ok = not msg.startswith("❌") and not msg.startswith("⛔")
         _json_response(
             self,
@@ -771,6 +783,7 @@ class Handler(BaseHTTPRequestHandler):
                 "symbol": sym,
                 "running": botctl.is_running(sym),
                 "message": msg,
+                "exit_mode": exit_mode,
             },
         )
 

@@ -38,6 +38,7 @@ from ob_structure import (
     StructureConfig,
     fetch_structure,
     format_structure_console,
+    should_structure_tp,
 )
 from ob_oscillators import (
     OscillatorConfig,
@@ -884,6 +885,21 @@ def run_loop(args: argparse.Namespace) -> None:
                 use_ob_exits = bool(getattr(args, "ob_exits", True) and pos.tp_price > 0)
                 tp_hit = False
                 sl_hit = False
+                structure_tp_hit = False
+                if getattr(args, "structure_tp", False):
+                    try:
+                        struct_cfg = StructureConfig(
+                            interval=getattr(args, "structure_interval", "5m"),
+                            equal_tol_pct=float(getattr(args, "structure_equal_tol", 0.12)),
+                            near_pct=float(getattr(args, "structure_near_pct", 0.35)),
+                        )
+                        snap = fetch_structure(sym, cfg=struct_cfg)
+                        in_profit = pnl > 0 and should_discretionary_close(pnl, args.fee_buffer)
+                        structure_tp_hit, _st_reason = should_structure_tp(
+                            pos.is_long, in_profit=in_profit, snap=snap,
+                        )
+                    except Exception as exc:
+                        print(f"{DIM}Structure TP check skip: {exc}{RESET}")
                 if use_ob_exits:
                     tp_hit = hit_tp(mark, pos.is_long, pos.tp_price) and should_discretionary_close(
                         pnl, args.fee_buffer,
@@ -901,7 +917,14 @@ def run_loop(args: argparse.Namespace) -> None:
                     tp_hit = should_tp_close(pnl, args.tp_pct, args.fee_buffer)
                     sl_hit = pnl <= -sl_threshold
 
-                if tp_hit:
+                if structure_tp_hit:
+                    _print_close_event("TP-EQ", pos, pnl, mark, fee_buffer=args.fee_buffer)
+                    last_close_at = _handle_close(
+                        sym, pos, mark, pnl, "TP-EQ", args, recovery, hedge, filt, api, sec,
+                        adaptive_state=adaptive,
+                    )
+                    pos = None
+                elif tp_hit:
                     _print_close_event("TP", pos, pnl, mark, fee_buffer=args.fee_buffer)
                     last_close_at = _handle_close(
                         sym, pos, mark, pnl, "TP", args, recovery, hedge, filt, api, sec,
@@ -1391,6 +1414,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--structure-equal-tol", type=float,
                    default=_env_float("OB_STRUCTURE_EQUAL_TOL", 0.12),
                    help="EQH/EQL match tolerance %% (default 0.12)")
+    p.add_argument(
+        "--structure-tp",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("OB_STRUCTURE_TP", False),
+        help="Take-profit when LONG near EQH / SHORT near EQL once already green (default off)",
+    )
     p.add_argument("--osc-interval", default=os.getenv("OB_OSC_INTERVAL", "5m").strip() or "5m",
                    help="Kline interval for RSI/Stochastic (default 5m)")
     p.add_argument("--rsi-period", type=int, default=int(_env_float("OB_RSI_PERIOD", 14)),

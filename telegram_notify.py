@@ -301,11 +301,19 @@ def notify_position_closed(
     vol_usdt: float | None = None,
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
+    reason: str | None = None,
 ) -> None:
     vol = f" · {fmt_vol_usdt(vol_usdt, leverage)}" if vol_usdt and vol_usdt > 0 else ""
     emoji = _close_emoji(pnl_usdt)
     pnl_line = pnl_suffix(pnl_usdt, vol_usdt or 0.0, leverage) if pnl_usdt is not None else ""
-    _send_async(f"{emoji} {symbol.upper()} futures\n#CLOSED {direction.upper()}{vol}{pnl_line}")
+    why = (reason or "").strip()
+    if not why and after_runner:
+        why = "runner"
+    reason_line = f"\nReason: {why}" if why else ""
+    _send_async(
+        f"{emoji} {symbol.upper()} futures\n"
+        f"#CLOSED {direction.upper()}{vol}{pnl_line}{reason_line}"
+    )
 
 
 def notify_sl_at_entry(symbol: str, direction: str, qty: float, entry: float) -> None:
@@ -465,11 +473,17 @@ def notify_fib_closed(
     vol_usdt: float | None = None,
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
+    reason: str | None = None,
 ) -> None:
     vol = f" · {fmt_vol_usdt(vol_usdt, leverage)}" if vol_usdt and vol_usdt > 0 else ""
     emoji = _close_emoji(pnl_usdt)
     pnl_line = pnl_suffix(pnl_usdt, vol_usdt or 0.0, leverage) if pnl_usdt is not None else ""
-    _send_async(f"{emoji} {symbol.upper()} futures\n#FIB CLOSED {direction.upper()}{vol}{pnl_line}")
+    why = (reason or "").strip()
+    reason_line = f"\nReason: {why}" if why else ""
+    _send_async(
+        f"{emoji} {symbol.upper()} futures\n"
+        f"#FIB CLOSED {direction.upper()}{vol}{pnl_line}{reason_line}"
+    )
 
 
 def notify_fib_error(symbol: str, detail: str) -> None:

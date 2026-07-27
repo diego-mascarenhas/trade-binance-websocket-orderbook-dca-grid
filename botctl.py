@@ -246,8 +246,9 @@ def write_run_meta(
     gate_price: float | None = None,
     gate_enabled: bool | None = None,
     clear_gate: bool = False,
+    exit_mode: str | None = None,
 ) -> dict[str, Any]:
-    """Persist start args so the app can restore Gate / direction after reopen."""
+    """Persist start args so the app can restore Gate / direction / TP after reopen."""
     sym = symbol.upper()
     path = _meta_path(sym)
     payload: dict[str, Any] = {}
@@ -278,6 +279,11 @@ def write_run_meta(
         payload["gate_enabled"] = bool(gate_enabled)
         if not payload["gate_enabled"]:
             payload.pop("gate_price", None)
+    if exit_mode is not None:
+        from exits import normalize_exit_mode
+        mode = normalize_exit_mode(exit_mode)
+        if mode is not None:
+            payload["exit_mode"] = mode
     path.write_text(json.dumps(payload), encoding="utf-8")
     return payload
 
@@ -301,6 +307,12 @@ def _parse_gate_direction_from_cmdline(cmdline: str) -> dict[str, Any]:
         d = m.group(1).lower()
         if d in ("long", "short", "auto"):
             out["direction"] = d
+    m = re.search(r"--exit[= ]+(\w+)", cmdline)
+    if m:
+        from exits import normalize_exit_mode
+        mode = normalize_exit_mode(m.group(1))
+        if mode is not None:
+            out["exit_mode"] = mode
     return out
 
 
@@ -364,12 +376,16 @@ def apply_gate_config(
     gate_price: float | None = None,
     gate_enabled: bool = False,
     restart_if_running: bool = True,
+    exit_mode: str | None = None,
 ) -> str:
-    """Persist gate/direction; restart live supervisor only when args actually change."""
+    """Persist gate/direction/exit; restart live supervisor only when args actually change."""
     sym = symbol.upper()
     dir_arg = (direction or "").lower()
     if dir_arg and dir_arg not in ("long", "short", "auto"):
         dir_arg = ""
+
+    from exits import normalize_exit_mode
+    exit_arg = normalize_exit_mode(exit_mode)
 
     if gate_enabled:
         if gate_price is None:
@@ -380,17 +396,33 @@ def apply_gate_config(
             return "❌ Invalid gate_price."
         if g <= 0:
             return "❌ gate_price must be > 0."
-        write_run_meta(sym, direction=dir_arg or None, gate_price=g, gate_enabled=True)
+        write_run_meta(
+            sym,
+            direction=dir_arg or None,
+            gate_price=g,
+            gate_enabled=True,
+            exit_mode=exit_arg,
+        )
         gate_for_start: float | None = g
     else:
-        write_run_meta(sym, direction=dir_arg or None, clear_gate=True)
+        write_run_meta(
+            sym,
+            direction=dir_arg or None,
+            clear_gate=True,
+            exit_mode=exit_arg,
+        )
         gate_for_start = None
 
-    saved = (
-        f"✅ Gate saved @ {gate_for_start:g}{f' ({dir_arg})' if dir_arg else ''}."
-        if gate_enabled
-        else "✅ Gate cleared."
-    )
+    parts = []
+    if gate_enabled:
+        parts.append(f"Gate @ {gate_for_start:g}")
+    else:
+        parts.append("Gate cleared")
+    if dir_arg:
+        parts.append(dir_arg)
+    if exit_arg:
+        parts.append(f"exit={exit_arg}")
+    saved = f"✅ {', '.join(parts)}."
 
     if not restart_if_running or not is_running(sym):
         # Activate alone never auto-starts a stopped bot — use Start for that.
@@ -399,10 +431,13 @@ def apply_gate_config(
     live = _parse_gate_direction_from_cmdline(_cmdline_for_symbol(sym))
     live_gate = live.get("gate_price")
     live_dir = (live.get("direction") or "").lower()
+    live_exit = (live.get("exit_mode") or "").lower()
     want_dir = dir_arg or live_dir or "auto"
+    want_exit = exit_arg or live_exit or ""
     same_gate = _gates_match(live_gate, gate_for_start)
     same_dir = (not dir_arg) or (live_dir == dir_arg) or (live_dir == want_dir and not dir_arg)
-    if same_gate and same_dir:
+    same_exit = (not exit_arg) or (live_exit == exit_arg)
+    if same_gate and same_dir and same_exit:
         return f"{saved} Supervisor already running with this config."
 
     # Restart supervisor with the new gate (stop keeps meta).
@@ -411,7 +446,12 @@ def apply_gate_config(
         if not is_running(sym):
             break
         time.sleep(0.2)
-    start_msg = start(sym, direction=dir_arg or None, gate_price=gate_for_start)
+    start_msg = start(
+        sym,
+        direction=dir_arg or None,
+        gate_price=gate_for_start,
+        exit_mode=exit_arg or want_exit or None,
+    )
     time.sleep(0.4)
     if not is_running(sym):
         return (
@@ -514,12 +554,19 @@ def start(
     backend: str | None = None,
     direction: str | None = None,
     gate_price: float | None = None,
+    exit_mode: str | None = None,
 ) -> str:
     sym = symbol.upper()
     backend = backend or detect_backend()
     dir_arg = (direction or "").lower()
     if dir_arg and dir_arg not in ("long", "short", "auto"):
         dir_arg = ""
+    from exits import normalize_exit_mode
+    exit_arg = normalize_exit_mode(exit_mode)
+    if exit_arg is None:
+        # Prefer saved meta when caller omits exit mode.
+        saved = run_meta(sym).get("exit_mode")
+        exit_arg = normalize_exit_mode(saved) if saved else None
     gate: float | None = None
     if gate_price is not None:
         try:
@@ -543,13 +590,23 @@ def start(
                 err = (proc.stderr or proc.stdout or "systemctl failed").strip()
                 return f"❌ Could not start {sym}: {err}"
         if gate is not None:
-            write_run_meta(sym, direction=dir_arg or None, gate_price=gate, gate_enabled=True)
+            write_run_meta(
+                sym, direction=dir_arg or None, gate_price=gate, gate_enabled=True,
+                exit_mode=exit_arg,
+            )
         else:
-            write_run_meta(sym, direction=dir_arg or None, clear_gate=True)
+            write_run_meta(
+                sym, direction=dir_arg or None, clear_gate=True, exit_mode=exit_arg,
+            )
         note = ""
         if gate is not None:
             note = (
                 f"\n⚠️ systemd start ignores --gate-price; set GATE_PRICE in the unit env "
+                f"or use pidfile backend."
+            )
+        if exit_arg:
+            note += (
+                f"\n⚠️ systemd start ignores --exit; set EXIT_MODE={exit_arg} in the unit env "
                 f"or use pidfile backend."
             )
         return f"▶️ {sym} supervisor started (systemd). Position and orders unchanged.{note}"
@@ -567,6 +624,8 @@ def start(
         cmd.extend(["--direction", dir_arg])
     if gate is not None:
         cmd.extend(["--gate-price", str(gate)])
+    if exit_arg:
+        cmd.extend(["--exit", exit_arg])
 
     with open(log, "a", encoding="utf-8") as logfh:
         logfh.write(f"\n--- start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
@@ -584,13 +643,19 @@ def start(
         clear_run_meta(sym)
         return f"❌ {sym} exited on start — check {log}"
     if gate is not None:
-        write_run_meta(sym, direction=dir_arg or None, gate_price=gate, gate_enabled=True)
+        write_run_meta(
+            sym, direction=dir_arg or None, gate_price=gate, gate_enabled=True,
+            exit_mode=exit_arg,
+        )
     else:
-        write_run_meta(sym, direction=dir_arg or None, clear_gate=True)
+        write_run_meta(
+            sym, direction=dir_arg or None, clear_gate=True, exit_mode=exit_arg,
+        )
     gate_txt = f" gate={gate:g}" if gate is not None else ""
     dir_txt = f" {dir_arg}" if dir_arg else ""
+    exit_txt = f" exit={exit_arg}" if exit_arg else ""
     return (
-        f"▶️ {sym} supervisor started (pid {proc.pid}){dir_txt}{gate_txt}. "
+        f"▶️ {sym} supervisor started (pid {proc.pid}){dir_txt}{gate_txt}{exit_txt}. "
         f"Position and orders unchanged."
     )
 
@@ -656,12 +721,17 @@ def stop(symbol: str, backend: str | None = None, *, clear_meta: bool = False) -
     return f"ℹ️ {sym} was not running."
 
 
-def fib_start(symbol: str, direction: str | None = None) -> str:
+def fib_start(symbol: str, direction: str | None = None, tp_mode: str | None = None) -> str:
     """Start fib micro-grid in background (pidfile)."""
     sym = symbol.upper()
     dir_arg = (direction or "").lower()
     if dir_arg and dir_arg not in ("long", "short", "auto"):
         dir_arg = ""
+    mode = (tp_mode or "").strip().lower()
+    if mode in ("eq", "eqh", "eql", "eqh_eql"):
+        mode = "structure"
+    if mode and mode not in ("avg", "swing", "structure"):
+        mode = ""
     allow = allowed_symbols()
     if allow is not None and sym not in allow:
         return f"⛔ {sym} is not in FUTURES_PAIRS."
@@ -680,6 +750,8 @@ def fib_start(symbol: str, direction: str | None = None) -> str:
     ]
     if dir_arg:
         cmd.extend(["--direction", dir_arg])
+    if mode:
+        cmd.extend(["--tp-mode", mode])
 
     with open(log, "a", encoding="utf-8") as logfh:
         logfh.write(f"\n--- fib start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
@@ -696,8 +768,9 @@ def fib_start(symbol: str, direction: str | None = None) -> str:
         pid_file.unlink(missing_ok=True)
         return f"❌ {sym} FIB exited on start — check {log}"
     dir_note = f" · {dir_arg}" if dir_arg else ""
+    mode_note = f" · tp={mode}" if mode else ""
     return (
-        f"▶️ {sym} FIB started (pid {proc.pid}){dir_note}. "
+        f"▶️ {sym} FIB started (pid {proc.pid}){dir_note}{mode_note}. "
         f"Position/orders unchanged. Log: {log}"
     )
 
@@ -1062,6 +1135,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="For start: only arm SHORT if mid>price, LONG if mid<price",
     )
+    p.add_argument(
+        "--exit",
+        dest="exit_mode",
+        choices=["trailing", "staged", "structure", "none"],
+        default=None,
+        help="For start: exit strategy (structure = LONG→EQH / SHORT→EQL TP)",
+    )
+    p.add_argument(
+        "--tp-mode",
+        choices=["avg", "swing", "structure"],
+        default=None,
+        help="For fib: take-profit mode (structure = EQH/EQL soft close)",
+    )
     p.add_argument("--backend", choices=["auto", "systemd", "pidfile"], default="auto")
     return p.parse_args()
 
@@ -1082,11 +1168,12 @@ def main() -> None:
             args.symbol, backend,
             direction=args.direction,
             gate_price=args.gate_price,
+            exit_mode=args.exit_mode,
         ))
     elif args.command == "stop":
         print(stop(args.symbol, backend))
     elif args.command == "fib":
-        print(fib_start(args.symbol, args.direction))
+        print(fib_start(args.symbol, args.direction, tp_mode=args.tp_mode))
     elif args.command == "fib-stop":
         print(fib_stop(args.symbol))
     elif args.command == "status":

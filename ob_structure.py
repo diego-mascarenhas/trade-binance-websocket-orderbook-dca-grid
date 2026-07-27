@@ -238,6 +238,68 @@ def fetch_structure(symbol: str, cfg: StructureConfig | None = None) -> Structur
     return snap
 
 
+def should_structure_tp(
+    is_long: bool,
+    *,
+    in_profit: bool,
+    snap: StructureSnapshot,
+) -> tuple[bool, str]:
+    """Take-profit by equal liquidity once the trade is already green.
+
+    - LONG  + near EQH → close (sell-side liquidity / rejection above)
+    - SHORT + near EQL → close (buy-side liquidity / bounce below)
+
+    ``snap.eqh`` / ``snap.eql`` are already ``near`` flags from ``fetch_structure``.
+    """
+    if not in_profit:
+        return False, ""
+    if is_long and snap.eqh:
+        lvl = snap.eqh_level
+        return True, f"EQH@{lvl:g}" if lvl > 0 else "EQH"
+    if (not is_long) and snap.eql:
+        lvl = snap.eql_level
+        return True, f"EQL@{lvl:g}" if lvl > 0 else "EQL"
+    return False, ""
+
+
+def structure_tp_level(is_long: bool, snap: StructureSnapshot) -> float:
+    """Display / preview level for structure TP (0 if none)."""
+    if is_long:
+        return float(snap.eqh_level or 0.0)
+    return float(snap.eql_level or 0.0)
+
+
+def structure_config_from_args(args: object | None = None) -> StructureConfig:
+    """Build StructureConfig from CLI/env-style attributes (shared by bots)."""
+    cfg = StructureConfig()
+    if args is None:
+        return cfg
+    interval = str(
+        getattr(args, "structure_interval", None)
+        or getattr(args, "equal_interval", None)
+        or ""
+    ).strip()
+    if interval:
+        cfg.interval = interval
+    tol = getattr(args, "equal_tol_pct", None)
+    if tol is None:
+        tol = getattr(args, "structure_equal_tol", None)
+    if tol is not None:
+        try:
+            cfg.equal_tol_pct = float(tol)
+        except (TypeError, ValueError):
+            pass
+    near = getattr(args, "near_pct", None)
+    if near is None:
+        near = getattr(args, "structure_near_pct", None)
+    if near is not None:
+        try:
+            cfg.near_pct = float(near)
+        except (TypeError, ValueError):
+            pass
+    return cfg
+
+
 def format_structure_console(snap: StructureSnapshot) -> str:
     from orderbook_dca_grid import CYAN, DIM, RESET
 
