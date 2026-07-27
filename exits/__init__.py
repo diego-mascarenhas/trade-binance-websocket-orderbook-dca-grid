@@ -66,6 +66,46 @@ def exit_mode_label(mode: str) -> str:
     return _LABELS.get(mode, mode)
 
 
+def clear_exit_presets(
+    symbol: str,
+    side_is_long: bool,
+    api: str,
+    sec: str,
+    recv: int,
+) -> dict[str, int]:
+    """Remove previous exit preset (staged algos/state + close-side TP/SL/trail).
+
+    Call before arming a new exit mode so old conditionals do not linger.
+    Does not cancel DCA grid LIMIT orders or the position itself.
+    """
+    import orderbook_dca_grid as grid
+    import orderbook_staged_exit as staged
+    from exits.structure import cancel_close_algos
+
+    sym = symbol.upper()
+    staged_n = staged.cancel_all_staged_algos(sym, api, sec, recv)
+    try:
+        staged.save_state(
+            sym,
+            {
+                "phase": staged.PHASE_IDLE,
+                "symbol": sym,
+                "remain_qty": 0.0,
+                "algo_ids": {},
+            },
+        )
+    except Exception:
+        pass
+    close_n = cancel_close_algos(sym, side_is_long, api, sec, recv)
+    # Also drop foreign reduce-side TP/SL that staged cancel skipped / trailing left.
+    foreign_n = 0
+    try:
+        foreign_n = grid.cancel_foreign_sl(sym, side_is_long, api, sec, recv)
+    except Exception:
+        pass
+    return {"staged": staged_n, "close_algos": close_n, "foreign": foreign_n}
+
+
 def run_exit_once(
     mode: str,
     symbol: str,
@@ -100,8 +140,30 @@ def run_exit_when_flat(
     sec: str,
     filt: dict[str, Decimal],
 ) -> None:
-    """Clear staged state (and stray algos) when flat — supervise calls this each poll."""
-    if mode != EXIT_STAGED:
+    """Clear exit leftovers when flat.
+
+    Staged: full sync_flat. Other modes: still drop stray staged algos/state.
+    """
+    if mode == EXIT_STAGED:
+        from exits.staged import sync_flat
+        sync_flat(symbol, args, hedge, api, sec, filt)
         return
-    from exits.staged import sync_flat
-    sync_flat(symbol, args, hedge, api, sec, filt)
+    # Left staged mode (or never used it) — wipe idle staged artifacts.
+    try:
+        import orderbook_staged_exit as staged
+
+        recv = int(getattr(args, "recv_window", 15000) or 15000)
+        n = staged.cancel_all_staged_algos(symbol, api, sec, recv)
+        staged.save_state(
+            symbol.upper(),
+            {
+                "phase": staged.PHASE_IDLE,
+                "symbol": symbol.upper(),
+                "remain_qty": 0.0,
+                "algo_ids": {},
+            },
+        )
+        if n:
+            print(f"Cleared {n} leftover staged exit algo(s) while flat ({mode}).")
+    except Exception:
+        pass

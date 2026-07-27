@@ -115,14 +115,14 @@ def run_once(
         print(f"{grid.RED}✗ Structure TP close failed: {exc}{grid.RESET}")
 
 
-def _cancel_close_algos(
+def cancel_close_algos(
     symbol: str,
     is_long: bool,
     api: str,
     sec: str,
     recv: int,
 ) -> int:
-    """Cancel any reduce-side conditional TP/SL/trail algos before market close."""
+    """Cancel any reduce-side conditional TP/SL/trail algos (exit presets)."""
     import orderbook_dca_grid as grid
 
     close_side = "SELL" if is_long else "BUY"
@@ -154,3 +154,14 @@ def _cancel_close_algos(
         except Exception:
             pass
     return killed
+
+
+def _cancel_close_algos(
+    symbol: str,
+    is_long: bool,
+    api: str,
+    sec: str,
+    recv: int,
+) -> int:
+    """Backward-compatible alias."""
+    return cancel_close_algos(symbol, is_long, api, sec, recv)

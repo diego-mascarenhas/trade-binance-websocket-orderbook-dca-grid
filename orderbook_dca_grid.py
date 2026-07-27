@@ -1360,7 +1360,15 @@ def supervise_loop(args: argparse.Namespace) -> None:
     except Exception as exc:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
-    from exits import EXIT_STAGED, EXIT_STRUCTURE, exit_mode_label, resolve_exit_mode, run_exit_once, run_exit_when_flat
+    from exits import (
+        EXIT_STAGED,
+        EXIT_STRUCTURE,
+        clear_exit_presets,
+        exit_mode_label,
+        resolve_exit_mode,
+        run_exit_once,
+        run_exit_when_flat,
+    )
     from exits.staged import dca_rearm_allowed, staged_phase
     from exits.structure import pop_close_reason
 
@@ -1387,6 +1395,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
     last_direction: str | None = None
     last_pos_meta: dict[str, float | int] = {}
     dca_missing_retry_at: float = 0.0
+    exit_preset_armed: bool = False
     sym = args.symbol.upper()
     try:
         while True:
@@ -1428,6 +1437,28 @@ def supervise_loop(args: argparse.Namespace) -> None:
                     last_position_qty = qty
                     last_direction = direction
                     last_pos_meta = pos_meta
+                    # On attach / after exit-mode restart: drop previous preset, then arm new.
+                    if not exit_preset_armed:
+                        try:
+                            cleared = clear_exit_presets(
+                                sym, side_is_long, api, sec, args.recv_window,
+                            )
+                            total = sum(cleared.values())
+                            if total:
+                                print(
+                                    f"{YELLOW}Exit preset reset → cleared "
+                                    f"staged={cleared['staged']} "
+                                    f"close_algos={cleared['close_algos']} "
+                                    f"foreign={cleared['foreign']} "
+                                    f"· arming {exit_mode_label(exit_mode)}{RESET}"
+                                )
+                            else:
+                                print(
+                                    f"{DIM}Exit preset ready · {exit_mode_label(exit_mode)}{RESET}"
+                                )
+                        except Exception as exc:
+                            print(f"{YELLOW}Exit preset clear skipped: {exc}{RESET}")
+                        exit_preset_armed = True
                     try:
                         oo_pos = _signed_request(
                             "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
@@ -1489,6 +1520,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
                     last_position_qty = 0.0
                     last_direction = None
                     last_pos_meta = {}
+                    exit_preset_armed = False
                     run_exit_when_flat(
                         exit_mode, args.symbol, args, hedge, api, sec, filt,
                     )
