@@ -512,11 +512,17 @@ Typical deploy:
 
 ```bash
 cd /opt/trade-binance-websocket-orderbook-dca-grid
+./deploy/deploy.sh                      # git pull + sync_pairs --restart + api/tg restart
+# or manually:
 git checkout dev && git pull
 python3 deploy/sync_pairs.py --restart
 sudo systemctl restart dca-telegram-ctl
 sudo systemctl restart dca-api
 ```
+
+`./deploy/deploy.sh --status` prints fleet/API status after the update.  
+`./deploy/deploy.sh --no-pull` only restarts (e.g. after editing `.env`).  
+For structure TP on the VPS set `EXIT_MODE=structure` in `.env` (optional `STRUCTURE_INTERVAL=15m`), then run the script.
 
 ### systemd units
 
