@@ -1865,8 +1865,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="[--exit staged] First partial size %%. Env: TP_PARTIAL_PCT")
     p.add_argument(
         "--structure-interval",
-        default=os.getenv("STRUCTURE_INTERVAL", os.getenv("OB_STRUCT_INTERVAL", "5m")),
-        help="[--exit structure] Kline interval for EQH/EQL (default 5m). Env: STRUCTURE_INTERVAL",
+        default=os.getenv("STRUCTURE_INTERVAL", os.getenv("OB_STRUCT_INTERVAL", "15m")),
+        help="[--exit structure] Kline interval for EQH/EQL (default 15m). Env: STRUCTURE_INTERVAL",
     )
     p.add_argument(
         "--equal-tol-pct",

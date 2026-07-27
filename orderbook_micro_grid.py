@@ -2973,8 +2973,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "also min net for structure TP")
     p.add_argument(
         "--structure-interval",
-        default=os.getenv("OB_MG_STRUCTURE_INTERVAL", os.getenv("STRUCTURE_INTERVAL", "5m")),
-        help="[--tp-mode structure] Kline interval for EQH/EQL (default 5m)",
+        default=os.getenv("OB_MG_STRUCTURE_INTERVAL", os.getenv("STRUCTURE_INTERVAL", "15m")),
+        help="[--tp-mode structure] Kline interval for EQH/EQL (default 15m)",
     )
     p.add_argument(
         "--equal-tol-pct",

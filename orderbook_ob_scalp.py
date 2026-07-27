@@ -889,7 +889,7 @@ def run_loop(args: argparse.Namespace) -> None:
                 if getattr(args, "structure_tp", False):
                     try:
                         struct_cfg = StructureConfig(
-                            interval=getattr(args, "structure_interval", "5m"),
+                            interval=getattr(args, "structure_interval", "15m"),
                             equal_tol_pct=float(getattr(args, "structure_equal_tol", 0.12)),
                             near_pct=float(getattr(args, "structure_near_pct", 0.35)),
                         )
@@ -1020,7 +1020,7 @@ def run_loop(args: argparse.Namespace) -> None:
             ):
                 try:
                     struct_cfg = StructureConfig(
-                        interval=getattr(args, "structure_interval", "5m"),
+                        interval=getattr(args, "structure_interval", "15m"),
                         equal_tol_pct=float(getattr(args, "structure_equal_tol", 0.12)),
                         near_pct=float(getattr(args, "structure_near_pct", 0.35)),
                     )
@@ -1409,8 +1409,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trig-min-hits", type=int,
                    default=int(_env_float("OB_TRIG_MIN_HITS", 2)),
                    help="Min agreeing triggers for entry when --multi-trigger (default 2)")
-    p.add_argument("--structure-interval", default=os.getenv("OB_STRUCTURE_INTERVAL", "5m").strip() or "5m",
-                   help="Kline interval for choch/eql/eqh (default 5m)")
+    p.add_argument("--structure-interval", default=os.getenv("OB_STRUCTURE_INTERVAL", "15m").strip() or "15m",
+                   help="Kline interval for choch/eql/eqh (default 15m)")
     p.add_argument("--structure-equal-tol", type=float,
                    default=_env_float("OB_STRUCTURE_EQUAL_TOL", 0.12),
                    help="EQH/EQL match tolerance %% (default 0.12)")

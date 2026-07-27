@@ -1,6 +1,6 @@
 """Market-structure triggers for OB scalp: iCHoCH, EQH, EQL.
 
-Uses Binance futures klines (default 5m) to find swing highs/lows, then:
+Uses Binance futures klines (default 15m) to find swing highs/lows, then:
   - iCHoCH (Change of Character): break of recent structure against prior trend
   - EQH: equal swing highs (liquidity) → short bias when price is near
   - EQL: equal swing lows (liquidity) → long bias when price is near
@@ -39,7 +39,7 @@ class StructureSnapshot:
 
 @dataclass
 class StructureConfig:
-    interval: str = "5m"
+    interval: str = "15m"
     lookback: int = 48
     swing_left: int = 2
     swing_right: int = 2

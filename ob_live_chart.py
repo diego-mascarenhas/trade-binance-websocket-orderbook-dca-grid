@@ -1569,7 +1569,7 @@ class BookState:
         self.rsi_overbought = 70.0
         self.adx_period = 14
         self.adx_min = 20.0
-        self.structure_interval = "5m"
+        self.structure_interval = "15m"
         # BB-width volatility gate (%% of mid); used when vol_filter on
         self.vol_min_pct = 0.12
         self.vol_max_pct = 2.5
@@ -4881,7 +4881,7 @@ def main() -> None:
                    help="entry side: both|auto(EMA lock)|long|short (default both)")
     p.add_argument("--osc-interval", default="5m",
                    help="RSI/ADX kline interval")
-    p.add_argument("--structure-interval", default="5m",
+    p.add_argument("--structure-interval", default="15m",
                    help="SMC / iCHoCH kline interval")
     p.add_argument("--net-exits", action=argparse.BooleanOptionalAction, default=True,
                    help="only soft-exit when gross pnl covers fee estimate")
