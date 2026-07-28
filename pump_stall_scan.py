@@ -10,7 +10,8 @@
 
 Display-only by default. With --watch --auto-trade: run the top
 `--max-trades` ★ from this list (default 2) via
-`dca SYMBOL short --exit structure` (TP=EQL) + BE protect (arm 1% → lock 0.3%).
+`dca SYMBOL short --exit structure` (TP=EQL) + BE protect (arm 1% → lock 0.3%)
++ post-BE trail (arm 2% → callback 0.8%).
 Other open pairs on the account do not consume these slots.
 
   python3 pump_stall_scan.py
@@ -20,6 +21,7 @@ Other open pairs on the account do not consume these slots.
 Profiles (wrappers; defaults of ./pump-stall-watch stay strict):
   ./pump-stall-watch          # stall≥35 · near≥85 · ★≥92
   ./pump-stall-watch-early    # TEST: stall≥25 · near≥82 · ★≥90
+                              # + auto-trade · BE + trail@2%/0.8%
   ./pump-stall-early          # one-shot scan with the early profile
 """
 
@@ -522,9 +524,10 @@ def print_hits(
                 print(f"{DIM}left: {', '.join(gone)}{RESET}")
         print()
         print(
-            f"{DIM}Hint: dca SYMBOL short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 "
-            f"--min-gap … --so-count …{RESET}"
-        )
+        f"{DIM}Hint: dca SYMBOL short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 "
+        f"--post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 "
+        f"--min-gap … --so-count …{RESET}"
+    )
         if why_limit > 0 and blocked is not None:
             print()
             print_blocked(blocked, limit=why_limit)
@@ -632,6 +635,9 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         "--protect-be",
         "--be-arm-pct", "1",
         "--be-profit-pct", "0.3",
+        "--post-be", "trail",
+        "--post-be-arm-pct", str(getattr(args, "post_be_arm_pct", 2.0) or 2.0),
+        "--post-be-callback", str(getattr(args, "post_be_callback", 0.8) or 0.8),
         "--once",
         "--loss-cooldown-min", str(getattr(args, "loss_cooldown_min", 1440)),
         "--so-count", str(args.so_count),
@@ -659,7 +665,7 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         print(
             f"{BOLD}{GREEN}AUTO ★ {hit.symbol}{RESET}  "
             f"{DIM}pid={proc.pid} · dca short --exit structure "
-            f"+ BE@1%→0.3% --once · log {log_path}{RESET}"
+            f"+ BE@1%→0.3% + trail@2%/0.8% --once · log {log_path}{RESET}"
         )
         return proc
     except Exception as exc:  # noqa: BLE001
@@ -873,6 +879,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--structure-interval",
         default=None,
         help="Passed to dca --structure-interval when auto-trading",
+    )
+    p.add_argument(
+        "--post-be-arm-pct",
+        type=float,
+        default=2.0,
+        help="With --auto-trade: arm post-BE trail at this profit %% (default 2)",
+    )
+    p.add_argument(
+        "--post-be-callback",
+        type=float,
+        default=0.8,
+        help="With --auto-trade: post-BE trailing callbackRate %% (default 0.8)",
     )
     p.add_argument(
         "--why",

@@ -1924,6 +1924,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="[--exit structure|be|staged] SL profit lock %% from entry "
                         "(structure/be default 0.3, staged default 0.1; no fee buffer). "
                         "Env: BE_PROFIT_PCT")
+    p.add_argument(
+        "--post-be",
+        choices=["none", "trail"],
+        default=None,
+        help="[--exit structure|be] After BE is armed: none (default) or trail "
+             "(arm trailing at --post-be-arm-pct). Env: POST_BE",
+    )
+    p.add_argument(
+        "--post-be-arm-pct",
+        type=float,
+        default=None,
+        help="[--post-be trail] Arm trailing when unrealized profit %% ≥ this "
+             "(default 2.0). Env: POST_BE_ARM_PCT",
+    )
+    p.add_argument(
+        "--post-be-callback",
+        type=float,
+        default=None,
+        help="[--post-be trail] TRAILING_STOP callbackRate %% (default 0.8). "
+             "Env: POST_BE_CALLBACK",
+    )
     p.add_argument("--tp-partial-pct", type=float, default=None,
                    help="[--exit staged] First partial size %%. Env: TP_PARTIAL_PCT")
     p.add_argument(

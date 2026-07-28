@@ -11,12 +11,15 @@ Type=simple
 User=forge
 WorkingDirectory=/opt/trade-binance-websocket-orderbook-dca-grid
 EnvironmentFile=-/opt/trade-binance-websocket-orderbook-dca-grid/.env
+# ★ · structure TP (EQL) + BE@1% + trail@2%/0.8% · early stall thresholds
 ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/pump_stall_scan.py \
   --watch \
   --auto-trade \
   --max-trades 1 \
   --interval 60 \
   --loss-cooldown-min 1440 \
+  --post-be-arm-pct 2 \
+  --post-be-callback 0.8 \
   --min-stall 25 \
   --min-near-high 82 \
   --ideal-near 90 \

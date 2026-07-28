@@ -33,8 +33,8 @@ _EXIT_ALIASES = {
 _LABELS = {
     EXIT_TRAILING: "trailing TP @ OB wall",
     EXIT_STAGED: "staged (TP1 + SL@entry + trail)",
-    EXIT_STRUCTURE: "structure TP (LONG→EQH · SHORT→EQL) + optional BE protect",
-    EXIT_BE: "BE protect only (no TP)",
+    EXIT_STRUCTURE: "structure TP (LONG→EQH · SHORT→EQL) + optional BE / post-BE trail",
+    EXIT_BE: "BE protect (+ optional post-BE trail)",
     EXIT_NONE: "none",
 }
 
