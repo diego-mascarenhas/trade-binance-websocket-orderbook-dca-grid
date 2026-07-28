@@ -1177,6 +1177,19 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
                          direction: str | None = None) -> bool:
     """Compute (auto-direction, wallet%% size, max leverage) and place a fresh grid.
     Returns True if orders were placed. Used by --supervise for auto re-arming."""
+    if not dca_only:
+        cd_min = float(getattr(args, "loss_cooldown_min", 0) or 0)
+        if cd_min > 0:
+            import loss_cooldown as lcd
+
+            left = lcd.remaining_sec(args.symbol)
+            if left > 0:
+                if verbose:
+                    print(
+                        f"{YELLOW}Loss cooldown {lcd.fmt_remaining(left)} — "
+                        f"skip arm {args.symbol.upper()}{RESET}",
+                    )
+                return False
     try:
         depth = fetch_depth(args.symbol, args.limit)
     except Exception as exc:
@@ -1510,15 +1523,30 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             close_reason = pop_close_reason(sym)
                         elif after_runner:
                             close_reason = "runner / trail"
+                        close_pnl = float(last_pos_meta.get("unrealized_pnl", 0) or 0)
                         telegram.notify_position_closed(
                             sym, last_direction,
                             after_runner=after_runner,
                             vol_usdt=float(last_pos_meta.get("notional", 0) or 0),
                             leverage=lev,
-                            pnl_usdt=float(last_pos_meta.get("unrealized_pnl", 0) or 0),
+                            pnl_usdt=close_pnl,
                             reason=close_reason,
                         )
-                        trade_sounds.play_close_sound(float(last_pos_meta.get("unrealized_pnl", 0) or 0))
+                        trade_sounds.play_close_sound(close_pnl)
+                        cd_min = float(getattr(args, "loss_cooldown_min", 0) or 0)
+                        if close_pnl < 0 and cd_min > 0:
+                            import loss_cooldown as lcd
+
+                            until = lcd.record_loss(
+                                sym, close_pnl, cd_min * 60.0,
+                                reason=close_reason or "loss",
+                            )
+                            left = max(0.0, until - time.time())
+                            print(
+                                f"{YELLOW}Loss close {close_pnl:+.2f} USDT → cooldown "
+                                f"{lcd.fmt_remaining(left)} on {sym} "
+                                f"(no re-entry){RESET}",
+                            )
                     elif exit_mode == EXIT_STRUCTURE:
                         # Drop stale reason if we somehow flattened without notifying.
                         pop_close_reason(sym)
@@ -1921,6 +1949,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--once",
         action="store_true",
         help="With --supervise: run one trade cycle only (arm → manage → on flat after close, exit; no re-arm)",
+    )
+    p.add_argument(
+        "--loss-cooldown-min",
+        type=float,
+        default=_env_float("LOSS_COOLDOWN_MIN", 1440.0),
+        help="After a losing close, block re-entry on this symbol for N minutes "
+             "(0=off; default 1440 = 24h). Env: LOSS_COOLDOWN_MIN",
     )
     p.add_argument("--tp-callback", type=float, default=0.2, help="Trailing callback rate %% (0.1..10)")
     p.add_argument("--tp-fee-buffer", type=float, default=0.12, help="Extra profit margin %% (fees+buffer) to stay green")

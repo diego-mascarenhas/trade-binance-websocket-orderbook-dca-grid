@@ -1,0 +1,25 @@
+[Unit]
+Description=Pump→stall auto-trade supervisor (★ shorts, --once, BE+EQL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=forge
+# Reads API keys from .env in WorkingDirectory.
+WorkingDirectory=/opt/trade-binance-websocket-orderbook-dca-grid
+EnvironmentFile=-/opt/trade-binance-websocket-orderbook-dca-grid/.env
+# Top 2 ★ · structure TP (EQL) + BE protect · loss cooldown 24h · refresh 60s
+# Override flags via drop-in if needed (systemctl edit pump-stall-watch).
+ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/pump_stall_scan.py \
+  --watch \
+  --auto-trade \
+  --max-trades 2 \
+  --interval 60 \
+  --loss-cooldown-min 1440
+Restart=always
+RestartSec=15
+# Child dca --once processes use start_new_session; they keep running if this unit restarts.
+
+[Install]
+WantedBy=multi-user.target

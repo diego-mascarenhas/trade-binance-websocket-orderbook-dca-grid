@@ -493,6 +493,7 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         "--be-arm-pct", "1",
         "--be-profit-pct", "0.3",
         "--once",
+        "--loss-cooldown-min", str(getattr(args, "loss_cooldown_min", 1440)),
         "--so-count", str(args.so_count),
         "--min-gap", str(args.min_gap),
         "--min-dist", str(args.min_dist),
@@ -540,11 +541,23 @@ def _maybe_auto_trade(
     active = _reap_active(active)
     max_trades = max(1, int(getattr(args, "max_trades", 2) or 2))
 
-    # Target set: first N ★ by score from this table only
-    target = _pick_ideals(hits, args.ideal_near, exclude=set(), limit=max_trades)
+    import loss_cooldown as lcd
+
+    cooling = lcd.cooling_map()
+    if cooling:
+        bits = [f"{s} {lcd.fmt_remaining(t)}" for s, t in sorted(cooling.items())]
+        print(f"{DIM}AUTO: loss cooldown · {', '.join(bits)}{RESET}")
+
+    # Target set: first N ★ by score, skipping symbols in loss cooldown
+    target = _pick_ideals(
+        hits, args.ideal_near, exclude=set(cooling), limit=max_trades,
+    )
     target_syms = [h.symbol.upper() for h in target]
     if not target_syms:
-        print(f"{DIM}AUTO: no ★ ideal this round — skip{RESET}")
+        if cooling:
+            print(f"{DIM}AUTO: no ★ ideal outside cooldown — skip{RESET}")
+        else:
+            print(f"{DIM}AUTO: no ★ ideal this round — skip{RESET}")
         return active
 
     running = {s.upper() for s in _dca_supervisor_running()}
@@ -701,6 +714,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=2,
         help="With --auto-trade: how many top ★ from this scan to run "
              "(this bot only; other account pairs do not count; default 2)",
+    )
+    p.add_argument(
+        "--loss-cooldown-min",
+        type=float,
+        default=1440.0,
+        help="With --auto-trade: after a losing close, skip that symbol for N minutes "
+             "(passed to dca; default 1440 = 24h, 0=off)",
     )
     p.add_argument(
         "--structure-interval",
