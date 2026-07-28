@@ -1384,8 +1384,11 @@ def supervise_loop(args: argparse.Namespace) -> None:
             gate_note = f", gate mid<{float(gate):g}"
         else:
             gate_note = f", gate {float(gate):g} (long mid< · short mid>)"
+    once = bool(getattr(args, "once", False))
+    once_note = ", once (no re-arm after close)" if once else ""
     print(f"\n{BOLD}{CYAN}Supervising {args.symbol.upper()} "
-          f"(auto re-arm grid + exit: {exit_mode_label(exit_mode)}, poll {args.tp_poll_sec:g}s{ttl_note}{gate_note}). "
+          f"(auto re-arm grid + exit: {exit_mode_label(exit_mode)}, poll {args.tp_poll_sec:g}s"
+          f"{ttl_note}{gate_note}{once_note}). "
           f"Ctrl+C to stop.{RESET}")
     import telegram_notify as telegram
     import trade_sounds
@@ -1396,6 +1399,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
     last_pos_meta: dict[str, float | int] = {}
     dca_missing_retry_at: float = 0.0
     exit_preset_armed: bool = False
+    seen_position = False  # --once: true after any open qty this cycle
     sym = args.symbol.upper()
     try:
         while True:
@@ -1403,6 +1407,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
             try:
                 side_is_long, qty, entry = _detect_open_side(args.symbol, hedge, api, sec, args.recv_window)
                 if side_is_long is not None:
+                    seen_position = True
                     armed_log_state = None
                     direction = "LONG" if side_is_long else "SHORT"
                     pos_meta = get_position_meta(sym, side_is_long, hedge, api, sec, args.recv_window)
@@ -1537,6 +1542,12 @@ def supervise_loop(args: argparse.Namespace) -> None:
                                 )
                         except Exception as exc:
                             print(f"{RED}Cancel leftover DCA after close failed: {exc}{RESET}")
+                        if once:
+                            print(
+                                f"{BOLD}{GREEN}--once: cycle complete for {sym} "
+                                f"(position closed) → stopping supervisor.{RESET}",
+                            )
+                            return
                     oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window)
                     if oo and grid_is_orphaned(oo, sym):
                         armed_log_state = None
@@ -1587,6 +1598,12 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             except Exception as exc:
                                 print(f"{RED}Cancel orphan grid failed: {exc}{RESET}")
                             else:
+                                if once:
+                                    print(
+                                        f"{BOLD}{YELLOW}--once: entry expired without fill "
+                                        f"→ stopping (no re-arm).{RESET}",
+                                    )
+                                    return
                                 if not position_just_closed:
                                     print(f"{BOLD}Flat after entry expiry → re-arming grid…{RESET}")
                                     placed = build_and_place_grid(args, api, sec, filt, verbose=True)
@@ -1671,6 +1688,12 @@ def supervise_loop(args: argparse.Namespace) -> None:
                                 armed_log_state = state
                     else:
                         armed_log_state = None
+                        if once and seen_position:
+                            print(
+                                f"{BOLD}{GREEN}--once: flat after trade on {sym} "
+                                f"→ stopping supervisor.{RESET}",
+                            )
+                            return
                         if position_just_closed:
                             print(f"{DIM}Flat after close — deferring grid re-arm to next poll.{RESET}")
                         else:
@@ -1882,6 +1905,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--tp-only", action="store_true", help="Skip the grid; only auto-manage the trailing TP for the position")
     p.add_argument("--supervise", action="store_true", help="Autonomous: re-arm the grid when flat + manage the trailing TP (loop)")
+    p.add_argument(
+        "--once",
+        action="store_true",
+        help="With --supervise: run one trade cycle only (arm → manage → on flat after close, exit; no re-arm)",
+    )
     p.add_argument("--tp-callback", type=float, default=0.2, help="Trailing callback rate %% (0.1..10)")
     p.add_argument("--tp-fee-buffer", type=float, default=0.12, help="Extra profit margin %% (fees+buffer) to stay green")
     p.add_argument("--tp-wall-min-mult", type=float, default=3.0, help="Min wall size vs median book qty to count as a wall")

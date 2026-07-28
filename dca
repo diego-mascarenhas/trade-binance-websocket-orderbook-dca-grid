@@ -16,6 +16,7 @@ usage() {
     echo "Usage: dca SYMBOL [long|short|auto|stop|status|cleanup|sweep] [flags...]"
     echo "  dca 1000PEPEUSDT                         # AUTO supervisor (default)"
     echo "  dca 1000PEPEUSDT short                   # SHORT supervisor"
+    echo "  dca ZAMAUSDT short --exit structure --once  # one cycle, then exit"
     echo "  dca BANKUSDT short --gate-price 0.29332  # SHORT only if mid > gate"
     echo "  dca SKLUSDT stop                         # stop supervisor (orders stay)"
     echo "  dca SKLUSDT status                       # process + trading state"

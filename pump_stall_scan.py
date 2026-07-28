@@ -8,16 +8,21 @@
   4. Starting to stall on daily ranges
   5. Enough ask-side order-book walls for a SHORT DCA grid
 
-Display only — does not place orders.
+Display-only by default. With --watch --auto-trade: if the account is flat
+and a ★ ideal exists, launches `dca SYMBOL short --exit structure --once`
+(one trade cycle), then rescans for the next best ★.
 
   python3 pump_stall_scan.py
   ./pump-stall --top 15 --min-near-regime 80 --min-sharp 35
+  ./pump-stall --watch --auto-trade --interval 60
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -397,14 +402,148 @@ def _clear_screen() -> None:
     sys.stdout.flush()
 
 
+def _repo_root() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _account_open_symbols(recv_window: int = 15000) -> list[str]:
+    """Symbols with non-zero futures position (needs API keys)."""
+    from orderbook_dca_grid import _signed_request, load_keys
+
+    api, sec = load_keys(None)
+    if not api or not sec:
+        return []
+    try:
+        rows = _signed_request("GET", "/fapi/v2/positionRisk", {}, api, sec, recv_window)
+    except Exception:
+        return []
+    if not isinstance(rows, list):
+        return []
+    out: list[str] = []
+    for r in rows:
+        try:
+            amt = abs(float(r.get("positionAmt") or 0))
+        except (TypeError, ValueError):
+            continue
+        if amt > 0:
+            sym = str(r.get("symbol") or "").upper()
+            if sym:
+                out.append(sym)
+    return sorted(set(out))
+
+
+def _dca_supervisor_running() -> list[str]:
+    """Symbols with a live orderbook_dca_grid.py --supervise process."""
+    try:
+        from botctl import _pgrep_supervisors
+
+        return list(_pgrep_supervisors())
+    except Exception:
+        return []
+
+
+def _pick_ideal(hits: list[PumpStallHit], ideal_near: float) -> PumpStallHit | None:
+    ideals = [h for h in hits if h.near_high_pct >= ideal_near]
+    if not ideals:
+        return None
+    return max(ideals, key=lambda h: h.score)
+
+
+def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.Popen | None:
+    """Start `dca SYMBOL short --exit structure --once …` in the background."""
+    root = _repo_root()
+    dca_bin = os.path.join(root, "dca")
+    log_dir = os.path.join(root, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"pump-stall-{hit.symbol}.log")
+    cmd = [
+        dca_bin,
+        hit.symbol,
+        "short",
+        "--exit", "structure",
+        "--once",
+        "--so-count", str(args.so_count),
+        "--min-gap", str(args.min_gap),
+        "--min-dist", str(args.min_dist),
+        "--max-range", str(args.max_range),
+        "--limit", str(args.limit),
+    ]
+    if getattr(args, "structure_interval", None):
+        cmd.extend(["--structure-interval", str(args.structure_interval)])
+    try:
+        log_f = open(log_path, "a", encoding="utf-8")
+        log_f.write(
+            f"\n--- launch {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"score={hit.score:.1f} near={hit.near_high_pct:.0f}% ---\n"
+        )
+        log_f.flush()
+        proc = subprocess.Popen(
+            cmd,
+            cwd=root,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        print(
+            f"{BOLD}{GREEN}AUTO ★ {hit.symbol}{RESET}  "
+            f"{DIM}pid={proc.pid} · dca short --exit structure --once · "
+            f"log {log_path}{RESET}"
+        )
+        return proc
+    except Exception as exc:  # noqa: BLE001
+        print(f"{RED}Failed to launch dca for {hit.symbol}: {exc}{RESET}")
+        return None
+
+
+def _maybe_auto_trade(
+    hits: list[PumpStallHit],
+    args: argparse.Namespace,
+    *,
+    active_proc: subprocess.Popen | None,
+) -> subprocess.Popen | None:
+    """If flat + no supervise + ★ ideal → launch one --once dca. Else keep waiting."""
+    if active_proc is not None and active_proc.poll() is None:
+        print(
+            f"{DIM}AUTO: trade supervisor still running "
+            f"(pid={active_proc.pid}) — waiting for --once exit…{RESET}"
+        )
+        return active_proc
+    if active_proc is not None and active_proc.poll() is not None:
+        print(
+            f"{DIM}AUTO: previous --once exited (code {active_proc.returncode}) "
+            f"— rescanning for next ★{RESET}"
+        )
+        active_proc = None
+
+    running = _dca_supervisor_running()
+    if running:
+        print(f"{DIM}AUTO: dca supervise already on {', '.join(running)} — skip{RESET}")
+        return None
+
+    open_syms = _account_open_symbols()
+    if open_syms:
+        print(f"{DIM}AUTO: open positions {', '.join(open_syms)} — skip{RESET}")
+        return None
+
+    pick = _pick_ideal(hits, args.ideal_near)
+    if pick is None:
+        print(f"{DIM}AUTO: no ★ ideal this round — skip{RESET}")
+        return None
+
+    return _launch_dca_once(pick, args)
+
+
 def watch_loop(args: argparse.Namespace) -> int:
     """Live supervisor: rescan on an interval and redraw the table."""
     interval = max(15.0, float(args.interval))
     prev: dict[str, float] | None = None
     round_n = 0
+    active: subprocess.Popen | None = None
+    auto = bool(getattr(args, "auto_trade", False))
+    mode = "AUTO-TRADE · --once" if auto else "display only"
     print(
         f"{BOLD}{CYAN}Pump→stall supervisor{RESET}  "
-        f"{DIM}refresh every {interval:g}s · Ctrl+C to stop{RESET}"
+        f"{DIM}{mode} · refresh every {interval:g}s · Ctrl+C to stop{RESET}"
     )
     try:
         while True:
@@ -424,11 +563,13 @@ def watch_loop(args: argparse.Namespace) -> int:
             print(
                 f"{BOLD}{CYAN}Pump→stall supervisor{RESET}  "
                 f"{DIM}#{round_n} · {now} · scan {elapsed:.1f}s · "
-                f"next in {interval:g}s · Ctrl+C{RESET}"
+                f"next in {interval:g}s · {mode} · Ctrl+C{RESET}"
             )
             print()
             prev = print_hits(hits, ideal_near=args.ideal_near, prev=prev)
-            # Sleep in chunks so Ctrl+C is responsive
+            if auto:
+                print()
+                active = _maybe_auto_trade(hits, args, active_proc=active)
             left = interval
             while left > 0:
                 step = min(1.0, left)
@@ -436,6 +577,11 @@ def watch_loop(args: argparse.Namespace) -> int:
                 left -= step
     except KeyboardInterrupt:
         print(f"\n{DIM}supervisor stopped.{RESET}")
+        if active is not None and active.poll() is None:
+            print(
+                f"{DIM}Note: dca --once for pid={active.pid} still running "
+                f"in background (not killed).{RESET}"
+            )
         return 0
 
 
@@ -487,11 +633,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=60.0,
         help="Watch refresh interval in seconds (default 60, min 15)",
     )
+    p.add_argument(
+        "--auto-trade",
+        action="store_true",
+        help="With --watch: if account flat and a ★ ideal exists, launch "
+             "`dca SYMBOL short --exit structure --once` (one cycle, then rescan)",
+    )
+    p.add_argument(
+        "--structure-interval",
+        default=None,
+        help="Passed to dca --structure-interval when auto-trading",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.auto_trade and not args.watch:
+        print(f"{YELLOW}--auto-trade requires --watch{RESET}", file=sys.stderr)
+        return 2
     if args.watch:
         return watch_loop(args)
     t0 = time.time()

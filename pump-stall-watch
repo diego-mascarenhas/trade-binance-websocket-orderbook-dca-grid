@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Live pump→stall supervisor (refreshes on screen).
 # Usage: ./pump-stall-watch [--interval 60] [--top 12] …
+# Auto-trade (option C): ./pump-stall-watch --auto-trade
+#   → when flat + ★ ideal: dca SYMBOL short --exit structure --once, then rescan
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec python3 "$ROOT/pump_stall_scan.py" --watch "$@"
