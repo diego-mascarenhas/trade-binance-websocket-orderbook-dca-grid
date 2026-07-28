@@ -44,6 +44,24 @@ from futures_scan import (
 )
 from orderbook_dca_grid import fetch_depth, select_walls
 
+# Extra ANSI for filter tags (not in futures_scan)
+MAGENTA = "\033[35m"
+BLUE = "\033[34m"
+ORANGE = "\033[38;5;208m"
+WHITE = "\033[37m"
+
+# First failing filter → color + short label
+BLOCK_COLORS = {
+    "klines": DIM,
+    "pump": MAGENTA,
+    "near": YELLOW,
+    "regime": CYAN,
+    "sharp": BLUE,
+    "peak": WHITE,
+    "stall": ORANGE,
+    "walls": RED,
+}
+
 
 @dataclass
 class PumpStallHit:
@@ -61,6 +79,24 @@ class PumpStallHit:
     wall_prices: list[float]
     score: float
     note: str
+
+
+@dataclass
+class AnalyzeRow:
+    """Pass (hit set) or first filter that blocked the seed symbol."""
+    symbol: str
+    change_24h: float
+    quote_volume: float
+    hit: PumpStallHit | None = None
+    blocked_by: str | None = None  # pump|near|regime|sharp|peak|stall|walls|klines
+    pump_7d_pct: float = 0.0
+    near_high_pct: float = 0.0
+    near_regime_pct: float = 0.0
+    sharp_pct: float = 0.0
+    stall_score: float = 0.0
+    peak_is_recent: bool = False
+    ask_walls: int = 0
+    detail: str = ""  # human value that failed, e.g. "near 81%<85"
 
 
 def _ohlc(klines: list[list]) -> list[tuple[float, float, float, float]]:
@@ -191,29 +227,58 @@ def _analyze_one(
     min_dist: float,
     max_range: float,
     depth_limit: int,
-) -> PumpStallHit | None:
+) -> AnalyzeRow:
+    base_row = AnalyzeRow(
+        symbol=t.symbol,
+        change_24h=t.change_pct,
+        quote_volume=t.quote_volume,
+    )
     try:
         # ~45 daily bars: enough to see downtrend vs blow-off at the right edge
         kl = fetch_klines(base, t.symbol, "1d", 45)
     except Exception:
-        return None
+        base_row.blocked_by = "klines"
+        base_row.detail = "klines fail"
+        return base_row
     daily = _ohlc(kl)
     m = _day_metrics(daily)
     if m is None:
-        return None
+        base_row.blocked_by = "klines"
+        base_row.detail = "not enough bars"
+        return base_row
+
+    base_row.pump_7d_pct = m.pump_pct
+    base_row.near_high_pct = m.near_high_pct
+    base_row.near_regime_pct = m.near_regime_pct
+    base_row.sharp_pct = m.sharp_pct
+    base_row.stall_score = m.stall_score
+    base_row.peak_is_recent = m.peak_is_recent
+
     if m.pump_pct < min_pump_7d:
-        return None
+        base_row.blocked_by = "pump"
+        base_row.detail = f"pump {m.pump_pct:.0f}%<{min_pump_7d:g}"
+        return base_row
     if m.near_high_pct < min_near_high:
-        return None
+        base_row.blocked_by = "near"
+        base_row.detail = f"near {m.near_high_pct:.0f}%<{min_near_high:g}"
+        return base_row
     # Reject "bounce in a larger downtrend" (ZBT): still far below 1D regime high
     if m.near_regime_pct < min_near_regime:
-        return None
+        base_row.blocked_by = "regime"
+        base_row.detail = f"reg {m.near_regime_pct:.0f}%<{min_near_regime:g}"
+        return base_row
     if m.sharp_pct < min_sharp:
-        return None
+        base_row.blocked_by = "sharp"
+        base_row.detail = f"sharp {m.sharp_pct:.0f}<{min_sharp:g}"
+        return base_row
     if require_recent_peak and not m.peak_is_recent:
-        return None
+        base_row.blocked_by = "peak"
+        base_row.detail = "peak not recent"
+        return base_row
     if m.stall_score < min_stall:
-        return None
+        base_row.blocked_by = "stall"
+        base_row.detail = f"stall {m.stall_score:.0f}<{min_stall:g}"
+        return base_row
 
     walls_n, span, prices = _ask_grid(
         t.symbol,
@@ -223,8 +288,11 @@ def _analyze_one(
         max_range=max_range,
         limit=depth_limit,
     )
+    base_row.ask_walls = walls_n
     if walls_n < min_walls:
-        return None
+        base_row.blocked_by = "walls"
+        base_row.detail = f"walls {walls_n}<{min_walls}"
+        return base_row
 
     score = (
         min(m.pump_pct, 200) * 0.25
@@ -245,7 +313,7 @@ def _analyze_one(
     ]
     if t.change_pct >= 20:
         note_bits.insert(0, f"24h +{t.change_pct:.0f}%")
-    return PumpStallHit(
+    hit = PumpStallHit(
         symbol=t.symbol,
         last=t.last,
         change_24h=t.change_pct,
@@ -261,9 +329,11 @@ def _analyze_one(
         score=score,
         note=" · ".join(note_bits),
     )
+    base_row.hit = hit
+    return base_row
 
 
-def scan(args: argparse.Namespace) -> list[PumpStallHit]:
+def scan(args: argparse.Namespace) -> tuple[list[PumpStallHit], list[AnalyzeRow]]:
     base = args.base.rstrip("/")
     allowed = trading_usdt_perps(base)
     tickers = fetch_tickers(base, allowed)
@@ -289,7 +359,7 @@ def scan(args: argparse.Namespace) -> list[PumpStallHit]:
         flush=True,
     )
 
-    hits: list[PumpStallHit] = []
+    rows: list[AnalyzeRow] = []
     workers = max(1, min(args.workers, 12))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {
@@ -318,14 +388,68 @@ def scan(args: argparse.Namespace) -> list[PumpStallHit]:
             if done % 20 == 0 or done == len(futs):
                 print(f"{DIM}  … {done}/{len(futs)}{RESET}", flush=True)
             try:
-                hit = fut.result()
+                row = fut.result()
             except Exception:
-                hit = None
-            if hit:
-                hits.append(hit)
+                continue
+            if row:
+                rows.append(row)
 
+    hits = [r.hit for r in rows if r.hit is not None]
     hits.sort(key=lambda h: h.score, reverse=True)
-    return hits[: args.top]
+    hits = hits[: args.top]
+
+    blocked = [r for r in rows if r.hit is None and r.blocked_by]
+    # Prefer near-misses (failed late filters) then by 24h change
+    _late = {"stall", "walls", "peak", "sharp", "near", "regime"}
+    blocked.sort(
+        key=lambda r: (
+            0 if r.blocked_by in _late else 1,
+            -r.change_24h,
+            -r.near_high_pct,
+        ),
+    )
+    return hits, blocked
+
+
+def _block_tag(reason: str) -> str:
+    c = BLOCK_COLORS.get(reason, DIM)
+    return f"{c}{BOLD}{reason:<6}{RESET}"
+
+
+def print_blocked(blocked: list[AnalyzeRow], *, limit: int) -> None:
+    """Show seed symbols that failed, colored by first failing filter."""
+    if limit <= 0:
+        return
+    show = blocked[:limit]
+    if not show:
+        print(f"{DIM}No blocked seed rows to show.{RESET}")
+        return
+    counts: dict[str, int] = {}
+    for r in blocked:
+        counts[r.blocked_by or "?"] = counts.get(r.blocked_by or "?", 0) + 1
+    legend = " · ".join(
+        f"{_block_tag(k)}×{v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])
+    )
+    print(f"{DIM}Blocked (first fail) · showing {len(show)}/{len(blocked)} · {RESET}{legend}")
+    print(
+        f"{DIM}{'':>1} {'#':>2}  {'SYMBOL':<14} {'24h%':>7} {'pump':>5} "
+        f"{'near':>5} {'reg%':>5} {'shp':>4} {'stl':>4} {'w':>3}  why{RESET}"
+    )
+    for i, r in enumerate(show, 1):
+        chg_c = GREEN if r.change_24h >= 0 else RED
+        why = r.blocked_by or "?"
+        print(
+            f"  {i:>2}  {CYAN}{r.symbol:<14}{RESET} "
+            f"{chg_c}{r.change_24h:>+6.1f}%{RESET} "
+            f"{r.pump_7d_pct:>4.0f}% "
+            f"{r.near_high_pct:>4.0f}% "
+            f"{r.near_regime_pct:>4.0f}% "
+            f"{r.sharp_pct:>3.0f} "
+            f"{r.stall_score:>3.0f} "
+            f"{r.ask_walls:>3}  "
+            f"{_block_tag(why)} {DIM}{r.detail}{RESET}"
+        )
+    print()
 
 
 def print_hits(
@@ -333,69 +457,80 @@ def print_hits(
     *,
     ideal_near: float,
     prev: dict[str, float] | None = None,
+    blocked: list[AnalyzeRow] | None = None,
+    why_limit: int = 0,
 ) -> dict[str, float]:
     """Render table. Returns symbol→score map for the next refresh diff."""
     if not hits:
         print(f"{YELLOW}No pump→stall short-grid candidates right now.{RESET}")
-        return {}
-    ranked = sorted(
-        hits,
-        key=lambda h: (0 if h.near_high_pct >= ideal_near else 1, -h.score),
-    )
-    print(
-        f"{DIM}★ = ideal (≤{100 - ideal_near:.0f}% off 1D top · near≥{ideal_near:.0f}%)"
-        f" · blank = late · + = new this refresh{RESET}"
-    )
-    print(
-        f"{BOLD}{'':>1} {'#':>2}  {'SYMBOL':<14} {'24h%':>7} {'pump':>7} "
-        f"{'near':>5} {'reg%':>5} {'shp':>4} {'stl':>4} "
-        f"{'w':>3} {'span':>5}  score  note{RESET}"
-    )
-    now_map: dict[str, float] = {}
-    for i, h in enumerate(ranked, 1):
-        now_map[h.symbol] = h.score
-        star = "★" if h.near_high_pct >= ideal_near else " "
-        flag = " "
-        if prev is not None and h.symbol not in prev:
-            flag = "+"
-        elif prev is not None and h.symbol in prev:
-            d = h.score - prev[h.symbol]
-            if d >= 3:
-                flag = "↑"
-            elif d <= -3:
-                flag = "↓"
-        chg_c = GREEN if h.change_24h >= 0 else RED
-        star_s = f"{YELLOW}{star}{RESET}" if star.strip() else " "
-        flag_s = (
-            f"{GREEN}{flag}{RESET}" if flag in "+↑"
-            else (f"{RED}{flag}{RESET}" if flag == "↓" else " ")
+    else:
+        ranked = sorted(
+            hits,
+            key=lambda h: (0 if h.near_high_pct >= ideal_near else 1, -h.score),
         )
         print(
-            f"{star_s}{flag_s} {i:>2}  {CYAN}{h.symbol:<14}{RESET} "
-            f"{chg_c}{h.change_24h:>+6.1f}%{RESET} "
-            f"{h.pump_7d_pct:>6.0f}% "
-            f"{h.near_high_pct:>4.0f}% "
-            f"{h.near_regime_pct:>4.0f}% "
-            f"{h.sharp_pct:>3.0f} "
-            f"{h.stall_score:>3.0f} "
-            f"{h.ask_walls:>3} "
-            f"{h.ask_span_pct:>4.1f}  "
-            f"{h.score:>5.1f}  {DIM}{h.note}{RESET}"
+            f"{DIM}★ = ideal (≤{100 - ideal_near:.0f}% off 1D top · near≥{ideal_near:.0f}%)"
+            f" · blank = late · + = new this refresh{RESET}"
         )
-        if h.wall_prices:
-            px = " → ".join(f"{p:g}" for p in h.wall_prices[:6])
-            print(f"      {DIM}ask walls: {px}{RESET}")
-    if prev is not None:
-        gone = [s for s in prev if s not in now_map]
-        if gone:
-            print(f"{DIM}left: {', '.join(gone)}{RESET}")
-    print()
-    print(
-        f"{DIM}Hint: dca SYMBOL short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 "
-        f"--min-gap … --so-count …{RESET}"
-    )
-    return now_map
+        print(
+            f"{BOLD}{'':>1} {'#':>2}  {'SYMBOL':<14} {'24h%':>7} {'pump':>7} "
+            f"{'near':>5} {'reg%':>5} {'shp':>4} {'stl':>4} "
+            f"{'w':>3} {'span':>5}  score  note{RESET}"
+        )
+        now_map: dict[str, float] = {}
+        for i, h in enumerate(ranked, 1):
+            now_map[h.symbol] = h.score
+            star = "★" if h.near_high_pct >= ideal_near else " "
+            flag = " "
+            if prev is not None and h.symbol not in prev:
+                flag = "+"
+            elif prev is not None and h.symbol in prev:
+                d = h.score - prev[h.symbol]
+                if d >= 3:
+                    flag = "↑"
+                elif d <= -3:
+                    flag = "↓"
+            chg_c = GREEN if h.change_24h >= 0 else RED
+            star_s = f"{YELLOW}{star}{RESET}" if star.strip() else " "
+            flag_s = (
+                f"{GREEN}{flag}{RESET}" if flag in "+↑"
+                else (f"{RED}{flag}{RESET}" if flag == "↓" else " ")
+            )
+            print(
+                f"{star_s}{flag_s} {i:>2}  {CYAN}{h.symbol:<14}{RESET} "
+                f"{chg_c}{h.change_24h:>+6.1f}%{RESET} "
+                f"{h.pump_7d_pct:>6.0f}% "
+                f"{h.near_high_pct:>4.0f}% "
+                f"{h.near_regime_pct:>4.0f}% "
+                f"{h.sharp_pct:>3.0f} "
+                f"{h.stall_score:>3.0f} "
+                f"{h.ask_walls:>3} "
+                f"{h.ask_span_pct:>4.1f}  "
+                f"{h.score:>5.1f}  {DIM}{h.note}{RESET}"
+            )
+            if h.wall_prices:
+                px = " → ".join(f"{p:g}" for p in h.wall_prices[:6])
+                print(f"      {DIM}ask walls: {px}{RESET}")
+        if prev is not None:
+            gone = [s for s in prev if s not in now_map]
+            if gone:
+                print(f"{DIM}left: {', '.join(gone)}{RESET}")
+        print()
+        print(
+            f"{DIM}Hint: dca SYMBOL short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 "
+            f"--min-gap … --so-count …{RESET}"
+        )
+        if why_limit > 0 and blocked is not None:
+            print()
+            print_blocked(blocked, limit=why_limit)
+        return now_map
 
+    if why_limit > 0 and blocked is not None:
+        print()
+        print_blocked(blocked, limit=why_limit)
+    elif why_limit > 0:
+        print(f"{DIM}(no blocked rows){RESET}")
+    return {}
 
 def _clear_screen() -> None:
     # Keep scrollback usable; full clear each refresh
@@ -617,7 +752,7 @@ def watch_loop(args: argparse.Namespace) -> int:
             round_n += 1
             t0 = time.time()
             try:
-                hits = scan(args)
+                hits, blocked = scan(args)
             except Exception as exc:  # noqa: BLE001
                 _clear_screen()
                 print(f"{RED}Scan failed: {exc}{RESET}")
@@ -633,7 +768,14 @@ def watch_loop(args: argparse.Namespace) -> int:
                 f"next in {interval:g}s · {mode} · Ctrl+C{RESET}"
             )
             print()
-            prev = print_hits(hits, ideal_near=args.ideal_near, prev=prev)
+            why_n = int(getattr(args, "why", 15) or 0)
+            prev = print_hits(
+                hits,
+                ideal_near=args.ideal_near,
+                prev=prev,
+                blocked=blocked,
+                why_limit=why_n,
+            )
             if auto:
                 print()
                 active = _maybe_auto_trade(hits, args, active=active)
@@ -727,6 +869,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Passed to dca --structure-interval when auto-trading",
     )
+    p.add_argument(
+        "--why",
+        type=int,
+        nargs="?",
+        const=15,
+        default=15,
+        metavar="N",
+        help="Show top N blocked seed symbols colored by first failing filter "
+             "(default 15; --why 0 to hide; --why 30 for more)",
+    )
     return p.parse_args(argv)
 
 
@@ -742,11 +894,15 @@ def main(argv: list[str] | None = None) -> int:
         f"{BOLD}{CYAN}Pump→stall short-grid scan{RESET}  "
         f"{DIM}(1D blow-off filter · display only){RESET}"
     )
-    hits = scan(args)
-    print_hits(hits, ideal_near=args.ideal_near)
+    hits, blocked = scan(args)
+    print_hits(
+        hits,
+        ideal_near=args.ideal_near,
+        blocked=blocked,
+        why_limit=int(getattr(args, "why", 15) or 0),
+    )
     print(f"{DIM}done in {time.time() - t0:.1f}s{RESET}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
