@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-shot scan: ./pump-stall
 # Live supervisor: ./pump-stall --watch [--interval 60]
-# Auto-trade (C):  ./pump-stall --watch --auto-trade
+# Auto-trade (C):  ./pump-stall --watch --auto-trade [--max-trades 2]
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec python3 "$ROOT/pump_stall_scan.py" "$@"

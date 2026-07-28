@@ -8,13 +8,14 @@
   4. Starting to stall on daily ranges
   5. Enough ask-side order-book walls for a SHORT DCA grid
 
-Display-only by default. With --watch --auto-trade: if the account is flat
-and a ★ ideal exists, launches `dca SYMBOL short --exit structure --once`
-(one trade cycle), then rescans for the next best ★.
+Display-only by default. With --watch --auto-trade: run the top
+`--max-trades` ★ from this list (default 2) via
+`dca SYMBOL short --exit structure --once`. Other open pairs on the
+account do not consume these slots.
 
   python3 pump_stall_scan.py
   ./pump-stall --top 15 --min-near-regime 80 --min-sharp 35
-  ./pump-stall --watch --auto-trade --interval 60
+  ./pump-stall --watch --auto-trade --max-trades 2 --interval 60
 """
 
 from __future__ import annotations
@@ -442,11 +443,38 @@ def _dca_supervisor_running() -> list[str]:
         return []
 
 
-def _pick_ideal(hits: list[PumpStallHit], ideal_near: float) -> PumpStallHit | None:
-    ideals = [h for h in hits if h.near_high_pct >= ideal_near]
-    if not ideals:
-        return None
-    return max(ideals, key=lambda h: h.score)
+def _pick_ideals(
+    hits: list[PumpStallHit],
+    ideal_near: float,
+    *,
+    exclude: set[str],
+    limit: int,
+) -> list[PumpStallHit]:
+    """Top ★ ideals by score, skipping symbols already busy."""
+    if limit <= 0:
+        return []
+    ideals = [
+        h for h in hits
+        if h.near_high_pct >= ideal_near and h.symbol.upper() not in exclude
+    ]
+    ideals.sort(key=lambda h: h.score, reverse=True)
+    return ideals[:limit]
+
+
+def _reap_active(
+    active: dict[str, subprocess.Popen],
+) -> dict[str, subprocess.Popen]:
+    """Drop finished --once children; log exits."""
+    alive: dict[str, subprocess.Popen] = {}
+    for sym, proc in active.items():
+        code = proc.poll()
+        if code is None:
+            alive[sym] = proc
+            continue
+        print(
+            f"{DIM}AUTO: {sym} --once exited (code {code}) — slot free{RESET}"
+        )
+    return alive
 
 
 def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.Popen | None:
@@ -499,38 +527,57 @@ def _maybe_auto_trade(
     hits: list[PumpStallHit],
     args: argparse.Namespace,
     *,
-    active_proc: subprocess.Popen | None,
-) -> subprocess.Popen | None:
-    """If flat + no supervise + ★ ideal → launch one --once dca. Else keep waiting."""
-    if active_proc is not None and active_proc.poll() is None:
-        print(
-            f"{DIM}AUTO: trade supervisor still running "
-            f"(pid={active_proc.pid}) — waiting for --once exit…{RESET}"
-        )
-        return active_proc
-    if active_proc is not None and active_proc.poll() is not None:
-        print(
-            f"{DIM}AUTO: previous --once exited (code {active_proc.returncode}) "
-            f"— rescanning for next ★{RESET}"
-        )
-        active_proc = None
+    active: dict[str, subprocess.Popen],
+) -> dict[str, subprocess.Popen]:
+    """Keep the top --max-trades ★ from this scan running (this bot only).
 
-    running = _dca_supervisor_running()
-    if running:
-        print(f"{DIM}AUTO: dca supervise already on {', '.join(running)} — skip{RESET}")
-        return None
+    Other account positions / unrelated supervisors do not consume slots.
+    We never launch outside the current top-N ★ list.
+    """
+    active = _reap_active(active)
+    max_trades = max(1, int(getattr(args, "max_trades", 2) or 2))
 
-    open_syms = _account_open_symbols()
-    if open_syms:
-        print(f"{DIM}AUTO: open positions {', '.join(open_syms)} — skip{RESET}")
-        return None
-
-    pick = _pick_ideal(hits, args.ideal_near)
-    if pick is None:
+    # Target set: first N ★ by score from this table only
+    target = _pick_ideals(hits, args.ideal_near, exclude=set(), limit=max_trades)
+    target_syms = [h.symbol.upper() for h in target]
+    if not target_syms:
         print(f"{DIM}AUTO: no ★ ideal this round — skip{RESET}")
-        return None
+        return active
 
-    return _launch_dca_once(pick, args)
+    running = {s.upper() for s in _dca_supervisor_running()}
+    ours = {s.upper() for s in active}
+
+    print(
+        f"{DIM}AUTO: target ★ top-{max_trades}: {', '.join(target_syms)}"
+        f" · ours {', '.join(sorted(ours)) or '—'} · "
+        f"supervise {', '.join(sorted(running)) or '—'}{RESET}"
+    )
+
+    for hit in target:
+        sym = hit.symbol.upper()
+        if sym in ours or sym in running:
+            continue  # already covered (ours or any supervise on this symbol)
+        if len(active) >= max_trades:
+            print(
+                f"{DIM}AUTO: at --max-trades={max_trades} "
+                f"(this bot) — wait for a slot{RESET}"
+            )
+            break
+        proc = _launch_dca_once(hit, args)
+        if proc is not None:
+            active[sym] = proc
+            ours.add(sym)
+
+    missing = [s for s in target_syms if s not in ours and s not in running]
+    covered = [s for s in target_syms if s in ours or s in running]
+    if covered and not missing:
+        print(f"{DIM}AUTO: top ★ covered ({', '.join(covered)}){RESET}")
+    elif missing and len(active) >= max_trades:
+        pass  # already logged slot wait
+    elif missing:
+        print(f"{DIM}AUTO: still need {', '.join(missing)}{RESET}")
+
+    return active
 
 
 def watch_loop(args: argparse.Namespace) -> int:
@@ -538,9 +585,13 @@ def watch_loop(args: argparse.Namespace) -> int:
     interval = max(15.0, float(args.interval))
     prev: dict[str, float] | None = None
     round_n = 0
-    active: subprocess.Popen | None = None
+    active: dict[str, subprocess.Popen] = {}
     auto = bool(getattr(args, "auto_trade", False))
-    mode = "AUTO-TRADE · --once" if auto else "display only"
+    max_trades = max(1, int(getattr(args, "max_trades", 2) or 2))
+    mode = (
+        f"AUTO-TRADE · --once · top {max_trades} ★"
+        if auto else "display only"
+    )
     print(
         f"{BOLD}{CYAN}Pump→stall supervisor{RESET}  "
         f"{DIM}{mode} · refresh every {interval:g}s · Ctrl+C to stop{RESET}"
@@ -569,7 +620,7 @@ def watch_loop(args: argparse.Namespace) -> int:
             prev = print_hits(hits, ideal_near=args.ideal_near, prev=prev)
             if auto:
                 print()
-                active = _maybe_auto_trade(hits, args, active_proc=active)
+                active = _maybe_auto_trade(hits, args, active=active)
             left = interval
             while left > 0:
                 step = min(1.0, left)
@@ -577,10 +628,11 @@ def watch_loop(args: argparse.Namespace) -> int:
                 left -= step
     except KeyboardInterrupt:
         print(f"\n{DIM}supervisor stopped.{RESET}")
-        if active is not None and active.poll() is None:
+        still = [f"{s} pid={p.pid}" for s, p in active.items() if p.poll() is None]
+        if still:
             print(
-                f"{DIM}Note: dca --once for pid={active.pid} still running "
-                f"in background (not killed).{RESET}"
+                f"{DIM}Note: dca --once still running "
+                f"({', '.join(still)}) — not killed.{RESET}"
             )
         return 0
 
@@ -636,8 +688,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--auto-trade",
         action="store_true",
-        help="With --watch: if account flat and a ★ ideal exists, launch "
-             "`dca SYMBOL short --exit structure --once` (one cycle, then rescan)",
+        help="With --watch: run the top ★ from this list via "
+             "`dca SYMBOL short --exit structure --once` (up to --max-trades)",
+    )
+    p.add_argument(
+        "--max-trades",
+        type=int,
+        default=2,
+        help="With --auto-trade: how many top ★ from this scan to run "
+             "(this bot only; other account pairs do not count; default 2)",
     )
     p.add_argument(
         "--structure-interval",
