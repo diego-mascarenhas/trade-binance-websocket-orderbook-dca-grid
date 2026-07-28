@@ -1,10 +1,10 @@
 [Unit]
-Description=Pump→stall EARLY test profile (lower stall/near · ★ shorts)
+Description=Pump→stall EARLY profile (prod default · lower stall/near · ★ shorts)
 After=network-online.target
 Wants=network-online.target
 
-# Do NOT enable alongside pump-stall-watch unless you want both scanning.
-# Prefer one or the other: default unit stays strict; this is the experiment.
+# Do NOT enable alongside pump-stall-watch — only one scanner.
+# This unit is the production default; pump-stall-watch is the strict fallback.
 
 [Service]
 Type=simple

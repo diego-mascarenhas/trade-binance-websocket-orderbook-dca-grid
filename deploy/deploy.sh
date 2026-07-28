@@ -77,7 +77,8 @@ fi
 # Reload unit templates if present (safe when unchanged).
 if [[ -d /etc/systemd/system ]]; then
   UNIT_SRC=()
-  for u in dca-futures@.service dca-spot@.service dca-telegram-ctl.service dca-api.service pump-stall-watch.service; do
+  for u in dca-futures@.service dca-spot@.service dca-telegram-ctl.service dca-api.service \
+           pump-stall-watch.service pump-stall-watch-early.service; do
     [[ -f "deploy/$u" ]] && UNIT_SRC+=("deploy/$u")
   done
   if [[ ${#UNIT_SRC[@]} -gt 0 ]]; then
@@ -110,19 +111,25 @@ if [[ "$RESTART_API" -eq 1 ]]; then
 fi
 
 # Restart pump-stall orchestrator only if already enabled (does not auto-enable).
-if systemctl is-enabled pump-stall-watch.service &>/dev/null; then
+# Prefer early (prod default); fall back to strict watch.
+if systemctl is-enabled pump-stall-watch-early.service &>/dev/null; then
+  run sudo systemctl restart pump-stall-watch-early
+elif systemctl is-enabled pump-stall-watch.service &>/dev/null; then
   run sudo systemctl restart pump-stall-watch
 else
-  echo "==> pump-stall-watch not enabled — skip (install: systemctl enable --now pump-stall-watch)"
+  echo "==> pump-stall not enabled — skip"
+  echo "    Switch to early: sudo systemctl disable --now pump-stall-watch \\"
+  echo "                     && sudo systemctl enable --now pump-stall-watch-early"
 fi
 
 if [[ "$SHOW_STATUS" -eq 1 ]]; then
   run python3 deploy/sync_pairs.py status
-  run sudo systemctl --no-pager --full status dca-api dca-telegram-ctl pump-stall-watch || true
+  run sudo systemctl --no-pager --full status dca-api dca-telegram-ctl \
+    pump-stall-watch-early pump-stall-watch || true
 fi
 
 echo "==> Deploy done."
 echo "    Structure TP: set EXIT_MODE=structure (and optional STRUCTURE_INTERVAL=15m) in .env, then re-run."
 echo "    One symbol:   sudo systemctl restart 'dca-futures@SOLUSDT'"
-echo "    Pump-stall:   sudo systemctl status pump-stall-watch"
-echo "                  sudo journalctl -u pump-stall-watch -f"
+echo "    Pump-stall:   sudo systemctl status pump-stall-watch-early"
+echo "                  sudo journalctl -u pump-stall-watch-early -f"
