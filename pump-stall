@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
-# Short wrapper: pump-stall [--top 15] …
+# One-shot scan: ./pump-stall
+# Live supervisor: ./pump-stall --watch [--interval 60]
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec python3 "$ROOT/pump_stall_scan.py" "$@"

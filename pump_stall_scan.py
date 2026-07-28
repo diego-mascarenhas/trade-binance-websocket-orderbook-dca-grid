@@ -322,30 +322,50 @@ def scan(args: argparse.Namespace) -> list[PumpStallHit]:
     return hits[: args.top]
 
 
-def print_hits(hits: list[PumpStallHit], *, ideal_near: float) -> None:
+def print_hits(
+    hits: list[PumpStallHit],
+    *,
+    ideal_near: float,
+    prev: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Render table. Returns symbol→score map for the next refresh diff."""
     if not hits:
         print(f"{YELLOW}No pump→stall short-grid candidates right now.{RESET}")
-        return
-    # Ideals first (near top), then the rest — both stay in the table
+        return {}
     ranked = sorted(
         hits,
         key=lambda h: (0 if h.near_high_pct >= ideal_near else 1, -h.score),
     )
-    print()
     print(
-        f"{DIM}★ = ideal short zone (≤{100 - ideal_near:.0f}% off 1D top · near≥{ideal_near:.0f}%)"
-        f" · blank = listed but late / farther from top{RESET}"
+        f"{DIM}★ = ideal (≤{100 - ideal_near:.0f}% off 1D top · near≥{ideal_near:.0f}%)"
+        f" · blank = late · + = new this refresh{RESET}"
     )
     print(
         f"{BOLD}{'':>1} {'#':>2}  {'SYMBOL':<14} {'24h%':>7} {'pump':>7} "
         f"{'near':>5} {'reg%':>5} {'shp':>4} {'stl':>4} "
         f"{'w':>3} {'span':>5}  score  note{RESET}"
     )
+    now_map: dict[str, float] = {}
     for i, h in enumerate(ranked, 1):
-        star = f"{YELLOW}★{RESET}" if h.near_high_pct >= ideal_near else " "
+        now_map[h.symbol] = h.score
+        star = "★" if h.near_high_pct >= ideal_near else " "
+        flag = " "
+        if prev is not None and h.symbol not in prev:
+            flag = "+"
+        elif prev is not None and h.symbol in prev:
+            d = h.score - prev[h.symbol]
+            if d >= 3:
+                flag = "↑"
+            elif d <= -3:
+                flag = "↓"
         chg_c = GREEN if h.change_24h >= 0 else RED
+        star_s = f"{YELLOW}{star}{RESET}" if star.strip() else " "
+        flag_s = (
+            f"{GREEN}{flag}{RESET}" if flag in "+↑"
+            else (f"{RED}{flag}{RESET}" if flag == "↓" else " ")
+        )
         print(
-            f"{star} {i:>2}  {CYAN}{h.symbol:<14}{RESET} "
+            f"{star_s}{flag_s} {i:>2}  {CYAN}{h.symbol:<14}{RESET} "
             f"{chg_c}{h.change_24h:>+6.1f}%{RESET} "
             f"{h.pump_7d_pct:>6.0f}% "
             f"{h.near_high_pct:>4.0f}% "
@@ -359,16 +379,69 @@ def print_hits(hits: list[PumpStallHit], *, ideal_near: float) -> None:
         if h.wall_prices:
             px = " → ".join(f"{p:g}" for p in h.wall_prices[:6])
             print(f"      {DIM}ask walls: {px}{RESET}")
+    if prev is not None:
+        gone = [s for s in prev if s not in now_map]
+        if gone:
+            print(f"{DIM}left: {', '.join(gone)}{RESET}")
     print()
     print(
         f"{DIM}Hint: dca SYMBOL short --exit structure "
         f"--min-gap … --so-count …{RESET}"
     )
+    return now_map
+
+
+def _clear_screen() -> None:
+    # Keep scrollback usable; full clear each refresh
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+def watch_loop(args: argparse.Namespace) -> int:
+    """Live supervisor: rescan on an interval and redraw the table."""
+    interval = max(15.0, float(args.interval))
+    prev: dict[str, float] | None = None
+    round_n = 0
+    print(
+        f"{BOLD}{CYAN}Pump→stall supervisor{RESET}  "
+        f"{DIM}refresh every {interval:g}s · Ctrl+C to stop{RESET}"
+    )
+    try:
+        while True:
+            round_n += 1
+            t0 = time.time()
+            try:
+                hits = scan(args)
+            except Exception as exc:  # noqa: BLE001
+                _clear_screen()
+                print(f"{RED}Scan failed: {exc}{RESET}")
+                print(f"{DIM}Retrying in {interval:g}s…{RESET}")
+                time.sleep(interval)
+                continue
+            elapsed = time.time() - t0
+            _clear_screen()
+            now = time.strftime("%H:%M:%S")
+            print(
+                f"{BOLD}{CYAN}Pump→stall supervisor{RESET}  "
+                f"{DIM}#{round_n} · {now} · scan {elapsed:.1f}s · "
+                f"next in {interval:g}s · Ctrl+C{RESET}"
+            )
+            print()
+            prev = print_hits(hits, ideal_near=args.ideal_near, prev=prev)
+            # Sleep in chunks so Ctrl+C is responsive
+            left = interval
+            while left > 0:
+                step = min(1.0, left)
+                time.sleep(step)
+                left -= step
+    except KeyboardInterrupt:
+        print(f"\n{DIM}supervisor stopped.{RESET}")
+        return 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Scan for 1D blow-off → stall shorts with ask liquidity for a DCA grid"
+        description="Scan / supervise 1D blow-off → stall shorts with ask liquidity"
     )
     p.add_argument("--base", default=FAPI_BASE, help="Futures REST base URL")
     p.add_argument("--top", type=int, default=12, help="Max hits to show")
@@ -403,11 +476,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-range", type=float, default=12.0)
     p.add_argument("--limit", type=int, default=500, help="Depth limit")
     p.add_argument("--workers", type=int, default=8)
+    p.add_argument(
+        "--watch",
+        action="store_true",
+        help="Live supervisor: refresh table on screen (Ctrl+C to stop)",
+    )
+    p.add_argument(
+        "--interval",
+        type=float,
+        default=60.0,
+        help="Watch refresh interval in seconds (default 60, min 15)",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.watch:
+        return watch_loop(args)
     t0 = time.time()
     print(
         f"{BOLD}{CYAN}Pump→stall short-grid scan{RESET}  "
