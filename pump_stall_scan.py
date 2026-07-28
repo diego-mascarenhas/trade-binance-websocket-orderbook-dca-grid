@@ -322,20 +322,30 @@ def scan(args: argparse.Namespace) -> list[PumpStallHit]:
     return hits[: args.top]
 
 
-def print_hits(hits: list[PumpStallHit]) -> None:
+def print_hits(hits: list[PumpStallHit], *, ideal_near: float) -> None:
     if not hits:
         print(f"{YELLOW}No pump→stall short-grid candidates right now.{RESET}")
         return
+    # Ideals first (near top), then the rest — both stay in the table
+    ranked = sorted(
+        hits,
+        key=lambda h: (0 if h.near_high_pct >= ideal_near else 1, -h.score),
+    )
     print()
     print(
-        f"{BOLD}{'#':>2}  {'SYMBOL':<14} {'24h%':>7} {'pump':>7} "
+        f"{DIM}★ = ideal short zone (≤{100 - ideal_near:.0f}% off 1D top · near≥{ideal_near:.0f}%)"
+        f" · blank = listed but late / farther from top{RESET}"
+    )
+    print(
+        f"{BOLD}{'':>1} {'#':>2}  {'SYMBOL':<14} {'24h%':>7} {'pump':>7} "
         f"{'near':>5} {'reg%':>5} {'shp':>4} {'stl':>4} "
         f"{'w':>3} {'span':>5}  score  note{RESET}"
     )
-    for i, h in enumerate(hits, 1):
+    for i, h in enumerate(ranked, 1):
+        star = f"{YELLOW}★{RESET}" if h.near_high_pct >= ideal_near else " "
         chg_c = GREEN if h.change_24h >= 0 else RED
         print(
-            f"{i:>2}  {CYAN}{h.symbol:<14}{RESET} "
+            f"{star} {i:>2}  {CYAN}{h.symbol:<14}{RESET} "
             f"{chg_c}{h.change_24h:>+6.1f}%{RESET} "
             f"{h.pump_7d_pct:>6.0f}% "
             f"{h.near_high_pct:>4.0f}% "
@@ -373,7 +383,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--min-pump-7d", type=float, default=35.0,
                    help="Min trough→peak %% over recent ~14d")
     p.add_argument("--min-near-high", type=float, default=85.0,
-                   help="Min last/recent-peak %% (still near the top)")
+                   help="Min last/recent-peak %% to appear in the table")
+    p.add_argument("--ideal-near", type=float, default=92.0,
+                   help="near%% ≥ this → ★ ideal short zone (default 92 ≈ ≤8%% off top)")
     p.add_argument("--min-near-regime", type=float, default=80.0,
                    help="Min last/30–45d high %% — rejects downtrend bounces (ZBT)")
     p.add_argument("--min-sharp", type=float, default=35.0,
@@ -402,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{DIM}(1D blow-off filter · display only){RESET}"
     )
     hits = scan(args)
-    print_hits(hits)
+    print_hits(hits, ideal_near=args.ideal_near)
     print(f"{DIM}done in {time.time() - t0:.1f}s{RESET}")
     return 0
 
