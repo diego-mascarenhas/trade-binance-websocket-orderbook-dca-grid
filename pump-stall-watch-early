@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Early-stall TEST profile — does not change default ./pump-stall-watch.
+#
+# Looser entry so blow-offs near the 1D top can appear / trade sooner:
+#   stall ≥ 25 (default 35) · near ≥ 82 (default 85) · ★ near ≥ 90 (default 92)
+#
+# Usage:
+#   ./pump-stall-watch-early
+#   ./pump-stall-watch-early --auto-trade --max-trades 1
+#   ./pump-stall-watch-early --why 30
+#
+# Extra flags after the preset still work (later flags win in argparse).
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$ROOT/pump_stall_scan.py" --watch \
+  --min-stall 25 \
+  --min-near-high 82 \
+  --ideal-near 90 \
+  --why 20 \
+  "$@"

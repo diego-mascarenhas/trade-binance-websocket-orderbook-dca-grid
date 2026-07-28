@@ -16,6 +16,11 @@ Other open pairs on the account do not consume these slots.
   python3 pump_stall_scan.py
   ./pump-stall --top 15 --min-near-regime 80 --min-sharp 35
   ./pump-stall --watch --auto-trade --max-trades 2 --interval 60
+
+Profiles (wrappers; defaults of ./pump-stall-watch stay strict):
+  ./pump-stall-watch          # stall≥35 · near≥85 · ★≥92
+  ./pump-stall-watch-early    # TEST: stall≥25 · near≥82 · ★≥90
+  ./pump-stall-early          # one-shot scan with the early profile
 """
 
 from __future__ import annotations

@@ -1,0 +1,28 @@
+[Unit]
+Description=Pump→stall EARLY test profile (lower stall/near · ★ shorts)
+After=network-online.target
+Wants=network-online.target
+
+# Do NOT enable alongside pump-stall-watch unless you want both scanning.
+# Prefer one or the other: default unit stays strict; this is the experiment.
+
+[Service]
+Type=simple
+User=forge
+WorkingDirectory=/opt/trade-binance-websocket-orderbook-dca-grid
+EnvironmentFile=-/opt/trade-binance-websocket-orderbook-dca-grid/.env
+ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/pump_stall_scan.py \
+  --watch \
+  --auto-trade \
+  --max-trades 1 \
+  --interval 60 \
+  --loss-cooldown-min 1440 \
+  --min-stall 25 \
+  --min-near-high 82 \
+  --ideal-near 90 \
+  --why 20
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
