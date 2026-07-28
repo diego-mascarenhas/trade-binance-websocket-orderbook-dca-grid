@@ -1873,17 +1873,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Exit strategy (plugins in exits/ — default staged TP1 + trail)
     p.add_argument(
         "--exit", dest="exit_mode",
-        choices=["trailing", "staged", "structure", "none"],
+        choices=["trailing", "staged", "structure", "be", "none"],
         default=None,
-        help="Exit strategy with open position: trailing | staged | structure (LONG→EQH / SHORT→EQL) | none "
-             "(default: staged; override with EXIT_MODE env)",
+        help="Exit strategy: trailing | staged | structure (TP=EQH/EQL; BE protect on by default) "
+             "| be (protect only, no TP) | none (default: staged; EXIT_MODE env)",
     )
     p.add_argument("--no-tp", action="store_true",
                    help="Legacy alias for --exit none (skip automatic exit management)")
     p.add_argument("--tp1-profit-pct", type=float, default=None,
                    help="[--exit staged] Profit %% for first partial. Env: TP1_PROFIT_PCT")
+    p.add_argument(
+        "--protect-be",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="[--exit structure] Also arm BE protect SL (default on). "
+             "Use --no-protect-be for structure TP only",
+    )
+    p.add_argument("--be-arm-pct", type=float, default=None,
+                   help="[--exit structure|be] Arm BE SL when unrealized profit %% ≥ this "
+                        "(default 1.0). Env: BE_ARM_PCT")
     p.add_argument("--be-profit-pct", type=float, default=None,
-                   help="[--exit staged] Runner SL profit lock %% after TP1. Env: BE_PROFIT_PCT")
+                   help="[--exit structure|be|staged] SL profit lock %% from entry "
+                        "(structure/be default 0.3, staged default 0.1; no fee buffer). "
+                        "Env: BE_PROFIT_PCT")
     p.add_argument("--tp-partial-pct", type=float, default=None,
                    help="[--exit staged] First partial size %%. Env: TP_PARTIAL_PCT")
     p.add_argument(

@@ -10,8 +10,8 @@
 
 Display-only by default. With --watch --auto-trade: run the top
 `--max-trades` ★ from this list (default 2) via
-`dca SYMBOL short --exit structure --once`. Other open pairs on the
-account do not consume these slots.
+`dca SYMBOL short --exit structure` (TP=EQL) + BE protect (arm 1% → lock 0.3%).
+Other open pairs on the account do not consume these slots.
 
   python3 pump_stall_scan.py
   ./pump-stall --top 15 --min-near-regime 80 --min-sharp 35
@@ -391,7 +391,7 @@ def print_hits(
             print(f"{DIM}left: {', '.join(gone)}{RESET}")
     print()
     print(
-        f"{DIM}Hint: dca SYMBOL short --exit structure "
+        f"{DIM}Hint: dca SYMBOL short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 "
         f"--min-gap … --so-count …{RESET}"
     )
     return now_map
@@ -478,7 +478,7 @@ def _reap_active(
 
 
 def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.Popen | None:
-    """Start `dca SYMBOL short --exit structure --once …` in the background."""
+    """Start `dca SYMBOL short --exit structure` (EQL TP + BE protect) --once."""
     root = _repo_root()
     dca_bin = os.path.join(root, "dca")
     log_dir = os.path.join(root, "logs")
@@ -489,6 +489,9 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         hit.symbol,
         "short",
         "--exit", "structure",
+        "--protect-be",
+        "--be-arm-pct", "1",
+        "--be-profit-pct", "0.3",
         "--once",
         "--so-count", str(args.so_count),
         "--min-gap", str(args.min_gap),
@@ -514,8 +517,8 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         )
         print(
             f"{BOLD}{GREEN}AUTO ★ {hit.symbol}{RESET}  "
-            f"{DIM}pid={proc.pid} · dca short --exit structure --once · "
-            f"log {log_path}{RESET}"
+            f"{DIM}pid={proc.pid} · dca short --exit structure "
+            f"+ BE@1%→0.3% --once · log {log_path}{RESET}"
         )
         return proc
     except Exception as exc:  # noqa: BLE001
@@ -689,7 +692,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--auto-trade",
         action="store_true",
         help="With --watch: run the top ★ from this list via "
-             "`dca SYMBOL short --exit structure --once` (up to --max-trades)",
+             "`dca SYMBOL short --exit structure` + BE protect --once "
+             "(up to --max-trades)",
     )
     p.add_argument(
         "--max-trades",
