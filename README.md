@@ -227,8 +227,10 @@ python3 orderbook_staged_exit.py LINKUSDT
 
 ```bash
 dca ZAMAUSDT short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 \
+  --partial-tp --tp-partial-pct 70 \
   --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once
-# TP = EQL; BE @ +1% → entry+0.3%; then trail from +2% (callback 0.8%)
+# 70% TAKE_PROFIT @ +0.3% gross (only if notional ≥ 500 USDT) · BE @ +1% → entry+0.3%
+# · trail from +2% · TP resto = EQL
 ```
 
 Add new exit strategies under `exits/` and register them in `exits/__init__.py`.
@@ -264,8 +266,8 @@ python3 pump_stall_scan.py --help
 1. Keeps scanning; picks the top **`--max-trades`** ★ symbols (default **3**) by score  
 2. Slots are **only for this bot’s ★ list** — other open pairs on the account do not count  
 3. Launches:  
-   `dca SYMBOL short --exit structure --protect-be --be-arm-pct 1 --be-profit-pct 0.3 --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once`  
-4. Exits: **TP = EQL**; **BE** at +1% → SL entry+0.3%; **trail** from +2% (callback 0.8%)  
+   `dca SYMBOL short --exit structure --protect-be --partial-tp --tp-partial-pct 70 --be-arm-pct 1 --be-profit-pct 0.3 --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once`  
+4. Exits: **70% TP @ +0.3% gross** (only if notional ≥ **500 USDT**); **BE** at +1% → SL entry+0.3%; **trail** from +2%; resto **EQL**  
 5. `--once` = one cycle then exit (no re-arm)  
 6. When a slot frees, rescans and may take the next best ★  
 7. Losing close → **`--loss-cooldown-min`** (default **1440 = 24h**) on that symbol (`.state/loss_cooldown.json`)

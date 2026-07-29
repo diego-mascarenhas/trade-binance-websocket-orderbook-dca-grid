@@ -143,13 +143,22 @@ def run_exit_once(
         run_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
         return
     if mode == EXIT_STRUCTURE:
-        # Protect first (exchange SL), then structure TP (EQL/EQH soft close).
+        # 1) Fee-min partial TP (70%) → 2) BE protect → 3) structure EQL/EQH
+        from exits.partial_tp import run_once as partial_once
+        from orderbook_dca_grid import _detect_open_side
+
+        recv = int(getattr(args, "recv_window", 15000) or 15000)
+        partial_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
+        still_long, still_qty, still_entry = _detect_open_side(
+            symbol, hedge, api, sec, recv, prefer_is_long=side_is_long,
+        )
+        if still_long is None or still_qty <= 0:
+            return
+        side_is_long, qty, entry = still_long, still_qty, still_entry
+
         if protect_be_enabled(args):
             from exits.be import run_once as be_once
             be_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
-            # Position may have been closed by immediate BE trigger
-            from orderbook_dca_grid import _detect_open_side
-            recv = int(getattr(args, "recv_window", 15000) or 15000)
             still_long, still_qty, still_entry = _detect_open_side(
                 symbol, hedge, api, sec, recv, prefer_is_long=side_is_long,
             )

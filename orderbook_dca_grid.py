@@ -1909,7 +1909,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-tp", action="store_true",
                    help="Legacy alias for --exit none (skip automatic exit management)")
     p.add_argument("--tp1-profit-pct", type=float, default=None,
-                   help="[--exit staged] Profit %% for first partial. Env: TP1_PROFIT_PCT")
+                   help="[--exit staged|structure] Partial TP profit %% from entry (gross). "
+                        "With --exit structure default 0.3. Env: TP1_PROFIT_PCT")
+    p.add_argument(
+        "--partial-tp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="[--exit structure] Arm TAKE_PROFIT on --tp-partial-pct when notional "
+             "≥ --partial-tp-min-notional (default on). Use --no-partial-tp to disable",
+    )
+    p.add_argument(
+        "--partial-tp-min-notional",
+        type=float,
+        default=None,
+        help="[--exit structure] Min position notional USDT to arm partial TP "
+             "(default 500). Env: PARTIAL_TP_MIN_NOTIONAL",
+    )
     p.add_argument(
         "--protect-be",
         action=argparse.BooleanOptionalAction,
@@ -1946,7 +1961,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "Env: POST_BE_CALLBACK",
     )
     p.add_argument("--tp-partial-pct", type=float, default=None,
-                   help="[--exit staged] First partial size %%. Env: TP_PARTIAL_PCT")
+                   help="[--exit staged|structure] Partial TP size %% (default 70). "
+                        "Env: TP_PARTIAL_PCT")
     p.add_argument(
         "--structure-interval",
         default=os.getenv("STRUCTURE_INTERVAL", os.getenv("OB_STRUCT_INTERVAL", "15m")),

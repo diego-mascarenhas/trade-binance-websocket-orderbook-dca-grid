@@ -635,6 +635,10 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         "--protect-be",
         "--be-arm-pct", "1",
         "--be-profit-pct", "0.3",
+        "--partial-tp",
+        "--tp-partial-pct", "70",
+        "--tp1-profit-pct", "0.3",
+        "--partial-tp-min-notional", "500",
         "--post-be", "trail",
         "--post-be-arm-pct", str(getattr(args, "post_be_arm_pct", 2.0) or 2.0),
         "--post-be-callback", str(getattr(args, "post_be_callback", 0.8) or 0.8),
@@ -665,7 +669,8 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         print(
             f"{BOLD}{GREEN}AUTO ★ {hit.symbol}{RESET}  "
             f"{DIM}pid={proc.pid} · dca short --exit structure "
-            f"+ BE@1%→0.3% + trail@2%/0.8% --once · log {log_path}{RESET}"
+            f"+ TP70%@+0.3%(≥500U) + BE@1%→0.3% + trail@2%/0.8% --once · "
+            f"log {log_path}{RESET}"
         )
         return proc
     except Exception as exc:  # noqa: BLE001
