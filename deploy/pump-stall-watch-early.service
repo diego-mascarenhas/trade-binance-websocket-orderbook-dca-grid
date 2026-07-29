@@ -15,7 +15,7 @@ EnvironmentFile=-/opt/trade-binance-websocket-orderbook-dca-grid/.env
 ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/pump_stall_scan.py \
   --watch \
   --auto-trade \
-  --max-trades 1 \
+  --max-trades 3 \
   --interval 60 \
   --loss-cooldown-min 1440 \
   --post-be-arm-pct 2 \

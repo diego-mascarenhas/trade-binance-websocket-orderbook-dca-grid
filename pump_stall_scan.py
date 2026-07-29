@@ -9,14 +9,14 @@
   5. Enough ask-side order-book walls for a SHORT DCA grid
 
 Display-only by default. With --watch --auto-trade: run the top
-`--max-trades` ★ from this list (default 2) via
+`--max-trades` ★ from this list (default 3) via
 `dca SYMBOL short --exit structure` (TP=EQL) + BE protect (arm 1% → lock 0.3%)
 + post-BE trail (arm 2% → callback 0.8%).
 Other open pairs on the account do not consume these slots.
 
   python3 pump_stall_scan.py
   ./pump-stall --top 15 --min-near-regime 80 --min-sharp 35
-  ./pump-stall --watch --auto-trade --max-trades 2 --interval 60
+  ./pump-stall --watch --auto-trade --max-trades 3 --interval 60
 
 Profiles (wrappers; defaults of ./pump-stall-watch stay strict):
   ./pump-stall-watch          # stall≥35 · near≥85 · ★≥92
@@ -685,7 +685,7 @@ def _maybe_auto_trade(
     We never launch outside the current top-N ★ list.
     """
     active = _reap_active(active)
-    max_trades = max(1, int(getattr(args, "max_trades", 2) or 2))
+    max_trades = max(1, int(getattr(args, "max_trades", 3) or 3))
 
     import loss_cooldown as lcd
 
@@ -749,7 +749,7 @@ def watch_loop(args: argparse.Namespace) -> int:
     round_n = 0
     active: dict[str, subprocess.Popen] = {}
     auto = bool(getattr(args, "auto_trade", False))
-    max_trades = max(1, int(getattr(args, "max_trades", 2) or 2))
+    max_trades = max(1, int(getattr(args, "max_trades", 3) or 3))
     mode = (
         f"AUTO-TRADE · --once · top {max_trades} ★"
         if auto else "display only"
@@ -818,7 +818,7 @@ Examples:
   ./pump-stall                              # one-shot table (no orders)
   ./pump-stall-watch                        # live table (no orders)
   ./pump-stall --why 15                     # show why seeds were blocked
-  ./pump-stall-watch --auto-trade           # top 2 ★ → dca short --once
+  ./pump-stall-watch --auto-trade           # top 3 ★ → dca short --once
   ./pump-stall-watch-early                  # TEST: looser filters + auto-trade
 
 Auto-trade launches per ★:
@@ -891,9 +891,9 @@ Production (VPS):
     p.add_argument(
         "--max-trades",
         type=int,
-        default=2,
+        default=3,
         help="With --auto-trade: how many top ★ from this scan to run "
-             "(this bot only; other account pairs do not count; default 2)",
+             "(this bot only; other account pairs do not count; default 3)",
     )
     p.add_argument(
         "--loss-cooldown-min",

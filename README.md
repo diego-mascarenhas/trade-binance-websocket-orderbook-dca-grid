@@ -254,14 +254,14 @@ Finds 1D blow-off → stall shorts with enough **ask** walls for a SHORT DCA gri
 ./pump-stall --why 15          # why seed symbols were blocked
 
 # Auto-trade (places orders)
-./pump-stall-watch --auto-trade --max-trades 2 --loss-cooldown-min 1440
+./pump-stall-watch --auto-trade --max-trades 3 --loss-cooldown-min 1440
 
 python3 pump_stall_scan.py --help
 ```
 
 ### Auto-trade behavior
 
-1. Keeps scanning; picks the top **`--max-trades`** ★ symbols (default **2**) by score  
+1. Keeps scanning; picks the top **`--max-trades`** ★ symbols (default **3**) by score  
 2. Slots are **only for this bot’s ★ list** — other open pairs on the account do not count  
 3. Launches:  
    `dca SYMBOL short --exit structure --protect-be --be-arm-pct 1 --be-profit-pct 0.3 --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once`  
@@ -274,7 +274,7 @@ python3 pump_stall_scan.py --help
 |------|---------|-------------|
 | `--watch` | off | Refresh table live |
 | `--auto-trade` | off | Launch trades (requires `--watch`) |
-| `--max-trades` | `2` | How many top ★ to run |
+| `--max-trades` | `3` | How many top ★ to run |
 | `--interval` | `60` | Refresh seconds (min 15) |
 | `--ideal-near` | `92` | near% ≥ this → ★ (early profile: 90) |
 | `--loss-cooldown-min` | `1440` | Skip symbol after loss (minutes) |

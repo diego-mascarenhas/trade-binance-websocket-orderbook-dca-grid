@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./pump-stall-watch                         # display only (no orders)
-#   ./pump-stall-watch --auto-trade            # ORDERS: top 2 ★ shorts
+#   ./pump-stall-watch --auto-trade            # ORDERS: top 3 ★ shorts
 #   ./pump-stall-watch --auto-trade --max-trades 3 --loss-cooldown-min 1440
 #   ./pump-stall-watch-early                   # TEST early profile + auto-trade
 #   ./pump-stall-watch --help
