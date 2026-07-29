@@ -17,11 +17,15 @@ usage() {
     echo "  dca 1000PEPEUSDT                         # AUTO supervisor (default)"
     echo "  dca 1000PEPEUSDT short                   # SHORT supervisor"
     echo "  dca ZAMAUSDT short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 --once"
+    echo "      # + optional: --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8"
+    echo "      # TP=EQL + BE protect (+1% → entry+0.3%); one cycle"
     echo "  dca BANKUSDT short --gate-price 0.29332  # SHORT only if mid > gate"
     echo "  dca SKLUSDT stop                         # stop supervisor (orders stay)"
     echo "  dca SKLUSDT status                       # process + trading state"
     echo "  dca SKLUSDT cleanup                      # cancel obstage* Stop/TP algos"
     echo "  dca REUSDT sweep                         # cancel orphan bot orders if flat"
+    echo "  # Also: --loss-cooldown-min 1440 (24h block after losing close)"
+    echo "  # Pump→stall auto: ./pump-stall-watch --auto-trade  (see README)"
     exit 1
 }
 

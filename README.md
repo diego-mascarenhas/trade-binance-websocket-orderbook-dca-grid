@@ -11,6 +11,7 @@ Both scripts read the live order book, place DCA orders on real walls, size entr
 | `orderbook_dca_grid.py` | Futures | LONG/SHORT grid on walls | **Staged** (default): TP1 + SL@entry + trail |
 | `orderbook_dca_grid_spot.py` | Spot | BUY grid on bid walls | OCO (TP + SL) |
 | `orderbook_micro_grid.py` | Futures | Fib pullback micro-grid (`fib`) | TP/SL + protect trailing |
+| `pump_stall_scan.py` | Futures | Scanner / auto ★ shorts | Orchestrates `dca … --exit structure` + BE protect |
 
 `orderbook_staged_exit.py` is legacy/experimental — use **`orderbook_dca_grid.py --supervise`** with staged exit (built-in) instead of two processes.
 
@@ -40,14 +41,20 @@ trade-binance-websocket-orderbook-dca-grid/
 ├── fib                          # Short wrapper → micro-grid
 ├── obmicro-grid                 # Same bot, flags passthrough
 ├── dca                          # Short wrapper → DCA supervise
+├── pump-stall                   # One-shot / watch pump→stall scanner
+├── pump-stall-watch             # Same as pump-stall --watch
+├── pump-stall-early             # One-shot with looser (TEST) filters
+├── pump-stall-watch-early       # TEST watch + auto-trade (early profile)
+├── pump_stall_scan.py           # ★ short candidates + optional --auto-trade
+├── loss_cooldown.py             # Per-symbol cooldown after a losing close
 ├── botctl.py                    # CLI: start/stop/status/fib per symbol
 ├── api_server.py                # HTTP API for Orderbook Trading (Flutter)
 ├── futures_scan.py              # Hot / Gainers / Losers scanner (+ JSON helpers)
 ├── telegram_botctl.py           # Telegram remote control (/start /fib /stop)
 ├── telegram_notify.py           # Telegram alerts (DCA + #FIB)
 ├── OBMICRO_GRID_COMMANDS.md     # Fib micro-grid full guide
-├── exits/                       # Exit plugins (staged, trailing, structure)
-├── .state/                      # Staged exit state per symbol (gitignored)
+├── exits/                       # Exit plugins (staged, trailing, structure, be)
+├── .state/                      # Staged / BE / loss_cooldown state (gitignored)
 ├── .run/                        # PID files + logs (Mac pidfile backend; gitignored)
 ├── pyproject.toml
 ├── .env.example
@@ -58,12 +65,15 @@ trade-binance-websocket-orderbook-dca-grid/
     ├── dca-futures-tp@.service    # Futures: trailing TP only (--tp-only)
     ├── dca-staged-exit@.service   # Legacy — do not use with dca-futures@
     ├── dca-spot@.service
+    ├── pump-stall-watch.service   # Pump→stall auto-trade orchestrator
+    ├── pump-stall-watch-early.service  # TEST early-profile auto-trade
     ├── ob-live@.service           # OB live chart (PAPER / --dry-run by default)
     ├── ob_live_start.sh           # PAPER launcher + fixed ports per symbol
     ├── launchagents/              # macOS agents: BTC/ETH/BNB/SOL
     ├── install_ob_live_macos.sh   # load BTC/ETH/BNB LaunchAgents (PAPER)
     ├── uninstall_ob_live_macos.sh
     ├── com.oblive.plist.example   # single-symbol macOS template
+    ├── deploy.sh                  # git pull + reload units + restart fleet
     └── sync_pairs.py              # Start/stop fleet from FUTURES_PAIRS / SPOT_PAIRS
 ```
 
@@ -195,20 +205,104 @@ python3 orderbook_staged_exit.py LINKUSDT
 
 | Flag / env | Default | Description |
 |------------|---------|-------------|
-| `EXIT_MODE` | `staged` | `staged` \| `trailing` \| `structure` \| `none` |
+| `EXIT_MODE` | `staged` | `staged` \| `trailing` \| `structure` \| `be` \| `none` |
 | `--exit staged` | *(env default)* | Staged exit plugin |
 | `--exit trailing` | — | Trailing TP @ OB wall |
-| `--exit structure` | — | Soft-close LONG→EQH / SHORT→EQL once already green |
+| `--exit structure` | — | Soft-close LONG→EQH / SHORT→EQL once already green; **BE protect on by default** |
+| `--protect-be` / `--no-protect-be` | on | With `--exit structure`: arm BE SL when profit ≥ `--be-arm-pct` |
+| `--be-arm-pct` / `BE_ARM_PCT` | `1.0` | Arm BE when unrealized profit % ≥ this |
+| `--be-profit-pct` / `BE_PROFIT_PCT` | `0.3` (structure/be) / `0.1` (staged) | SL lock % from entry (no fee buffer) |
+| `--exit be` | — | BE protect only (no TP) |
 | `--exit none` / `--no-tp` | — | Grid only |
+| `--once` | off | One trade cycle then exit (used by pump-stall auto-trade) |
+| `--loss-cooldown-min` / `LOSS_COOLDOWN_MIN` | `1440` (24h) | After a losing close, block re-entry on that symbol (0=off) |
 | `DIRECTION` | `auto` | `auto` \| `long` \| `short` |
 | `RECV_WINDOW` | `15000` | Binance recvWindow ms |
 | `TP1_PROFIT_PCT` | `0.3` | First partial trigger (%) |
-| `BE_PROFIT_PCT` | `0.1` | Runner SL profit lock after TP1 (%) |
 | `TP_PARTIAL_PCT` | `70` | First partial size (%) |
 | `TP_POLL_SEC` | `15` | Supervise loop poll (`--tp-poll-sec`); raise if you hit HTTP 429 |
 | `STAGED_POLL_SEC` | *(same as TP_POLL_SEC)* | Staged standalone poll; grid uses `TP_POLL_SEC` |
 
+**Structure + BE (pump-stall default trade):**
+
+```bash
+dca ZAMAUSDT short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 \
+  --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once
+# TP = EQL; BE @ +1% → entry+0.3%; then trail from +2% (callback 0.8%)
+```
+
 Add new exit strategies under `exits/` and register them in `exits/__init__.py`.
+
+---
+
+## Pump→stall scanner (`pump_stall_scan.py`)
+
+Finds 1D blow-off → stall shorts with enough **ask** walls for a SHORT DCA grid.
+
+| Mode | Command | Orders? |
+|------|---------|---------|
+| One-shot table | `./pump-stall` | No |
+| Live table | `./pump-stall-watch` | No |
+| Auto-trade (strict) | `./pump-stall-watch --auto-trade` | **Yes** |
+| Early profile (TEST) | `./pump-stall-watch-early` | **Yes** (looser filters + auto-trade) |
+| Early one-shot | `./pump-stall-early` | No |
+
+```bash
+# Local — display only (safe)
+./pump-stall
+./pump-stall-watch --interval 60
+./pump-stall --why 15          # why seed symbols were blocked
+
+# Auto-trade (places orders)
+./pump-stall-watch --auto-trade --max-trades 2 --loss-cooldown-min 1440
+
+python3 pump_stall_scan.py --help
+```
+
+### Auto-trade behavior
+
+1. Keeps scanning; picks the top **`--max-trades`** ★ symbols (default **2**) by score  
+2. Slots are **only for this bot’s ★ list** — other open pairs on the account do not count  
+3. Launches:  
+   `dca SYMBOL short --exit structure --protect-be --be-arm-pct 1 --be-profit-pct 0.3 --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once`  
+4. Exits: **TP = EQL**; **BE** at +1% → SL entry+0.3%; **trail** from +2% (callback 0.8%)  
+5. `--once` = one cycle then exit (no re-arm)  
+6. When a slot frees, rescans and may take the next best ★  
+7. Losing close → **`--loss-cooldown-min`** (default **1440 = 24h**) on that symbol (`.state/loss_cooldown.json`)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--watch` | off | Refresh table live |
+| `--auto-trade` | off | Launch trades (requires `--watch`) |
+| `--max-trades` | `2` | How many top ★ to run |
+| `--interval` | `60` | Refresh seconds (min 15) |
+| `--ideal-near` | `92` | near% ≥ this → ★ (early profile: 90) |
+| `--loss-cooldown-min` | `1440` | Skip symbol after loss (minutes) |
+| `--post-be-arm-pct` | `2` | Arm post-BE trail at this profit % |
+| `--post-be-callback` | `0.8` | Trailing `callbackRate` % |
+| `--why [N]` | off | Show top N blocked seeds by failing filter |
+
+Trade logs: `logs/pump-stall-SYMBOL.log`. Stop one child: `dca SYMBOL stop`.
+
+### Production (systemd)
+
+Code lives on branch **`dev`** (checkout that branch on the VPS). Install once:
+
+```bash
+cd /opt/trade-binance-websocket-orderbook-dca-grid
+git fetch && git checkout dev && git pull
+sudo cp deploy/pump-stall-watch.service /etc/systemd/system/
+# optional TEST unit (looser filters):
+# sudo cp deploy/pump-stall-watch-early.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pump-stall-watch
+sudo systemctl status pump-stall-watch
+sudo journalctl -u pump-stall-watch -f
+tail -f logs/pump-stall-*.log
+```
+
+Later deploys: if the unit is enabled, `./deploy/deploy.sh` restarts it after `git pull`.  
+Override flags: `sudo systemctl edit pump-stall-watch`.
 
 ### Telegram alerts + remote control
 
@@ -529,6 +623,8 @@ For structure TP on the VPS set `EXIT_MODE=structure` in `.env` (optional `STRUC
 | Unit | Command | Use when |
 |------|---------|----------|
 | `dca-futures@SYMBOL` | `--supervise` | **Main bot**: grid + staged exit (defaults from `.env`/code) |
+| `pump-stall-watch` | `pump_stall_scan.py --watch --auto-trade` | Orchestrator: top ★ shorts → `dca … --once` |
+| `pump-stall-watch-early` | early profile + auto-trade | TEST looser filters (optional) |
 | `dca-telegram-ctl` | `telegram_botctl.py` | Telegram `/start` `/stop` `/status` (24/7) |
 | `dca-api` | `api_server.py` | HTTP API for Orderbook Trading Flutter app (`:8787`) |
 | `dca-futures-tp@SYMBOL` | `--tp-only` | Exit only (manual/other entry) |
@@ -554,6 +650,10 @@ Omit `FUTURES_PAIRS` or `SPOT_PAIRS` to leave that market untouched. An empty va
 ```bash
 # Trading bots
 sudo journalctl -u 'dca-futures@*' -u 'dca-spot@*' -f -o with-unit
+
+# Pump→stall auto-trade
+sudo journalctl -u pump-stall-watch -f
+tail -f /opt/trade-binance-websocket-orderbook-dca-grid/logs/pump-stall-*.log
 
 # Telegram remote control
 sudo journalctl -u dca-telegram-ctl -f

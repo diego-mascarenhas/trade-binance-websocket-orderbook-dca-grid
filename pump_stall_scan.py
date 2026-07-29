@@ -808,7 +808,34 @@ def watch_loop(args: argparse.Namespace) -> int:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Scan / supervise 1D blow-off → stall shorts with ask liquidity"
+        description=(
+            "Scan / supervise 1D blow-off → stall shorts with ask liquidity. "
+            "Display-only by default; --watch --auto-trade places real orders."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  ./pump-stall                              # one-shot table (no orders)
+  ./pump-stall-watch                        # live table (no orders)
+  ./pump-stall --why 15                     # show why seeds were blocked
+  ./pump-stall-watch --auto-trade           # top 2 ★ → dca short --once
+  ./pump-stall-watch-early                  # TEST: looser filters + auto-trade
+
+Auto-trade launches per ★:
+  dca SYMBOL short --exit structure --protect-be \\
+    --be-arm-pct 1 --be-profit-pct 0.3 \\
+    --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once
+
+  TP = EQL (short) / EQH (long).
+  BE protect arms at +1% → SL @ entry+0.3%; trail from +2% (cb 0.8%).
+  Loss close → --loss-cooldown-min on that symbol (default 1440 = 24h).
+  Slots = top ★ of this list only (other account pairs ignored).
+
+Production (VPS):
+  sudo systemctl enable --now pump-stall-watch
+  sudo journalctl -u pump-stall-watch -f
+  See README.md → Pump→stall scanner.
+""",
     )
     p.add_argument("--base", default=FAPI_BASE, help="Futures REST base URL")
     p.add_argument("--top", type=int, default=12, help="Max hits to show")
