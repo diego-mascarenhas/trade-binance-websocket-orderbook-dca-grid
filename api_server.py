@@ -504,6 +504,10 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if method == "GET" and path == "/pump-stall":
+            self._handle_pump_stall()
+            return
+
         if not _authorized(self):
             _json_response(self, 401, {"ok": False, "error": "Unauthorized"})
             return
@@ -581,6 +585,31 @@ class Handler(BaseHTTPRequestHandler):
             _json_response(self, 504, {"ok": False, "error": "Command timed out"})
         except Exception as exc:  # noqa: BLE001
             _json_response(self, 500, {"ok": False, "error": str(exc)})
+
+    def _handle_pump_stall(self) -> None:
+        """Read-only snapshot from pump_stall_scan.py (--snapshot). Public."""
+        raw = _env("PUMP_STALL_SNAPSHOT", "")
+        path = Path(raw) if raw else ROOT / ".state" / "pump_stall_snapshot.json"
+        if not path.is_file():
+            _json_response(
+                self,
+                404,
+                {
+                    "ok": False,
+                    "error": "Snapshot not found — run pump_stall_scan with --watch "
+                    f"(expected {path})",
+                },
+            )
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _json_response(self, 500, {"ok": False, "error": f"Bad snapshot: {exc}"})
+            return
+        if not isinstance(data, dict):
+            _json_response(self, 500, {"ok": False, "error": "Snapshot must be an object"})
+            return
+        _json_response(self, 200, {"ok": True, **data})
 
     def _handle_scan(self, qs: dict[str, list[str]]) -> None:
         top = int((qs.get("top") or ["15"])[0])

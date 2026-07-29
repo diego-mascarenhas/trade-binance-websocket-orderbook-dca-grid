@@ -29,11 +29,13 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import os
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from futures_scan import (
     BOLD,
@@ -56,6 +58,9 @@ MAGENTA = "\033[35m"
 BLUE = "\033[34m"
 ORANGE = "\033[38;5;208m"
 WHITE = "\033[37m"
+
+ROOT = Path(__file__).resolve().parent
+DEFAULT_SNAPSHOT = ROOT / ".state" / "pump_stall_snapshot.json"
 
 # First failing filter → color + short label
 BLOCK_COLORS = {
@@ -421,6 +426,119 @@ def scan(args: argparse.Namespace) -> tuple[list[PumpStallHit], list[AnalyzeRow]
 def _block_tag(reason: str) -> str:
     c = BLOCK_COLORS.get(reason, DIM)
     return f"{c}{BOLD}{reason:<6}{RESET}"
+
+
+def _hit_to_dict(h: PumpStallHit) -> dict:
+    return {
+        "symbol": h.symbol,
+        "change_24h": h.change_24h,
+        "pump_7d_pct": h.pump_7d_pct,
+        "near_high_pct": h.near_high_pct,
+        "near_regime_pct": h.near_regime_pct,
+        "sharp_pct": h.sharp_pct,
+        "stall_score": h.stall_score,
+        "ask_walls": h.ask_walls,
+        "ask_span_pct": h.ask_span_pct,
+        "score": h.score,
+        "note": h.note,
+        "wall_prices": list(h.wall_prices[:6]),
+        "flag": "",
+    }
+
+
+def _blocked_to_dict(r: AnalyzeRow) -> dict:
+    return {
+        "symbol": r.symbol,
+        "change_24h": r.change_24h,
+        "pump_7d_pct": r.pump_7d_pct,
+        "near_high_pct": r.near_high_pct,
+        "near_regime_pct": r.near_regime_pct,
+        "sharp_pct": r.sharp_pct,
+        "stall_score": r.stall_score,
+        "ask_walls": r.ask_walls,
+        "blocked_by": r.blocked_by or "?",
+        "detail": r.detail,
+    }
+
+
+def build_snapshot(
+    *,
+    hits: list[PumpStallHit],
+    blocked: list[AnalyzeRow],
+    ideal_near: float,
+    cycle: int,
+    time_s: str,
+    scan_s: float,
+    next_s: float,
+    mode: str,
+    why_limit: int,
+) -> dict:
+    """Payload for Pumpstall web (same keys as DemoScanSnapshot)."""
+    ranked = sorted(
+        hits,
+        key=lambda h: (0 if h.near_high_pct >= ideal_near else 1, -h.score),
+    )
+    counts: dict[str, int] = {}
+    for r in blocked:
+        key = r.blocked_by or "?"
+        counts[key] = counts.get(key, 0) + 1
+    block_counts = dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+    show_n = max(0, int(why_limit))
+    return {
+        "cycle": int(cycle),
+        "time": time_s,
+        "scan_s": round(float(scan_s), 1),
+        "next_s": float(next_s),
+        "mode": mode,
+        "ideal_near": float(ideal_near),
+        "hits": [_hit_to_dict(h) for h in ranked],
+        "blocked": [_blocked_to_dict(r) for r in blocked[:show_n]],
+        "block_counts": block_counts,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
+def write_snapshot(path: Path | str, payload: dict) -> None:
+    """Atomic JSON write. Never raises into the trading loop."""
+    try:
+        dest = Path(path)
+        if not dest.is_absolute():
+            dest = ROOT / dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(dest)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{DIM}snapshot write skipped: {exc}{RESET}", flush=True)
+
+
+def maybe_write_snapshot(
+    args: argparse.Namespace,
+    *,
+    hits: list[PumpStallHit],
+    blocked: list[AnalyzeRow],
+    cycle: int,
+    time_s: str,
+    scan_s: float,
+    mode: str,
+) -> None:
+    if getattr(args, "no_snapshot", False):
+        return
+    path = getattr(args, "snapshot", None)
+    if not path:
+        return
+    payload = build_snapshot(
+        hits=hits,
+        blocked=blocked,
+        ideal_near=float(args.ideal_near),
+        cycle=cycle,
+        time_s=time_s,
+        scan_s=scan_s,
+        next_s=float(getattr(args, "interval", 60.0) or 60.0),
+        mode=mode,
+        why_limit=int(getattr(args, "why", 15) or 0),
+    )
+    write_snapshot(path, payload)
 
 
 def print_blocked(blocked: list[AnalyzeRow], *, limit: int) -> None:
@@ -792,6 +910,15 @@ def watch_loop(args: argparse.Namespace) -> int:
                 blocked=blocked,
                 why_limit=why_n,
             )
+            maybe_write_snapshot(
+                args,
+                hits=hits,
+                blocked=blocked,
+                cycle=round_n,
+                time_s=now,
+                scan_s=elapsed,
+                mode=mode,
+            )
             if auto:
                 print()
                 active = _maybe_auto_trade(hits, args, active=active)
@@ -934,6 +1061,17 @@ Production (VPS):
         help="Show top N blocked seed symbols colored by first failing filter "
              "(default 15; --why 0 to hide; --why 30 for more)",
     )
+    p.add_argument(
+        "--snapshot",
+        default=str(DEFAULT_SNAPSHOT),
+        help="Write JSON snapshot for Pumpstall web after each scan "
+             f"(default: {DEFAULT_SNAPSHOT})",
+    )
+    p.add_argument(
+        "--no-snapshot",
+        action="store_true",
+        help="Do not write the web snapshot JSON (trading unchanged either way)",
+    )
     return p.parse_args(argv)
 
 
@@ -955,6 +1093,15 @@ def main(argv: list[str] | None = None) -> int:
         ideal_near=args.ideal_near,
         blocked=blocked,
         why_limit=int(getattr(args, "why", 15) or 0),
+    )
+    maybe_write_snapshot(
+        args,
+        hits=hits,
+        blocked=blocked,
+        cycle=1,
+        time_s=time.strftime("%H:%M:%S"),
+        scan_s=time.time() - t0,
+        mode="display only",
     )
     print(f"{DIM}done in {time.time() - t0:.1f}s{RESET}")
     return 0
