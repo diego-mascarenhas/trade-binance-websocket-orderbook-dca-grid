@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# DeepSeek situational review for an open position: review NEARUSDT
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+exec python3 -u "$ROOT/trade_review.py" "$@"

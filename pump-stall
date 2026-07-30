@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Pump→stall scanner (display or auto-trade).
+#
+# Usage:
+#   ./pump-stall                         # one-shot table (no orders)
+#   ./pump-stall --watch                 # live table (no orders)
+#   ./pump-stall --watch --auto-trade    # top ★ → dca short --once (ORDERS)
+#   ./pump-stall --help
+#
+# See README.md → "Pump→stall scanner" and: python3 pump_stall_scan.py --help
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$ROOT/pump_stall_scan.py" "$@"

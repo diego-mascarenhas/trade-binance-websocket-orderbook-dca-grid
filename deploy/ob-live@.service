@@ -1,0 +1,16 @@
+[Unit]
+Description=OB live chart scalper (%i) — PAPER + feed paused until UI FEED
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=forge
+WorkingDirectory=/opt/trade-binance-websocket-orderbook-dca-grid
+# Ports: BTC=8765 ETH=8766 BNB=8767 (see deploy/ob_live_start.sh)
+ExecStart=/opt/trade-binance-websocket-orderbook-dca-grid/deploy/ob_live_start.sh %i
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

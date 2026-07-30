@@ -1,0 +1,16 @@
+[Unit]
+Description=Futures staged exit supervisor (%i) — 70%% TP + BE + trailing (experimental)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=forge
+WorkingDirectory=/opt/trade-binance-websocket-orderbook-dca-grid
+# Pair with dca-futures@SYMBOL running --no-tp on the same symbol.
+ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/orderbook_staged_exit.py %i
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

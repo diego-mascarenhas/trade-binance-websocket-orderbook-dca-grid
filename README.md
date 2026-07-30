@@ -8,8 +8,25 @@ Both scripts read the live order book, place DCA orders on real walls, size entr
 
 | Bot | Market | Entry | Exit |
 |-----|--------|-------|------|
-| `orderbook_dca_grid.py` | Futures | LONG/SHORT grid on walls | Trailing TP (`TRAILING_STOP_MARKET`) |
+| `orderbook_dca_grid.py` | Futures | LONG/SHORT grid on walls | **Staged** (default): TP1 + SL@entry + trail |
 | `orderbook_dca_grid_spot.py` | Spot | BUY grid on bid walls | OCO (TP + SL) |
+| `orderbook_micro_grid.py` | Futures | Fib pullback micro-grid (`fib`) | TP/SL + protect trailing |
+| `pump_stall_scan.py` | Futures | Scanner / auto ★ shorts | Orchestrates `dca … --exit structure` + BE protect |
+
+`orderbook_staged_exit.py` is legacy/experimental — use **`orderbook_dca_grid.py --supervise`** with staged exit (built-in) instead of two processes.
+
+### Fib micro-grid (`fib`)
+
+Short pullback grid on Fibonacci retraces (default **5m**, arm Fib 0–0.236, LIMIT-only, protect trail after full fill, **1h cooldown** after flat).
+
+```bash
+fib LTCUSDT                 # PATH wrapper (or ./fib)
+fib SKLUSDT short --entry-usdt 50
+python3 botctl.py fib LTCUSDT
+# Telegram: /fib LTCUSDT · /stop LTCUSDT
+```
+
+Full docs: **[OBMICRO_GRID_COMMANDS.md](OBMICRO_GRID_COMMANDS.md)**
 
 Self-contained: **Python standard library only** — no third-party dependencies.
 
@@ -17,16 +34,49 @@ Self-contained: **Python standard library only** — no third-party dependencies
 
 ```
 trade-binance-websocket-orderbook-dca-grid/
-├── orderbook_dca_grid.py        # Futures bot
+├── orderbook_dca_grid.py        # Futures bot (grid + exit plugins)
+├── orderbook_micro_grid.py      # Fib micro-grid (./fib · /fib Telegram)
+├── orderbook_staged_exit.py     # Staged exit logic (used by exits/staged.py; standalone optional)
 ├── orderbook_dca_grid_spot.py   # Spot bot
-├── pyproject.toml               # optional install → `orderbook-dca-grid` command
-├── .env.example                 # API keys + config template
+├── fib                          # Short wrapper → micro-grid
+├── obmicro-grid                 # Same bot, flags passthrough
+├── dca                          # Short wrapper → DCA supervise
+├── pump-stall                   # One-shot / watch pump→stall scanner
+├── pump-stall-watch             # Same as pump-stall --watch
+├── pump-stall-early             # One-shot with looser (TEST) filters
+├── pump-stall-watch-early       # TEST watch + auto-trade (early profile)
+├── pump_stall_scan.py           # ★ short candidates + optional --auto-trade
+├── loss_cooldown.py             # Per-symbol cooldown after a losing close
+├── botctl.py                    # CLI: start/stop/status/fib per symbol
+├── api_server.py                # HTTP API for Orderbook Trading (Flutter)
+├── futures_scan.py              # Hot / Gainers / Losers scanner (+ JSON helpers)
+├── telegram_botctl.py           # Telegram remote control (/start /fib /stop)
+├── telegram_notify.py           # Telegram alerts (DCA + #FIB)
+├── OBMICRO_GRID_COMMANDS.md     # Fib micro-grid full guide
+├── exits/                       # Exit plugins (staged, trailing, structure, be)
+├── .state/                      # Staged / BE / loss_cooldown state (gitignored)
+├── .run/                        # PID files + logs (Mac pidfile backend; gitignored)
+├── pyproject.toml
+├── .env.example
 └── deploy/
-    ├── dca-futures@.service     # Futures: grid + trailing TP (--supervise)
-    ├── dca-futures-tp@.service  # Futures: trailing TP only (--tp-only)
-    ├── dca-spot@.service        # Spot: buy grid + OCO (--supervise)
-    └── sync_pairs.py            # enable/disable systemd units from .env pair lists
+    ├── dca-futures@.service       # Futures supervisor (--supervise)
+    ├── dca-telegram-ctl.service   # Telegram start/stop/status daemon
+    ├── dca-api.service            # HTTP API for Orderbook Trading (Flutter)
+    ├── dca-futures-tp@.service    # Futures: trailing TP only (--tp-only)
+    ├── dca-staged-exit@.service   # Legacy — do not use with dca-futures@
+    ├── dca-spot@.service
+    ├── pump-stall-watch.service   # Pump→stall auto-trade orchestrator
+    ├── pump-stall-watch-early.service  # TEST early-profile auto-trade
+    ├── ob-live@.service           # OB live chart (PAPER / --dry-run by default)
+    ├── ob_live_start.sh           # PAPER launcher + fixed ports per symbol
+    ├── launchagents/              # macOS agents: BTC/ETH/BNB/SOL
+    ├── install_ob_live_macos.sh   # load BTC/ETH/BNB LaunchAgents (PAPER)
+    ├── uninstall_ob_live_macos.sh
+    ├── com.oblive.plist.example   # single-symbol macOS template
+    ├── deploy.sh                  # git pull + reload units + restart fleet
+    └── sync_pairs.py              # Start/stop fleet from FUTURES_PAIRS / SPOT_PAIRS
 ```
+
 
 ## Quick start
 
@@ -38,6 +88,42 @@ chmod 600 .env
 ```
 
 Keys are read from environment variables first, then `.env` (cwd or next to the script). No `pip install` is required to run.
+
+### Orderbook Trading API (Flutter / iOS)
+
+HTTP control plane for the sibling Flutter app (`../orderbook_trading`). Add to `.env`:
+
+```env
+API_TOKEN=change-me-to-a-long-secret
+API_HOST=0.0.0.0
+API_PORT=8787
+```
+
+```bash
+# Local / foreground
+python3 api_server.py
+
+# Production (systemd) — once
+sudo cp deploy/dca-api.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dca-api
+sudo systemctl status dca-api
+sudo journalctl -u dca-api -f
+```
+
+```text
+GET  /health
+GET  /scan                    # Hot / Gainers / Losers (Bearer token)
+GET  /scan/BTCUSDT
+GET  /positions               # open Futures positions + PnL
+GET  /chart/SYMBOL            # candles + OPEN/LIMIT/TP/SL levels
+GET  /bots · GET /bots/SYMBOL
+POST /bots/SYMBOL/start       # JSON: {direction, gate_price?, dry_run?}
+POST /bots/SYMBOL/stop
+```
+
+Local Chrome/simulator: app Settings → `http://127.0.0.1:8787` + the same token.  
+Physical iPhone: use the Mac LAN IP. VPS: `http://SERVER_IP:8787` (open firewall) or prefer HTTPS reverse proxy; only change the app URL.
 
 Preview without sending orders:
 
@@ -61,7 +147,7 @@ python3 orderbook_dca_grid.py ADAUSDT
 # Only manage trailing TP for an existing position (no new grid)
 python3 orderbook_dca_grid.py ADAUSDT --tp-only
 
-# Fully autonomous: re-arm grid when flat + manage TP
+# Fully autonomous (recommended — defaults: staged exit, auto direction)
 python3 orderbook_dca_grid.py ADAUSDT --supervise
 
 # Cancel + fresh grid (DCA-only if holding; stop systemd unit first)
@@ -73,15 +159,227 @@ python3 orderbook_dca_grid.py OPUSDT --rearm --rearm-flat  # close position, the
 ### Key behavior
 
 - **Direction**: `--direction auto` (default) from bid/ask imbalance; or `long` / `short`.
-- **Account balance guard**: `MAX_IMBALANCE=30` (default) skips new orders on the heavier side when `|LONG − SHORT| / total` exceeds the limit; the lighter side is still allowed. `--force` overrides.
+- **Account risk guards** (futures, before arming a grid):
+  - `MAX_IMBALANCE=20` (default): skip new grids on the heavier LONG/SHORT side when imbalance exceeds 20%.
+  - `MAX_MARGIN_PCT=50`: skip if projected initial margin usage exceeds 50% of balance.
+  - `MIN_LIQ_DISTANCE_PCT=20`: skip if any open position is within 20% of liquidation.
+  - `MAX_ACCOUNT_NOTIONAL_PCT=80`: skip if total |notional| + new grid exceeds 80% of `wallet × leverage`.
+  - `RISK_USE_FULL_GRID=true` (default): checks use full-grid notional, not entry only.
+  - Lighter-side opens still allowed for imbalance; `--force` overrides all guards.
 - **Entry size**: 10% of wallet (`WALLET_PCT=10`) or fixed `BASE_SIZE` in USDT.
 - **Leverage**: symbol max set automatically (`--no-max-leverage` / `--set-leverage N`).
 - **DCA walls**: real order-book levels within `--max-range` % (default 12).
 - **Trailing TP**: opposite-side wall, activation clamped so callback stays in profit.
-- **Order expiry**: only the **base/entry** LIMIT uses **GTD** (`ORDER_TTL=3600` = 1 h; `0` = all GTC). DCA safety orders stay **GTC**. If the entry expires unfilled, `--supervise` cancels the whole grid and re-arms. With an open position, DCA orders are kept.
+- **Order expiry**: only the **base/entry** LIMIT uses **GTD** (`ORDER_TTL=3600` = 1 h; `0` = all GTC). DCA safety orders stay **GTC**. If the entry expires unfilled, `--supervise` cancels the whole grid and re-arms.
+- **Grid refresh**: while flat, `--supervise` cancels and re-arms after `GRID_TTL` (default **1 h**; `0` = off), same as Spot. With an open position, DCA orders are kept (use `--rearm` to replenish).
 - **Safety**: refuses to stack on existing exposure (`--force` to override); cancels foreign SLs (`--keep-sl` to disable).
 
 Run `python3 orderbook_dca_grid.py --help` for all flags.
+
+---
+
+## Staged exit (default)
+
+Staged exit is the **default** exit mode (code default + `EXIT_MODE=staged` in `.env`). Logic lives in `exits/staged.py` (implementation in `orderbook_staged_exit.py`). Use **one process per symbol**:
+
+```bash
+python3 orderbook_dca_grid.py 1000RATSUSDT --supervise
+python3 orderbook_dca_grid.py LINKUSDT --audit
+python3 orderbook_staged_exit.py LINKUSDT --audit --cleanup   # optional standalone audit
+```
+
+When a position is open:
+
+1. Places **TP1 (70%)** as TAKE_PROFIT at **+TP1_PROFIT_PCT** (default **0.3%**) — DCA grid stays active
+2. On TP1 fill: **cancels DCA**, **SL on runner at entry + BE_PROFIT_PCT** (default **0.1%** profit lock)
+3. **Trailing** on the opposite order-book wall for the runner — **profit-lock SL stays active** alongside the trail
+
+**Do not** run `orderbook_staged_exit.py` in parallel on the same symbol as `--supervise`.
+
+Legacy two-process mode (avoid):
+
+```bash
+python3 orderbook_dca_grid.py LINKUSDT --supervise --exit none   # or --no-tp
+python3 orderbook_staged_exit.py LINKUSDT
+```
+
+| Flag / env | Default | Description |
+|------------|---------|-------------|
+| `EXIT_MODE` | `staged` | `staged` \| `trailing` \| `structure` \| `be` \| `none` |
+| `--exit staged` | *(env default)* | Staged exit plugin |
+| `--exit trailing` | — | Trailing TP @ OB wall |
+| `--exit structure` | — | Soft-close LONG→EQH / SHORT→EQL once already green; **BE protect on by default** |
+| `--protect-be` / `--no-protect-be` | on | With `--exit structure`: arm BE SL when profit ≥ `--be-arm-pct` |
+| `--be-arm-pct` / `BE_ARM_PCT` | `1.0` | Arm BE when unrealized profit % ≥ this |
+| `--be-profit-pct` / `BE_PROFIT_PCT` | `0.3` (structure/be) / `0.1` (staged) | SL lock % from entry (no fee buffer) |
+| `--exit be` | — | BE protect only (no TP) |
+| `--exit none` / `--no-tp` | — | Grid only |
+| `--once` | off | One trade cycle then exit (used by pump-stall auto-trade) |
+| `--loss-cooldown-min` / `LOSS_COOLDOWN_MIN` | `1440` (24h) | After a losing close, block re-entry on that symbol (0=off) |
+| `DIRECTION` | `auto` | `auto` \| `long` \| `short` |
+| `RECV_WINDOW` | `15000` | Binance recvWindow ms |
+| `TP1_PROFIT_PCT` | `0.3` | First partial trigger (%) |
+| `TP_PARTIAL_PCT` | `70` | First partial size (%) |
+| `TP_POLL_SEC` | `15` | Supervise loop poll (`--tp-poll-sec`); raise if you hit HTTP 429 |
+| `STAGED_POLL_SEC` | *(same as TP_POLL_SEC)* | Staged standalone poll; grid uses `TP_POLL_SEC` |
+
+**Structure + BE (pump-stall default trade):**
+
+```bash
+dca ZAMAUSDT short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 \
+  --partial-tp --tp-partial-pct 70 \
+  --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once
+# 70% TAKE_PROFIT @ +0.3% gross (only if notional ≥ 500 USDT) · BE @ +1% → entry+0.3%
+# · trail from +2% · TP resto = EQL
+```
+
+Add new exit strategies under `exits/` and register them in `exits/__init__.py`.
+
+---
+
+## Pump→stall scanner (`pump_stall_scan.py`)
+
+Finds 1D blow-off → stall shorts with enough **ask** walls for a SHORT DCA grid.
+
+| Mode | Command | Orders? |
+|------|---------|---------|
+| One-shot table | `./pump-stall` | No |
+| Live table | `./pump-stall-watch` | No |
+| Auto-trade (strict) | `./pump-stall-watch --auto-trade` | **Yes** |
+| Early profile (TEST) | `./pump-stall-watch-early` | **Yes** (looser filters + auto-trade) |
+| Early one-shot | `./pump-stall-early` | No |
+
+```bash
+# Local — display only (safe)
+./pump-stall
+./pump-stall-watch --interval 60
+./pump-stall --why 15          # why seed symbols were blocked
+
+# Auto-trade (places orders)
+./pump-stall-watch --auto-trade --max-trades 3 --loss-cooldown-min 1440
+
+python3 pump_stall_scan.py --help
+```
+
+### Auto-trade behavior
+
+1. Keeps scanning; picks the top **`--max-trades`** ★ symbols (default **3**) by score  
+2. Slots are **only for this bot’s ★ list** — other open pairs on the account do not count  
+3. Launches:  
+   `dca SYMBOL short --exit structure --protect-be --partial-tp --tp-partial-pct 70 --be-arm-pct 1 --be-profit-pct 0.3 --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once`  
+4. Exits: **70% TP @ +0.3% gross** (only if notional ≥ **500 USDT**); **BE** at +1% → SL entry+0.3%; **trail** from +2%; resto **EQL**  
+5. `--once` = one cycle then exit (no re-arm)  
+6. When a slot frees, rescans and may take the next best ★  
+7. Losing close → **`--loss-cooldown-min`** (default **1440 = 24h**) on that symbol (`.state/loss_cooldown.json`)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--watch` | off | Refresh table live |
+| `--auto-trade` | off | Launch trades (requires `--watch`) |
+| `--max-trades` | `3` | How many top ★ to run |
+| `--interval` | `60` | Refresh seconds (min 15) |
+| `--ideal-near` | `92` | near% ≥ this → ★ (early profile: 90) |
+| `--loss-cooldown-min` | `1440` | Skip symbol after loss (minutes) |
+| `--post-be-arm-pct` | `2` | Arm post-BE trail at this profit % |
+| `--post-be-callback` | `0.8` | Trailing `callbackRate` % |
+| `--why [N]` | off | Show top N blocked seeds by failing filter |
+
+Trade logs: `logs/pump-stall-SYMBOL.log`. Stop one child: `dca SYMBOL stop`.
+
+### Production (systemd)
+
+Code lives on branch **`dev`** (checkout that branch on the VPS). Install once:
+
+```bash
+cd /opt/trade-binance-websocket-orderbook-dca-grid
+git fetch && git checkout dev && git pull
+sudo cp deploy/pump-stall-watch.service /etc/systemd/system/
+# optional TEST unit (looser filters):
+# sudo cp deploy/pump-stall-watch-early.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pump-stall-watch
+sudo systemctl status pump-stall-watch
+sudo journalctl -u pump-stall-watch -f
+tail -f logs/pump-stall-*.log
+```
+
+Later deploys: if the unit is enabled, `./deploy/deploy.sh` restarts it after `git pull`.  
+Override flags: `sudo systemctl edit pump-stall-watch`.
+
+### Telegram alerts + remote control
+
+Uses `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` in `.env`. If unset, alerts and remote control are skipped.
+
+**Alerts** (`telegram_notify.py`): DCA supervise start, grid/DCA re-arm, fills, open/close (PnL), staged TP1/SL/trail; **FIB** `#FIB` armed/open/fill/trail/disarm/closed.
+
+**Remote control** (`telegram_botctl.py` + `botctl.py`): start/stop/status **without closing positions or cancelling orders** on stop. Works for DCA and FIB (same machine as the process).
+
+#### Telegram commands
+
+Only messages from `TELEGRAM_CHAT_ID` are accepted.
+
+| Command | Action |
+|---------|--------|
+| `/start SYMBOL` | Start **DCA** supervisor |
+| `/fib SYMBOL [long\|short\|auto]` | Start **FIB** micro-grid in background |
+| `/stop SYMBOL` | Stop DCA **and/or** FIB (orders & position stay) |
+| `/status SYMBOL` | Process state + position + PnL |
+| `/list` | All running bots (DCA + `FIB:SYMBOL`) |
+| `/help` | Command list |
+
+`/start` and `/fib` respect `FUTURES_PAIRS` whitelist when set. `/stop` and `/status` work for any symbol.
+
+CLI equivalent:
+
+```bash
+python3 botctl.py start SXTUSDT
+python3 botctl.py fib LTCUSDT short
+python3 botctl.py stop LTCUSDT
+python3 botctl.py fib-stop LTCUSDT
+python3 botctl.py status LTCUSDT
+python3 botctl.py list
+```
+
+Fib full guide: [OBMICRO_GRID_COMMANDS.md](OBMICRO_GRID_COMMANDS.md)
+
+#### Local (Mac) — manual daemon
+
+```bash
+python3 telegram_botctl.py
+```
+
+Uses **pidfile** backend: PIDs in `.run/pids/`, logs in `.run/logs/`. Supervisors started with `/start` run in the background.
+
+#### Production (VPS) — systemd
+
+Install once:
+
+```bash
+sudo cp deploy/dca-telegram-ctl.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dca-telegram-ctl
+```
+
+Uses **systemd** backend: `/start` and `/stop` call `systemctl` on `dca-futures@SYMBOL`.
+
+```bash
+sudo systemctl status dca-telegram-ctl
+sudo journalctl -u dca-telegram-ctl -f
+```
+
+Optional env: `BOTCTL_MODE=auto|systemd|pidfile`, `FUTURES_UNIT=dca-futures`.
+
+#### Important: Telegram ctl ≠ fleet auto-start
+
+Starting `dca-telegram-ctl` **does not** start trading bots. It only listens for commands.
+
+| Tool | Starts all `FUTURES_PAIRS`? |
+|------|---------------------------|
+| `python3 deploy/sync_pairs.py` | **Yes** — enable + start every listed symbol |
+| `telegram_botctl` `/start SYMBOL` | **One** symbol at a time |
+| `/list` | Shows what's **already running** (empty until sync or `/start`) |
+
+After first deploy, run `sync_pairs.py` once to bring up the default fleet (see [Production deploy](#production-deploy-runbook)).
 
 ---
 
@@ -106,7 +404,7 @@ python3 orderbook_dca_grid_spot.py BTCUSDT --tp-only --once   # sync OCO once an
 - **BUY LIMIT** grid on real **bid walls**; DCA count from the book (`SO_WALL_MULT`), capped by `SO_MAX`.
 - **OCO SELL** while holding: TP on ask walls, SL **below the deepest open DCA** (`SPOT_SL` is fallback when grid is fully filled).
 - **Budget fit**: before placing, sums grid notional vs free USDT and `MAX_SYMBOL_PCT` (default **25%** of wallet); drops deepest DCAs until it fits.
-- **Grid refresh**: Spot has no native GTD — `--supervise` cancels and re-arms after `GRID_TTL` (default **1 h**; `0` = off).
+- **Grid refresh**: `--supervise` cancels and re-arms after `GRID_TTL` (default **1 h**; `0` = off).
 
 Run `python3 orderbook_dca_grid_spot.py --help` for all flags.
 
@@ -116,27 +414,123 @@ Run `python3 orderbook_dca_grid_spot.py --help` for all flags.
 
 Copy `.env.example` → `.env`. CLI flags override env vars.
 
+### Required (production)
+
+```env
+BINANCE_API_KEY=...
+BINANCE_SECRET_KEY=...
+FUTURES_PAIRS=1000SHIBUSDT,ATOMUSDT,SXTUSDT,...   # fleet + /start whitelist
+```
+
+Futures API key needs **Futures trading** permission. `chmod 600 .env`.
+
+### Telegram (alerts + remote control)
+
+```env
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+```
+
+### Futures defaults (optional — already coded as defaults)
+
+```env
+EXIT_MODE=staged          # staged | trailing | structure | none
+DIRECTION=auto            # auto | long | short
+RECV_WINDOW=15000         # raise if you see -1021 timestamp errors
+WALLET_PCT=10
+MAX_IMBALANCE=20          # 0 = off
+# MAX_MARGIN_PCT=50
+# MIN_LIQ_DISTANCE_PCT=20
+# MAX_ACCOUNT_NOTIONAL_PCT=80
+# RISK_USE_FULL_GRID=true
+ORDER_TTL=3600
+GRID_TTL=3600
+REARM_BACKOFF=60
+# TP1_PROFIT_PCT=0.3
+# TP_PARTIAL_PCT=70
+# TELEGRAM_MIN_OPEN_VOL=5
+# BOTCTL_MODE=auto
+# FUTURES_UNIT=dca-futures
+```
+
+### Full reference
+
 | Variable | Default | Applies to | Description |
 |----------|---------|------------|-------------|
 | `BINANCE_API_KEY` | — | both | API key |
 | `BINANCE_SECRET_KEY` | — | both | Secret |
+| `EXIT_MODE` | `staged` | futures | Exit plugin: `staged`, `trailing`, `structure`, `none` |
+| `DIRECTION` | `auto` | futures | Grid direction: `auto`, `long`, `short` |
+| `RECV_WINDOW` | `15000` | futures | Binance recvWindow (ms) |
 | `WALLET_PCT` | `10` | both | Entry size as % of wallet/free USDT |
 | `BASE_SIZE` | `0` | both | Fixed entry USDT (`0` = use `WALLET_PCT`) |
-| `MAX_IMBALANCE` | `30` | futures | Account LONG/SHORT balance guard (`0` = off) |
+| `MAX_IMBALANCE` | `20` | futures | Account LONG/SHORT balance guard (`0` = off) |
+| `MAX_MARGIN_PCT` | `50` | futures | Max projected initial margin / balance (`0` = off) |
+| `MIN_LIQ_DISTANCE_PCT` | `20` | futures | Min distance to liq on any position (`0` = off) |
+| `MAX_ACCOUNT_NOTIONAL_PCT` | `80` | futures | Cap on total \|notional\| + grid vs wallet×lev |
+| `RISK_USE_FULL_GRID` | `true` | futures | Risk checks use full grid notional |
 | `ORDER_TTL` | `3600` | futures | Entry order GTD in seconds; DCA orders stay GTC (`0` = all GTC) |
+| `GRID_TTL` | `3600` | futures + spot | Refresh stale flat grid (seconds; `0` = off) |
 | `REARM_BACKOFF` | `60` | both | Wait when flat but grid can't be armed |
-| `MAX_SYMBOL_PCT` | `25` | spot | Cap per symbol (% of total USDT wallet) |
-| `MIN_BASE_USDT` | `10` | spot | Floor for wallet-% entry size |
-| `GRID_TTL` | `3600` | spot | Refresh stale armed grid (seconds) |
-| `SPOT_TP` / `SPOT_SL` | `0.5` / `5` | spot | OCO TP/SL % |
+| `TP1_PROFIT_PCT` | `0.3` | futures staged | First partial trigger (%) |
+| `BE_PROFIT_PCT` | `0.1` | futures staged | Runner SL profit lock after TP1 (%) |
+| `TP_PARTIAL_PCT` | `70` | futures staged | First partial size (%) |
+| `TELEGRAM_BOT_TOKEN` | — | telegram | Bot token for alerts + remote control |
+| `TELEGRAM_CHAT_ID` | — | telegram | Allowed chat for alerts + commands |
+| `TELEGRAM_MIN_OPEN_VOL` | `5` | telegram | Min notional USDT to send `#OPEN` alert |
+| `BOTCTL_MODE` | `auto` | telegram ctl | `auto`, `systemd`, or `pidfile` |
+| `FUTURES_UNIT` | `dca-futures` | deploy / botctl | systemd template name |
 | `FUTURES_PAIRS` | — | deploy | Comma-separated symbols for `dca-futures@` |
 | `SPOT_PAIRS` | — | deploy | Comma-separated symbols for `dca-spot@` |
+| `MAX_SYMBOL_PCT` | `25` | spot | Cap per symbol (% of total USDT wallet) |
+| `MIN_BASE_USDT` | `10` | spot | Floor for wallet-% entry size |
+| `SPOT_TP` / `SPOT_SL` | `0.5` / `5` | spot | OCO TP/SL % |
 
 Example pair lists (alphabetical):
 
 ```env
 FUTURES_PAIRS=1000SHIBUSDT,ATOMUSDT,AVAXUSDT,DOGEUSDT,EIGENUSDT,ETCUSDT,NEARUSDT,OPUSDT,SUIUSDT,XRPUSDT
 SPOT_PAIRS=BNBUSDT,BTCUSDT,ETHUSDT,SOLUSDT
+```
+
+---
+
+## OB live chart as a service (PAPER by default)
+
+Scalper dashboard (`ob_live_chart.py`) for **BTC / ETH / BNB**. Always starts in **PAPER** (`--dry-run`) with the Binance feed **PAUSED** (`--feed-paused`); click **FEED** in the UI to start REST polling, then **LIVE** when ready. After a stop-loss in LIVE, mode falls back to PAPER automatically.
+
+| Symbol   | Port | URL |
+|----------|------|-----|
+| BTCUSDT  | 8765 | http://127.0.0.1:8765/ |
+| ETHUSDT  | 8766 | http://127.0.0.1:8766/ |
+| BNBUSDT  | 8767 | http://127.0.0.1:8767/ |
+
+### macOS (LaunchAgents)
+
+```bash
+./deploy/install_ob_live_macos.sh      # install + start BTC/ETH/BNB (PAPER)
+./deploy/uninstall_ob_live_macos.sh    # stop + unload
+```
+
+Because the repo may live on an external volume, the installer syncs a runtime copy to `~/.local/share/ob-live/app` (launchd cannot exec from `/Volumes/…` without Full Disk Access). **Re-run the install script after editing `ob_live_chart.py`** so that copy stays in sync.
+
+Logs: `/tmp/oblive-btcusdt.log` (and eth/bnb).
+
+### Linux (systemd)
+
+```bash
+sudo cp deploy/ob-live@.service /etc/systemd/system/
+# set User + WorkingDirectory in the unit to your install path
+sudo systemctl daemon-reload
+sudo systemctl enable --now ob-live@BTCUSDT ob-live@ETHUSDT ob-live@BNBUSDT
+```
+
+Ports come from `deploy/ob_live_start.sh` (same mapping as the table above).
+
+### Manual (foreground)
+
+```bash
+python3 ob_live_chart.py BNBUSDT --dry-run --port 8767
 ```
 
 ---
@@ -166,45 +560,89 @@ sudo git clone https://github.com/diego-mascarenhas/trade-binance-websocket-orde
   /opt/trade-binance-websocket-orderbook-dca-grid
 sudo chown -R forge:forge /opt/trade-binance-websocket-orderbook-dca-grid
 
-# 2. Secrets
+# 2. Branch + secrets
 cd /opt/trade-binance-websocket-orderbook-dca-grid
+git checkout dev
 cp .env.example .env
 chmod 600 .env
-nano .env   # BINANCE_API_KEY, BINANCE_SECRET_KEY, FUTURES_PAIRS, SPOT_PAIRS
+nano .env   # see Configuration section above
 
 # 3. Dry-run
-python3 orderbook_dca_grid_spot.py BTCUSDT --dry-run
+python3 orderbook_dca_grid.py BTCUSDT --dry-run
 
-# 4. systemd (needs sudo for systemctl)
-sudo cp deploy/dca-futures@.service deploy/dca-futures-tp@.service deploy/dca-spot@.service /etc/systemd/system/
+# 4. Install systemd units (once)
+sudo cp deploy/dca-futures@.service deploy/dca-spot@.service \
+        deploy/dca-telegram-ctl.service deploy/dca-api.service \
+        /etc/systemd/system/
 sudo systemctl daemon-reload
+
+# 5. Start Telegram remote control (optional)
+sudo systemctl enable --now dca-telegram-ctl
+
+# 5b. Start Orderbook Trading API (Flutter)
+sudo systemctl enable --now dca-api
+
+# 6. Start trading fleet from FUTURES_PAIRS
 python3 deploy/sync_pairs.py --dry-run
 python3 deploy/sync_pairs.py
+python3 deploy/sync_pairs.py status
 ```
 
-Updates later:
+### Production deploy runbook
+
+What to run after each type of change:
+
+| Situation | Commands |
+|-----------|----------|
+| **First install** | Steps above (units + `sync_pairs.py` + optional `dca-telegram-ctl` / `dca-api`) |
+| **Code update** (`git pull`) | `git pull` then `python3 deploy/sync_pairs.py --restart` |
+| **Telegram ctl code only** | `sudo systemctl restart dca-telegram-ctl` |
+| **API code / `.env` API_* only** | `sudo systemctl restart dca-api` |
+| **`.env` changed (same pairs)** | `sync_pairs.py --restart` (reload config in running bots) |
+| **Add/remove symbol in `FUTURES_PAIRS`** | Edit `.env`, then `python3 deploy/sync_pairs.py` (starts new, stops removed) |
+| **One symbol manually** | Telegram `/start SYMBOL` or `/stop SYMBOL` |
+
+`git pull` alone does **not** restart bots — they keep old code in memory until `--restart`.
+
+Typical deploy:
 
 ```bash
 cd /opt/trade-binance-websocket-orderbook-dca-grid
-git pull
+./deploy/deploy.sh                      # git pull + sync_pairs --restart + api/tg restart
+# or manually:
+git checkout dev && git pull
 python3 deploy/sync_pairs.py --restart
+sudo systemctl restart dca-telegram-ctl
+sudo systemctl restart dca-api
 ```
+
+`./deploy/deploy.sh --status` prints fleet/API status after the update.  
+`./deploy/deploy.sh --no-pull` only restarts (e.g. after editing `.env`).  
+For structure TP on the VPS set `EXIT_MODE=structure` in `.env` (optional `STRUCTURE_INTERVAL=15m`), then run the script.
+
+### systemd units
 
 | Unit | Command | Use when |
 |------|---------|----------|
-| `dca-futures@SYMBOL` | `--supervise` | Full bot: grid + trailing TP |
+| `dca-futures@SYMBOL` | `--supervise` | **Main bot**: grid + staged exit (defaults from `.env`/code) |
+| `pump-stall-watch` | `pump_stall_scan.py --watch --auto-trade` | Orchestrator: top ★ shorts → `dca … --once` |
+| `pump-stall-watch-early` | early profile + auto-trade | TEST looser filters (optional) |
+| `dca-telegram-ctl` | `telegram_botctl.py` | Telegram `/start` `/stop` `/status` (24/7) |
+| `dca-api` | `api_server.py` | HTTP API for Orderbook Trading Flutter app (`:8787`) |
 | `dca-futures-tp@SYMBOL` | `--tp-only` | Exit only (manual/other entry) |
 | `dca-spot@SYMBOL` | `--supervise` | Spot grid + OCO |
+
+Do **not** run `dca-futures@` and `dca-staged-exit@` on the same symbol. Staged exit is built into `dca-futures@` via `EXIT_MODE=staged`.
 
 Do **not** run `dca-futures@` and `dca-futures-tp@` on the same symbol.
 
 ### Sync pairs from `.env`
 
 ```bash
-python3 deploy/sync_pairs.py status     # desired vs running
-python3 deploy/sync_pairs.py --dry-run  # preview
-python3 deploy/sync_pairs.py            # enable+start listed, disable the rest
-python3 deploy/sync_pairs.py --restart  # same + restart running units
+python3 deploy/sync_pairs.py status      # desired vs running
+python3 deploy/sync_pairs.py --dry-run   # preview
+python3 deploy/sync_pairs.py             # enable + start listed, disable the rest
+python3 deploy/sync_pairs.py --restart   # same + restart already-running units
 ```
 
 Omit `FUTURES_PAIRS` or `SPOT_PAIRS` to leave that market untouched. An empty value disables all units for that template.
@@ -212,8 +650,41 @@ Omit `FUTURES_PAIRS` or `SPOT_PAIRS` to leave that market untouched. An empty va
 ### Logs
 
 ```bash
+# Trading bots
 sudo journalctl -u 'dca-futures@*' -u 'dca-spot@*' -f -o with-unit
-sudo systemctl restart 'dca-futures@*' 'dca-spot@*'
+
+# Pump→stall auto-trade
+sudo journalctl -u pump-stall-watch -f
+tail -f /opt/trade-binance-websocket-orderbook-dca-grid/logs/pump-stall-*.log
+
+# Telegram remote control
+sudo journalctl -u dca-telegram-ctl -f
+
+# One symbol
+sudo journalctl -u dca-futures@SXTUSDT -n 50
+```
+
+Mac (pidfile backend): `.run/logs/SYMBOL.log`
+
+### `/list` says "No supervisors running" but Telegram shows trades
+
+`/list` only sees **systemd units** named `dca-futures@SYMBOL` (or legacy `dca-super@`). It is **not** the same as "positions open on Binance".
+
+Common causes:
+
+| Cause | What happened | Fix |
+|-------|----------------|-----|
+| **sudo without TTY** | `dca-telegram-ctl` runs as `forge`; `sudo systemctl` fails silently in the daemon | Updated `botctl.py` tries systemctl **without sudo** for reads. Redeploy + `sudo systemctl restart dca-telegram-ctl`. For `/start`/`/stop`, add passwordless sudo for forge: `forge ALL=(ALL) NOPASSWD: /bin/systemctl *` |
+| **Fleet never synced** | Alerts from a one-off run; units not enabled | `python3 deploy/sync_pairs.py` on the VPS |
+| **Old unit names** | Bots under `dca-super@` not `dca-futures@` | Migrate per section below, or set `FUTURES_UNIT=dca-super` in `.env` |
+| **Supervisor crashed** | Last alert minutes ago; position still open | `sudo journalctl -u 'dca-futures@*' -n 30`; restart with `/start SYMBOL` or `sync_pairs.py --restart` |
+
+Check on the VPS:
+
+```bash
+python3 deploy/sync_pairs.py status
+sudo systemctl list-units 'dca-futures@*' --state=active
+pgrep -af 'orderbook_dca_grid.py.*--supervise'
 ```
 
 ### Migrate from `dca-super@` / `dca-tp@` (old unit names)

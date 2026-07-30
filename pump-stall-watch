@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Live pump→stall supervisor (same as ./pump-stall --watch …).
+#
+# Usage:
+#   ./pump-stall-watch                         # display only (no orders)
+#   ./pump-stall-watch --auto-trade            # ORDERS: top 3 ★ shorts
+#   ./pump-stall-watch --auto-trade --max-trades 3 --loss-cooldown-min 1440
+#   ./pump-stall-watch-early                   # TEST early profile + auto-trade
+#   ./pump-stall-watch --help
+#
+# Auto-trade → dca short --exit structure + BE@1%→0.3% + trail@2%/0.8% --once
+# Production: sudo systemctl enable --now pump-stall-watch
+# Docs: README.md → Pump→stall scanner
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$ROOT/pump_stall_scan.py" --watch "$@"

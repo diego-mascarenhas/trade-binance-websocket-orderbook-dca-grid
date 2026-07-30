@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# All closed trades + total PnL for a pair
+#   ./obscalp-trades              # snapshot
+#   ./obscalp-trades PYTHUSDT
+#   ./obscalp-trades -f           # live (updates as trades close)
+#   ./obscalp-trades -f -n 20     # live, last 20
+#   ./obscalp-trades --opens
+#   ./obscalp-trades --list
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+exec python3 -u "$ROOT/ob_scalp_trades.py" "$@"

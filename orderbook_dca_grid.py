@@ -401,10 +401,105 @@ def grid_is_orphaned(open_orders: list[dict], symbol: str) -> bool:
     return any(_order_client_id(o).startswith(prefix) for o in open_orders)
 
 
+def count_dca_orders(open_orders: list[dict], symbol: str) -> int:
+    prefix = f"obdcaS{symbol.upper()}"
+    return sum(1 for o in open_orders if _order_client_id(o).startswith(prefix))
+
+
+def sum_dca_notional(open_orders: list[dict], symbol: str) -> float:
+    """Total USDT notional of open obdca* limit orders."""
+    prefix = f"obdcaS{symbol.upper()}"
+    total = 0.0
+    for o in open_orders:
+        if not _order_client_id(o).startswith(prefix):
+            continue
+        try:
+            total += float(o.get("origQty", 0) or 0) * float(o.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
 def cancel_all_symbol_orders(symbol: str, api: str, sec: str, recv: int) -> None:
     _signed_request(
         "DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol.upper()}, api, sec, recv,
     )
+
+
+def gate_price_blocks(
+    gate: float | None,
+    is_long: bool,
+    mid: float,
+    *,
+    verbose: bool = True,
+) -> bool:
+    """True = do not place new orders.
+
+    SHORT: only arm when mid > gate. LONG: only arm when mid < gate.
+    """
+    if gate is None:
+        return False
+    try:
+        g = float(gate)
+    except (TypeError, ValueError):
+        return False
+    if g <= 0 or mid <= 0:
+        return False
+    ok = mid < g if is_long else mid > g
+    if not ok and verbose:
+        side = "LONG" if is_long else "SHORT"
+        need = f"mid < {g:g}" if is_long else f"mid > {g:g}"
+        print(
+            f"{YELLOW}Gate {g:g}: skip {side} "
+            f"(mid {price_fmt(mid)}, need {need}).{RESET}",
+        )
+    return not ok
+
+
+def _live_mid(symbol: str, limit: int = 5) -> float | None:
+    try:
+        depth = fetch_depth(symbol, limit)
+        bids = depth.get("bids") or []
+        asks = depth.get("asks") or []
+        if not bids or not asks:
+            return None
+        return (float(bids[0][0]) + float(asks[0][0])) / 2
+    except Exception:
+        return None
+
+
+def cancel_dca_grid_orders(symbol: str, api: str, sec: str, recv: int) -> int:
+    """Cancel obdca* limit orders (entry + DCA safety grid)."""
+    sym = symbol.upper()
+    try:
+        oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, recv) or []
+    except Exception:
+        return 0
+    killed = 0
+    for o in oo:
+        cid = _order_client_id(o)
+        if not cid.startswith("obdca"):
+            continue
+        try:
+            _signed_request(
+                "DELETE", "/fapi/v1/order",
+                {"symbol": sym, "orderId": o.get("orderId")},
+                api, sec, recv,
+            )
+            killed += 1
+        except Exception as exc:
+            print(f"{RED}Cancel DCA order {cid} failed: {exc}{RESET}")
+    if killed:
+        print(f"{YELLOW}Cancelled {killed} DCA grid limit order(s) on {sym}.{RESET}")
+    return killed
+
+
+def grid_age_sec(orders: list[dict]) -> float:
+    """Age in seconds of the oldest open order (by Binance `time` field)."""
+    times = [int(o.get("time", 0) or 0) for o in orders]
+    if not times:
+        return 0.0
+    return max(0.0, time.time() - min(times) / 1000)
 
 
 def place_orders(
@@ -686,17 +781,232 @@ def account_imbalance_blocks(
     return not args.force
 
 
+def grid_add_notional(orders: list[dict], args: argparse.Namespace, *, dca_only: bool = False) -> float:
+    """USDT notional used for risk guards (full grid by default, entry only if disabled)."""
+    if not orders:
+        return 0.0
+    if dca_only:
+        return sum(float(o.get("size_usdt", 0) or 0) for o in orders)
+    if getattr(args, "risk_use_full_grid", True) and orders[-1].get("cum_usdt") is not None:
+        return float(orders[-1]["cum_usdt"])
+    return float(orders[0].get("size_usdt", 0) or 0)
+
+
+def account_total_notional(api: str, sec: str, recv: int) -> float:
+    """Sum |notional| across all open futures positions."""
+    rows = _signed_request("GET", "/fapi/v2/positionRisk", {}, api, sec, recv)
+    total = 0.0
+    for r in rows if isinstance(rows, list) else []:
+        amt = float(r.get("positionAmt", 0) or 0)
+        if amt == 0:
+            continue
+        raw = r.get("notional", "")
+        if raw not in ("", None):
+            total += abs(float(raw))
+        else:
+            total += abs(amt) * float(r.get("markPrice", 0) or 0)
+    return total
+
+
+def liq_distance_pct(amt: float, mark: float, liq_price: float) -> float | None:
+    """Distance from mark to liquidation as % of mark (None if unknown)."""
+    if mark <= 0 or liq_price <= 0:
+        return None
+    if amt > 0:
+        return (mark - liq_price) / mark * 100.0
+    return (liq_price - mark) / mark * 100.0
+
+
+def account_margin_snapshot(api: str, sec: str, recv: int) -> dict[str, float]:
+    acc = _signed_request("GET", "/fapi/v2/account", {}, api, sec, recv)
+    return {
+        "margin_balance": float(acc.get("totalMarginBalance", 0) or 0),
+        "initial_margin": float(acc.get("totalInitialMargin", 0) or 0),
+        "available": float(acc.get("availableBalance", 0) or 0),
+    }
+
+
+def account_liq_distance_blocks(
+    args: argparse.Namespace, api: str, sec: str, verbose: bool = True,
+) -> bool:
+    """True if any open position is closer to liquidation than --min-liq-distance-pct."""
+    min_dist = getattr(args, "min_liq_distance_pct", 0.0)
+    if min_dist <= 0:
+        return False
+    try:
+        rows = _signed_request("GET", "/fapi/v2/positionRisk", {}, api, sec, args.recv_window)
+    except Exception as exc:
+        if verbose:
+            print(f"{YELLOW}Could not read liquidation prices ({exc}); skipping liq check.{RESET}")
+        return False
+    worst_sym = ""
+    worst_dist: float | None = None
+    for r in rows if isinstance(rows, list) else []:
+        amt = float(r.get("positionAmt", 0) or 0)
+        if amt == 0:
+            continue
+        mark = float(r.get("markPrice", 0) or 0)
+        liq = float(r.get("liquidationPrice", 0) or 0)
+        dist = liq_distance_pct(amt, mark, liq)
+        if dist is None:
+            continue
+        if worst_dist is None or dist < worst_dist:
+            worst_dist = dist
+            worst_sym = str(r.get("symbol", ""))
+    if worst_dist is None or worst_dist >= min_dist:
+        return False
+    if verbose:
+        if args.force:
+            print(f"{YELLOW}Liquidation distance {worst_dist:.1f}% on {worst_sym} "
+                  f"< min {min_dist:g}% — continuing due to --force.{RESET}")
+        else:
+            print(f"{RED}Liquidation too close: {worst_sym} {worst_dist:.1f}% from liq "
+                  f"(min {min_dist:g}%) — skipping new grid "
+                  f"(use --force or --min-liq-distance-pct 0 to disable).{RESET}")
+    return not args.force
+
+
+def account_margin_blocks(
+    args: argparse.Namespace, add_notional: float, leverage: float,
+    api: str, sec: str, verbose: bool = True,
+) -> bool:
+    """True if projected initial margin usage exceeds --max-margin-pct."""
+    limit = getattr(args, "max_margin_pct", 0.0)
+    if limit <= 0:
+        return False
+    try:
+        snap = account_margin_snapshot(api, sec, args.recv_window)
+    except Exception as exc:
+        if verbose:
+            print(f"{YELLOW}Could not read account margin ({exc}); skipping margin check.{RESET}")
+        return False
+    bal = snap["margin_balance"]
+    if bal <= 0:
+        return False
+    lev = max(leverage, 1.0)
+    est_add = add_notional / lev
+    usage = (snap["initial_margin"] + est_add) / bal * 100.0
+    if usage <= limit:
+        return False
+    if verbose:
+        if args.force:
+            print(f"{YELLOW}Projected margin usage {usage:.1f}% > max {limit:g}% "
+                  f"— continuing due to --force.{RESET}")
+        else:
+            print(f"{RED}Margin usage too high: projected {usage:.1f}% > max {limit:g}% "
+                  f"(balance {bal:,.2f} USDT) — skipping new grid "
+                  f"(use --force or --max-margin-pct 0 to disable).{RESET}")
+    return not args.force
+
+
+def account_notional_cap_blocks(
+    args: argparse.Namespace, add_notional: float, leverage: float,
+    api: str, sec: str, verbose: bool = True,
+) -> bool:
+    """True if total |notional| + add would exceed wallet × leverage × cap %."""
+    limit = getattr(args, "max_account_notional_pct", 0.0)
+    if limit <= 0:
+        return False
+    try:
+        wallet = get_wallet_balance(api, sec, args.recv_window)
+        current = account_total_notional(api, sec, args.recv_window)
+    except Exception as exc:
+        if verbose:
+            print(f"{YELLOW}Could not read account notional ({exc}); skipping cap check.{RESET}")
+        return False
+    if wallet <= 0:
+        return False
+    lev = max(leverage, 1.0)
+    cap = wallet * lev * (limit / 100.0)
+    projected = current + add_notional
+    if projected <= cap:
+        return False
+    usage_pct = projected / cap * 100.0 if cap > 0 else 100.0
+    if verbose:
+        if args.force:
+            print(f"{YELLOW}Account notional {projected:,.0f} USDT ({usage_pct:.0f}% of cap) "
+                  f"> {limit:g}% cap — continuing due to --force.{RESET}")
+        else:
+            print(f"{RED}Account notional cap: {projected:,.0f} USDT projected "
+                  f"(current {current:,.0f} + new {add_notional:,.0f}) > "
+                  f"{limit:g}% of wallet×lev ({cap:,.0f} USDT) — skipping new grid "
+                  f"(use --force or --max-account-notional-pct 0 to disable).{RESET}")
+    return not args.force
+
+
+def account_risk_blocks(
+    args: argparse.Namespace,
+    is_long: bool,
+    add_notional: float,
+    api: str,
+    sec: str,
+    *,
+    leverage: float | None = None,
+    verbose: bool = True,
+) -> bool:
+    """True if any account risk guard blocks opening `add_notional` on this side."""
+    lev = leverage if leverage and leverage > 0 else getattr(args, "leverage", 10.0)
+    if account_imbalance_blocks(args, is_long, add_notional, api, sec, verbose):
+        return True
+    if account_liq_distance_blocks(args, api, sec, verbose):
+        return True
+    if account_margin_blocks(args, add_notional, lev, api, sec, verbose):
+        return True
+    if account_notional_cap_blocks(args, add_notional, lev, api, sec, verbose):
+        return True
+    return False
+
+
 def get_position(symbol: str, is_long: bool, hedge: bool, api: str, sec: str, recv: int) -> tuple[float, float]:
     """Return (abs_qty, entry_price) for the relevant position side (0,0 if none)."""
+    meta = get_position_meta(symbol, is_long, hedge, api, sec, recv)
+    return meta["qty"], meta["entry"]
+
+
+def get_position_meta(
+    symbol: str, is_long: bool, hedge: bool, api: str, sec: str, recv: int,
+) -> dict[str, float | int]:
+    """Return qty, entry, notional (USDT), leverage for the open position side."""
+    empty: dict[str, float | int] = {
+        "qty": 0.0, "entry": 0.0, "notional": 0.0, "leverage": 0, "unrealized_pnl": 0.0,
+    }
     rows = _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()}, api, sec, recv)
     want_side = ("LONG" if is_long else "SHORT") if hedge else "BOTH"
-    for r in rows:
+    for r in rows if isinstance(rows, list) else []:
         if str(r.get("positionSide", "BOTH")).upper() != want_side:
             continue
         amt = float(r.get("positionAmt", 0) or 0)
-        if abs(amt) > 0:
-            return abs(amt), float(r.get("entryPrice", 0) or 0)
-    return 0.0, 0.0
+        if abs(amt) <= 0:
+            continue
+        entry = float(r.get("entryPrice", 0) or 0)
+        mark = float(r.get("markPrice", 0) or 0)
+        raw_n = r.get("notional", "")
+        if raw_n not in ("", None):
+            notional = abs(float(raw_n))
+        else:
+            notional = abs(amt) * (mark if mark > 0 else entry)
+        lev = int(float(r.get("leverage", 0) or 0))
+        return {
+            "qty": abs(amt),
+            "entry": entry,
+            "notional": notional,
+            "leverage": lev,
+            "unrealized_pnl": float(r.get("unRealizedProfit", 0) or 0),
+        }
+    return empty
+
+
+def get_symbol_leverage(symbol: str, api: str, sec: str, recv: int) -> int:
+    """Configured leverage for the symbol (from positionRisk, even when flat)."""
+    rows = _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()}, api, sec, recv)
+    for r in rows if isinstance(rows, list) else []:
+        lev = int(float(r.get("leverage", 0) or 0))
+        if lev > 0:
+            return lev
+    try:
+        return get_max_leverage(symbol, api, sec, recv)
+    except Exception:
+        return 10
 
 
 def open_trailing_tp(symbol: str, is_long: bool, api: str, sec: str, recv: int) -> dict | None:
@@ -728,6 +1038,9 @@ def cancel_foreign_sl(symbol: str, is_long: bool, api: str, sec: str, recv: int)
         otype = str(o.get("orderType") or o.get("type") or "").upper()
         if otype in ("STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET", "TAKE_PROFIT") and \
            str(o.get("side", "")).upper() == close_side:
+            cid = str(o.get("clientAlgoId") or o.get("newClientOrderId") or "")
+            if cid.startswith("obstage"):
+                continue  # staged-exit addon — do not remove
             try:
                 _signed_request("DELETE", "/fapi/v1/algoOrder",
                                 {"symbol": symbol.upper(), "algoId": o.get("algoId")}, api, sec, recv)
@@ -864,6 +1177,19 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
                          direction: str | None = None) -> bool:
     """Compute (auto-direction, wallet%% size, max leverage) and place a fresh grid.
     Returns True if orders were placed. Used by --supervise for auto re-arming."""
+    if not dca_only:
+        cd_min = float(getattr(args, "loss_cooldown_min", 0) or 0)
+        if cd_min > 0:
+            import loss_cooldown as lcd
+
+            left = lcd.remaining_sec(args.symbol)
+            if left > 0:
+                if verbose:
+                    print(
+                        f"{YELLOW}Loss cooldown {lcd.fmt_remaining(left)} — "
+                        f"skip arm {args.symbol.upper()}{RESET}",
+                    )
+                return False
     try:
         depth = fetch_depth(args.symbol, args.limit)
     except Exception as exc:
@@ -885,6 +1211,9 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
     else:
         is_long = dir_choice == "long"
 
+    if gate_price_blocks(getattr(args, "gate_price", None), is_long, mid, verbose=verbose):
+        return False
+
     entry = args.price if args.price is not None else mid
     base_size = args.base_size
     if base_size <= 0:
@@ -899,27 +1228,34 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
     if force:
         args.force = True
     try:
-        if account_imbalance_blocks(args, is_long, base_size, api, sec, verbose):
+        levels = bids if is_long else asks
+        walls = select_walls(levels, entry, is_long, args.so_count, args.min_gap, args.min_dist, args.max_range)
+        if not walls:
+            print(f"{RED}No qualifying walls found (adjust --min-gap/--max-range/--limit).{RESET}")
+            return False
+
+        orders = build_grid(entry, is_long, walls, base_size, args.tp, args.size_mode,
+                            args.comp_factor, args.so_size, args.volume_scale)
+        if dca_only:
+            orders = orders[1:]
+            if not orders:
+                print(f"{RED}No DCA levels to place.{RESET}")
+                return False
+            if verbose:
+                print(f"{BOLD}{CYAN}Re-arm DCA only ({len(orders)} safety orders, "
+                      f"{'LONG' if is_long else 'SHORT'}){RESET}")
+
+        lev = float(args.leverage or 10.0)
+        if not args.no_max_leverage:
+            try:
+                lev = float(get_max_leverage(args.symbol, api, sec, args.recv_window))
+            except Exception:
+                pass
+        add_notional = grid_add_notional(orders, args, dca_only=dca_only)
+        if account_risk_blocks(args, is_long, add_notional, api, sec, leverage=lev, verbose=verbose):
             return False
     finally:
         args.force = prev_force
-
-    levels = bids if is_long else asks
-    walls = select_walls(levels, entry, is_long, args.so_count, args.min_gap, args.min_dist, args.max_range)
-    if not walls:
-        print(f"{RED}No qualifying walls found (adjust --min-gap/--max-range/--limit).{RESET}")
-        return False
-
-    orders = build_grid(entry, is_long, walls, base_size, args.tp, args.size_mode,
-                        args.comp_factor, args.so_size, args.volume_scale)
-    if dca_only:
-        orders = orders[1:]
-        if not orders:
-            print(f"{RED}No DCA levels to place.{RESET}")
-            return False
-        if verbose:
-            print(f"{BOLD}{CYAN}Re-arm DCA only ({len(orders)} safety orders, "
-                  f"{'LONG' if is_long else 'SHORT'}){RESET}")
 
     prepared = prepare_orders(orders, args.symbol, is_long, filt)
     return place_orders(args.symbol, is_long, prepared, args, force=force, dca_only=dca_only)
@@ -1009,9 +1345,17 @@ def rearm_grid(args: argparse.Namespace) -> bool:
             args, api, sec, filt, verbose=True,
             dca_only=True, force=True, direction=direction,
         )
-        if placed:
-            print(f"{DIM}Syncing trailing TP…{RESET}")
-            _manage_tp_once(args.symbol, side_is_long, qty, pos_entry, args, hedge, api, sec, filt)
+        from exits import resolve_exit_mode, run_exit_once
+
+        exit_mode = resolve_exit_mode(args)
+        if placed and exit_mode != "none":
+            print(f"{DIM}Syncing exit ({exit_mode})…{RESET}")
+            run_exit_once(
+                exit_mode, args.symbol, side_is_long, qty, pos_entry,
+                args, hedge, api, sec, filt,
+            )
+        elif placed:
+            print(f"{DIM}Exit mode none — skipping exit sync.{RESET}")
     else:
         placed = build_and_place_grid(args, api, sec, filt, verbose=True, force=True)
 
@@ -1019,8 +1363,7 @@ def rearm_grid(args: argparse.Namespace) -> bool:
 
 
 def supervise_loop(args: argparse.Namespace) -> None:
-    """Fully autonomous: re-place the grid whenever the symbol is flat, and keep
-    the trailing TP synced while a position is open."""
+    """Fully autonomous: re-place the grid when flat; run exit plugin when in position."""
     api, sec = load_keys(args.env_file)
     if not api or not sec:
         print(f"{RED}No API keys — cannot supervise.{RESET}")
@@ -1030,46 +1373,383 @@ def supervise_loop(args: argparse.Namespace) -> None:
     except Exception as exc:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
+    from exits import (
+        EXIT_STAGED,
+        EXIT_STRUCTURE,
+        clear_exit_presets,
+        exit_mode_label,
+        resolve_exit_mode,
+        run_exit_once,
+        run_exit_when_flat,
+    )
+    from exits.staged import dca_rearm_allowed, staged_phase
+    from exits.structure import pop_close_reason
+
     hedge = _resolve_hedge(args, api, sec)
+    exit_mode = resolve_exit_mode(args)
+    ttl_note = f", grid refresh {args.grid_ttl:g}s" if args.grid_ttl > 0 else ""
+    gate = getattr(args, "gate_price", None)
+    gate_note = ""
+    if gate is not None and float(gate) > 0:
+        if args.direction == "short":
+            gate_note = f", gate mid>{float(gate):g}"
+        elif args.direction == "long":
+            gate_note = f", gate mid<{float(gate):g}"
+        else:
+            gate_note = f", gate {float(gate):g} (long mid< · short mid>)"
+    once = bool(getattr(args, "once", False))
+    once_note = ", once (no re-arm after close)" if once else ""
     print(f"\n{BOLD}{CYAN}Supervising {args.symbol.upper()} "
-          f"(auto re-arm grid + trailing TP, poll {args.tp_poll_sec:g}s). Ctrl+C to stop.{RESET}")
+          f"(auto re-arm grid + exit: {exit_mode_label(exit_mode)}, poll {args.tp_poll_sec:g}s"
+          f"{ttl_note}{gate_note}{once_note}). "
+          f"Ctrl+C to stop.{RESET}")
+    import telegram_notify as telegram
+    import trade_sounds
+    telegram.notify_supervise_started(args.symbol.upper(), exit_mode_label(exit_mode))
+    armed_log_state: str | None = None
+    last_position_qty: float = 0.0
+    last_direction: str | None = None
+    last_pos_meta: dict[str, float | int] = {}
+    dca_missing_retry_at: float = 0.0
+    exit_preset_armed: bool = False
+    seen_position = False  # --once: true after any open qty this cycle
+    sym = args.symbol.upper()
     try:
         while True:
             sleep_s = args.tp_poll_sec
             try:
                 side_is_long, qty, entry = _detect_open_side(args.symbol, hedge, api, sec, args.recv_window)
                 if side_is_long is not None:
-                    _manage_tp_once(args.symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
+                    seen_position = True
+                    armed_log_state = None
+                    direction = "LONG" if side_is_long else "SHORT"
+                    pos_meta = get_position_meta(sym, side_is_long, hedge, api, sec, args.recv_window)
+                    min_open_vol = _env_float("TELEGRAM_MIN_OPEN_VOL", 5.0)
+                    lev = int(pos_meta["leverage"]) or get_symbol_leverage(sym, api, sec, args.recv_window)
+                    pnl = float(pos_meta.get("unrealized_pnl", 0) or 0)
+                    notional = float(pos_meta["notional"])
+                    if last_position_qty <= 0 and qty > 0 and notional >= min_open_vol:
+                        telegram.notify_position_open(
+                            sym, direction, qty, entry,
+                            vol_usdt=notional,
+                            leverage=lev,
+                            pnl_usdt=pnl,
+                        )
+                        trade_sounds.play_sound("entry")
+                    elif last_position_qty > 0 and qty > last_position_qty + float(filt["step_size"]) / 2:
+                        dca_qty = qty - last_position_qty
+                        old_notional = float(last_pos_meta.get("notional", 0) or 0)
+                        fill_notional = max(0.0, notional - old_notional)
+                        fill_price = fill_notional / dca_qty if dca_qty > 0 else entry
+                        telegram.notify_dca_filled(
+                            sym, direction,
+                            fill_qty=dca_qty,
+                            fill_price=fill_price,
+                            pos_qty=qty,
+                            entry=entry,
+                            vol_usdt=notional,
+                            leverage=lev,
+                            pnl_usdt=pnl,
+                        )
+                        trade_sounds.play_sound("dca")
+                    last_position_qty = qty
+                    last_direction = direction
+                    last_pos_meta = pos_meta
+                    # On attach / after exit-mode restart: drop previous preset, then arm new.
+                    if not exit_preset_armed:
+                        try:
+                            cleared = clear_exit_presets(
+                                sym, side_is_long, api, sec, args.recv_window,
+                            )
+                            total = sum(cleared.values())
+                            if total:
+                                print(
+                                    f"{YELLOW}Exit preset reset → cleared "
+                                    f"staged={cleared['staged']} "
+                                    f"close_algos={cleared['close_algos']} "
+                                    f"foreign={cleared['foreign']} "
+                                    f"· arming {exit_mode_label(exit_mode)}{RESET}"
+                                )
+                            else:
+                                print(
+                                    f"{DIM}Exit preset ready · {exit_mode_label(exit_mode)}{RESET}"
+                                )
+                        except Exception as exc:
+                            print(f"{YELLOW}Exit preset clear skipped: {exc}{RESET}")
+                        exit_preset_armed = True
+                    try:
+                        oo_pos = _signed_request(
+                            "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
+                        ) or []
+                    except Exception:
+                        oo_pos = []
+                    if (
+                        count_dca_orders(oo_pos, sym) == 0
+                        and time.time() >= dca_missing_retry_at
+                        and (exit_mode != EXIT_STAGED or dca_rearm_allowed(sym))
+                    ):
+                        print(f"{YELLOW}Position open, no DCA grid → DCA-only re-arm…{RESET}")
+                        placed = build_and_place_grid(
+                            args, api, sec, filt, verbose=True,
+                            dca_only=True, force=True,
+                            direction=direction.lower(),
+                        )
+                        if placed:
+                            oo_after = _signed_request(
+                                "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
+                            ) or []
+                            lev = get_symbol_leverage(sym, api, sec, args.recv_window)
+                            telegram.notify_grid_armed(
+                                sym, direction, count_dca_orders(oo_after, sym), dca_only=True,
+                                grid_vol_usdt=sum_dca_notional(oo_after, sym),
+                                leverage=lev,
+                            )
+                        else:
+                            dca_missing_retry_at = time.time() + args.rearm_backoff
+                    run_exit_once(
+                        exit_mode, args.symbol, side_is_long, qty, entry,
+                        args, hedge, api, sec, filt,
+                    )
                 else:
+                    position_just_closed = last_position_qty > 0 and bool(last_direction)
+                    close_phase = staged_phase(sym) if exit_mode == EXIT_STAGED else ""
+                    if position_just_closed and last_direction:
+                        after_runner = close_phase in ("staged_partial", "staged_trail")
+                        lev = int(last_pos_meta.get("leverage", 0) or 0) or get_symbol_leverage(
+                            sym, api, sec, args.recv_window,
+                        )
+                        close_reason = None
+                        if exit_mode == EXIT_STRUCTURE:
+                            close_reason = pop_close_reason(sym)
+                        elif after_runner:
+                            close_reason = "runner / trail"
+                        close_pnl = float(last_pos_meta.get("unrealized_pnl", 0) or 0)
+                        telegram.notify_position_closed(
+                            sym, last_direction,
+                            after_runner=after_runner,
+                            vol_usdt=float(last_pos_meta.get("notional", 0) or 0),
+                            leverage=lev,
+                            pnl_usdt=close_pnl,
+                            reason=close_reason,
+                        )
+                        trade_sounds.play_close_sound(close_pnl)
+                        cd_min = float(getattr(args, "loss_cooldown_min", 0) or 0)
+                        if close_pnl < 0 and cd_min > 0:
+                            import loss_cooldown as lcd
+
+                            until = lcd.record_loss(
+                                sym, close_pnl, cd_min * 60.0,
+                                reason=close_reason or "loss",
+                            )
+                            left = max(0.0, until - time.time())
+                            print(
+                                f"{YELLOW}Loss close {close_pnl:+.2f} USDT → cooldown "
+                                f"{lcd.fmt_remaining(left)} on {sym} "
+                                f"(no re-entry){RESET}",
+                            )
+                    elif exit_mode == EXIT_STRUCTURE:
+                        # Drop stale reason if we somehow flattened without notifying.
+                        pop_close_reason(sym)
+                    last_position_qty = 0.0
+                    last_direction = None
+                    last_pos_meta = {}
+                    exit_preset_armed = False
+                    run_exit_when_flat(
+                        exit_mode, args.symbol, args, hedge, api, sec, filt,
+                    )
                     if not args.keep_sl:
                         cancel_foreign_sl(args.symbol, True, api, sec, args.recv_window)
                         cancel_foreign_sl(args.symbol, False, api, sec, args.recv_window)
-                    oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": args.symbol.upper()}, api, sec, args.recv_window)
-                    sym = args.symbol.upper()
+                    if position_just_closed:
+                        try:
+                            killed = cancel_dca_grid_orders(sym, api, sec, args.recv_window)
+                            if killed:
+                                print(
+                                    f"{GREEN}Trade closed → cleared {killed} leftover "
+                                    f"DCA limit order(s).{RESET}",
+                                )
+                        except Exception as exc:
+                            print(f"{RED}Cancel leftover DCA after close failed: {exc}{RESET}")
+                        if once:
+                            print(
+                                f"{BOLD}{GREEN}--once: cycle complete for {sym} "
+                                f"(position closed) → stopping supervisor.{RESET}",
+                            )
+                            return
+                    oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window)
                     if oo and grid_is_orphaned(oo, sym):
-                        print(f"{YELLOW}Entry expired → cancelling orphan grid ({len(oo)} orders)…{RESET}")
+                        armed_log_state = None
+                        side_chk, qty_chk, entry_chk = _detect_open_side(
+                            args.symbol, hedge, api, sec, args.recv_window,
+                        )
+                        if side_chk is not None:
+                            direction = "LONG" if side_chk else "SHORT"
+                            print(f"{YELLOW}Entry filled — {direction} {qty_chk:g} @ {price_fmt(entry_chk)} "
+                                  f"→ DCA-only re-arm (skip orphan cancel){RESET}")
+                            pos_chk = get_position_meta(
+                                sym, side_chk, hedge, api, sec, args.recv_window,
+                            )
+                            telegram.notify_orphan_recovery(
+                                sym, direction, qty_chk, entry_chk,
+                                vol_usdt=float(pos_chk["notional"]),
+                                leverage=get_symbol_leverage(sym, api, sec, args.recv_window),
+                                pnl_usdt=float(pos_chk.get("unrealized_pnl", 0) or 0),
+                            )
+                            if exit_mode != EXIT_STAGED or dca_rearm_allowed(sym):
+                                placed = build_and_place_grid(
+                                    args, api, sec, filt, verbose=True,
+                                    dca_only=True, force=True,
+                                    direction=direction.lower(),
+                                )
+                            else:
+                                placed = False
+                            if placed:
+                                oo2 = _signed_request(
+                                    "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
+                                ) or []
+                                lev = get_symbol_leverage(sym, api, sec, args.recv_window)
+                                telegram.notify_grid_armed(
+                                    sym, direction, count_dca_orders(oo2, sym), dca_only=True,
+                                    grid_vol_usdt=sum_dca_notional(oo2, sym),
+                                    leverage=lev,
+                                )
+                            run_exit_once(
+                                exit_mode, args.symbol, side_chk, qty_chk, entry_chk,
+                                args, hedge, api, sec, filt,
+                            )
+                            if not placed:
+                                sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
+                        else:
+                            print(f"{YELLOW}Entry expired → cancelling orphan grid ({len(oo)} orders)…{RESET}")
+                            try:
+                                cancel_all_symbol_orders(sym, api, sec, args.recv_window)
+                            except Exception as exc:
+                                print(f"{RED}Cancel orphan grid failed: {exc}{RESET}")
+                            else:
+                                if once:
+                                    print(
+                                        f"{BOLD}{YELLOW}--once: entry expired without fill "
+                                        f"→ stopping (no re-arm).{RESET}",
+                                    )
+                                    return
+                                if not position_just_closed:
+                                    print(f"{BOLD}Flat after entry expiry → re-arming grid…{RESET}")
+                                    placed = build_and_place_grid(args, api, sec, filt, verbose=True)
+                                    if placed:
+                                        oo_new = _signed_request(
+                                            "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
+                                        ) or []
+                                        lev = get_symbol_leverage(sym, api, sec, args.recv_window)
+                                        telegram.notify_grid_armed(
+                                            sym,
+                                            args.direction.upper() if args.direction in ("long", "short") else "AUTO",
+                                            count_dca_orders(oo_new, sym) + (1 if grid_entry_order_open(oo_new, sym) else 0),
+                                            grid_vol_usdt=sum_dca_notional(oo_new, sym),
+                                            leverage=lev,
+                                        )
+                                    elif not placed:
+                                        sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
+                                        print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
+                                else:
+                                    print(f"{DIM}Position just closed — deferring grid re-arm to next poll.{RESET}")
+                    elif oo and args.grid_ttl > 0 and grid_age_sec(oo) >= args.grid_ttl:
+                        armed_log_state = None
+                        age_h = grid_age_sec(oo) / 3600
+                        print(f"{YELLOW}Grid stale ({age_h:.1f}h ≥ {args.grid_ttl / 3600:.1f}h TTL) "
+                              f"→ refreshing at current book walls…{RESET}")
                         try:
                             cancel_all_symbol_orders(sym, api, sec, args.recv_window)
                         except Exception as exc:
-                            print(f"{RED}Cancel orphan grid failed: {exc}{RESET}")
+                            print(f"{RED}Cancel stale grid failed: {exc}{RESET}")
                         else:
-                            print(f"{BOLD}Flat after entry expiry → re-arming grid…{RESET}")
                             placed = build_and_place_grid(args, api, sec, filt, verbose=True)
                             if not placed:
                                 sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
-                                print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
+                                print(f"{DIM}Grid refresh failed → retrying in {sleep_s:g}s.{RESET}")
                     elif oo:
-                        print(f"{DIM}Flat · grid armed ({len(oo)} orders waiting to fill)…{RESET}")
+                        if count_dca_orders(oo, sym) > 0 and not grid_entry_order_open(oo, sym):
+                            armed_log_state = None
+                            print(
+                                f"{YELLOW}Flat with leftover DCA limits ({count_dca_orders(oo, sym)}) "
+                                f"→ cancelling…{RESET}",
+                            )
+                            try:
+                                cancel_dca_grid_orders(sym, api, sec, args.recv_window)
+                            except Exception as exc:
+                                print(f"{RED}Cancel leftover DCA failed: {exc}{RESET}")
+                            else:
+                                oo = []
+                        # Armed flat grid past the gate → cancel so it cannot fill.
+                        if oo and getattr(args, "gate_price", None):
+                            mid_now = _live_mid(sym, min(int(args.limit), 20))
+                            if mid_now is not None:
+                                if args.direction == "auto":
+                                    try:
+                                        depth = fetch_depth(sym, min(int(args.limit), 100))
+                                        b = [[float(p), float(q)] for p, q in depth["bids"]]
+                                        a = [[float(p), float(q)] for p, q in depth["asks"]]
+                                        d = decide_direction(b, a, mid_now, args.auto_range)
+                                        side_long = d["direction"] == "long"
+                                    except Exception:
+                                        side_long = None
+                                else:
+                                    side_long = args.direction == "long"
+                                if side_long is not None and gate_price_blocks(
+                                    args.gate_price, side_long, mid_now, verbose=False,
+                                ):
+                                    armed_log_state = None
+                                    print(
+                                        f"{YELLOW}Gate {float(args.gate_price):g}: mid "
+                                        f"{price_fmt(mid_now)} out of range → cancelling armed grid…{RESET}",
+                                    )
+                                    try:
+                                        cancel_dca_grid_orders(sym, api, sec, args.recv_window)
+                                    except Exception as exc:
+                                        print(f"{RED}Gate cancel failed: {exc}{RESET}")
+                                    else:
+                                        oo = []
+                                    sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
+                        if oo:
+                            state = f"armed:{len(oo)}"
+                            if state != armed_log_state:
+                                print(f"{DIM}Flat · grid armed ({len(oo)} orders waiting to fill)…{RESET}")
+                                armed_log_state = state
                     else:
-                        print(f"{BOLD}Flat and no orders → re-arming grid…{RESET}")
-                        placed = build_and_place_grid(args, api, sec, filt, verbose=True)
-                        if not placed:
-                            # Could not arm (imbalance guard, no walls, etc.) — back off
-                            # so we don't hammer the API / spam logs every poll.
-                            sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
-                            print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
+                        armed_log_state = None
+                        if once and seen_position:
+                            print(
+                                f"{BOLD}{GREEN}--once: flat after trade on {sym} "
+                                f"→ stopping supervisor.{RESET}",
+                            )
+                            return
+                        if position_just_closed:
+                            print(f"{DIM}Flat after close — deferring grid re-arm to next poll.{RESET}")
+                        else:
+                            print(f"{BOLD}Flat and no orders → re-arming grid…{RESET}")
+                            placed = build_and_place_grid(args, api, sec, filt, verbose=True)
+                            if placed:
+                                oo_new = _signed_request(
+                                    "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
+                                ) or []
+                                lev = get_symbol_leverage(sym, api, sec, args.recv_window)
+                                n_orders = count_dca_orders(oo_new, sym) + (
+                                    1 if grid_entry_order_open(oo_new, sym) else 0
+                                )
+                                dir_label = (
+                                    args.direction.upper()
+                                    if args.direction in ("long", "short") else "AUTO"
+                                )
+                                telegram.notify_grid_armed(
+                                    sym, dir_label, n_orders,
+                                    grid_vol_usdt=sum_dca_notional(oo_new, sym),
+                                    leverage=lev,
+                                )
+                            elif not placed:
+                                sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
+                                print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
             except Exception as exc:
                 print(f"{RED}Supervisor pass error: {exc}{RESET}")
+                telegram.notify_supervisor_error(sym, str(exc))
             time.sleep(sleep_s)
     except KeyboardInterrupt:
         print(f"\n{RESET}Stopped supervising (open orders/TP left in place).")
@@ -1096,6 +1776,13 @@ def print_tp_plan(symbol: str, is_long: bool, args: argparse.Namespace,
           f"{'✓ guaranteed in profit' if ok else '✗ NOT in profit'}{RESET}")
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name, "")
     if not raw:
@@ -1106,28 +1793,74 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def parse_args() -> argparse.Namespace:
+def _env_optional_float(name: str) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_direction(default: str = "auto") -> str:
+    raw = os.getenv("DIRECTION", default).strip().lower()
+    return raw if raw in ("long", "short", "auto") else default
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Load .env early so config vars (e.g. WALLET_PCT) can drive the defaults.
     # --env-file is honoured on the second pass inside load_keys().
     env_file = None
-    argv = sys.argv[1:]
-    for i, a in enumerate(argv):
-        if a == "--env-file" and i + 1 < len(argv):
-            env_file = argv[i + 1]
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    for i, a in enumerate(raw_argv):
+        if a == "--env-file" and i + 1 < len(raw_argv):
+            env_file = raw_argv[i + 1]
         elif a.startswith("--env-file="):
             env_file = a.split("=", 1)[1]
     load_env_file(env_file)
 
     p = argparse.ArgumentParser(description="DCA grid anchored to real order-book walls")
-    p.add_argument("symbol", help="Symbol, e.g. MORPHOUSDT")
+    p.add_argument("symbol", nargs="?", default=None, help="Symbol, e.g. MORPHOUSDT")
     p.add_argument("--price", type=float, default=None, help="Entry price (default: live mid)")
-    p.add_argument("--direction", choices=["long", "short", "auto"], default="auto",
-                   help="auto = decide from bid/ask imbalance in the book")
+    p.add_argument(
+        "--gate-price",
+        type=float,
+        default=_env_optional_float("GATE_PRICE"),
+        help="Optional: only place/re-arm when mid is on the trade side of this price — "
+             "SHORT if mid > gate, LONG if mid < gate. Env: GATE_PRICE",
+    )
+    p.add_argument("--direction", choices=["long", "short", "auto"], default=_env_direction(),
+                   help="auto = decide from bid/ask imbalance in the book (Env: DIRECTION)")
     p.add_argument("--auto-range", type=float, default=1.0, help="%% band around mid for auto-direction imbalance")
-    p.add_argument("--max-imbalance", type=float, default=_env_float("MAX_IMBALANCE", 30.0),
+    p.add_argument("--max-imbalance", type=float, default=_env_float("MAX_IMBALANCE", 20.0),
                    help="Skip opening on a side if the account's LONG vs SHORT exposure "
                         "would differ by more than this %% (0=off). Env: MAX_IMBALANCE. "
                         "Override with --force")
+    p.add_argument("--max-margin-pct", type=float, default=_env_float("MAX_MARGIN_PCT", 50.0),
+                   help="Skip new grid if projected initial margin / balance exceeds this %% "
+                        "(0=off). Env: MAX_MARGIN_PCT")
+    p.add_argument("--min-liq-distance-pct", type=float, default=_env_float("MIN_LIQ_DISTANCE_PCT", 20.0),
+                   help="Skip new grid if any open position is closer to liquidation than this %% "
+                        "(0=off). Env: MIN_LIQ_DISTANCE_PCT")
+    p.add_argument("--max-account-notional-pct", type=float, default=_env_float("MAX_ACCOUNT_NOTIONAL_PCT", 80.0),
+                   help="Skip if total |notional| + new grid exceeds wallet×leverage×this%% "
+                        "(0=off). Env: MAX_ACCOUNT_NOTIONAL_PCT")
+    p.add_argument("--risk-use-full-grid", action="store_true", default=_env_bool("RISK_USE_FULL_GRID", True),
+                   help="Risk checks use full-grid notional, not entry only (default on). "
+                        "Env: RISK_USE_FULL_GRID")
+    p.add_argument("--no-risk-use-full-grid", dest="risk_use_full_grid", action="store_false",
+                   help="Risk checks use base entry size only")
     p.add_argument("--so-count", type=int, default=8, help="Number of DCA orders (walls to place)")
     p.add_argument("--limit", type=int, default=1000, help="Order book depth to fetch (5..1000)")
     p.add_argument("--min-gap", type=float, default=0.8, help="Min %% spacing between chosen walls")
@@ -1156,20 +1889,121 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--order-ttl", type=float, default=_env_float("ORDER_TTL", 3600.0),
                    help="Base/entry LIMIT lifetime in seconds via GTD (0=use --tif for all). "
                         "DCA safety orders always use --tif (default GTC). Env: ORDER_TTL")
+    p.add_argument("--grid-ttl", type=float, default=_env_float("GRID_TTL", 3600.0),
+                   help="Refresh a flat armed grid after this many seconds (cancel + re-arm). "
+                        "0=off. Default 1h. Env: GRID_TTL")
     p.add_argument("--position-mode", choices=["auto", "hedge", "oneway"], default="auto")
     p.add_argument("--set-leverage", type=int, default=0, help="Force a specific leverage (0=use symbol max)")
     p.add_argument("--no-max-leverage", action="store_true", help="Do NOT auto-set the symbol's max leverage")
-    p.add_argument("--recv-window", type=int, default=5000)
+    p.add_argument("--recv-window", type=int, default=_env_int("RECV_WINDOW", 15000),
+                   help="Binance recvWindow ms (use 15000 on Mac if -1021). Env: RECV_WINDOW")
     p.add_argument("--env-file", default=None, help="Path to .env with API keys (default: project root)")
-    # Trailing TP on the opposite order book (AUTOMATIC by default when executing)
-    p.add_argument("--no-tp", action="store_true", help="Do NOT auto-manage the trailing TP after placing the grid")
+    # Exit strategy (plugins in exits/ — default staged TP1 + trail)
+    p.add_argument(
+        "--exit", dest="exit_mode",
+        choices=["trailing", "staged", "structure", "be", "none"],
+        default=None,
+        help="Exit strategy: trailing | staged | structure (TP=EQH/EQL; BE protect on by default) "
+             "| be (protect only, no TP) | none (default: staged; EXIT_MODE env)",
+    )
+    p.add_argument("--no-tp", action="store_true",
+                   help="Legacy alias for --exit none (skip automatic exit management)")
+    p.add_argument("--tp1-profit-pct", type=float, default=None,
+                   help="[--exit staged|structure] Partial TP profit %% from entry (gross). "
+                        "With --exit structure default 0.3. Env: TP1_PROFIT_PCT")
+    p.add_argument(
+        "--partial-tp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="[--exit structure] Arm TAKE_PROFIT on --tp-partial-pct when notional "
+             "≥ --partial-tp-min-notional (default on). Use --no-partial-tp to disable",
+    )
+    p.add_argument(
+        "--partial-tp-min-notional",
+        type=float,
+        default=None,
+        help="[--exit structure] Min position notional USDT to arm partial TP "
+             "(default 500). Env: PARTIAL_TP_MIN_NOTIONAL",
+    )
+    p.add_argument(
+        "--protect-be",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="[--exit structure] Also arm BE protect SL (default on). "
+             "Use --no-protect-be for structure TP only",
+    )
+    p.add_argument("--be-arm-pct", type=float, default=None,
+                   help="[--exit structure|be] Arm BE SL when unrealized profit %% ≥ this "
+                        "(default 1.0). Env: BE_ARM_PCT")
+    p.add_argument("--be-profit-pct", type=float, default=None,
+                   help="[--exit structure|be|staged] SL profit lock %% from entry "
+                        "(structure/be default 0.3, staged default 0.1; no fee buffer). "
+                        "Env: BE_PROFIT_PCT")
+    p.add_argument(
+        "--post-be",
+        choices=["none", "trail"],
+        default=None,
+        help="[--exit structure|be] After BE is armed: none (default) or trail "
+             "(arm trailing at --post-be-arm-pct). Env: POST_BE",
+    )
+    p.add_argument(
+        "--post-be-arm-pct",
+        type=float,
+        default=None,
+        help="[--post-be trail] Arm trailing when unrealized profit %% ≥ this "
+             "(default 2.0). Env: POST_BE_ARM_PCT",
+    )
+    p.add_argument(
+        "--post-be-callback",
+        type=float,
+        default=None,
+        help="[--post-be trail] TRAILING_STOP callbackRate %% (default 0.8). "
+             "Env: POST_BE_CALLBACK",
+    )
+    p.add_argument("--tp-partial-pct", type=float, default=None,
+                   help="[--exit staged|structure] Partial TP size %% (default 70). "
+                        "Env: TP_PARTIAL_PCT")
+    p.add_argument(
+        "--structure-interval",
+        default=os.getenv("STRUCTURE_INTERVAL", os.getenv("OB_STRUCT_INTERVAL", "15m")),
+        help="[--exit structure] Kline interval for EQH/EQL (default 15m). Env: STRUCTURE_INTERVAL",
+    )
+    p.add_argument(
+        "--equal-tol-pct",
+        type=float,
+        default=_env_float("EQUAL_TOL_PCT", 0.12),
+        help="[--exit structure] EQH/EQL match tolerance %% (default 0.12). Env: EQUAL_TOL_PCT",
+    )
+    p.add_argument(
+        "--near-pct",
+        type=float,
+        default=_env_float("NEAR_PCT", 0.35),
+        help="[--exit structure] Max distance %% to EQH/EQL to fire TP (default 0.35). Env: NEAR_PCT",
+    )
     p.add_argument("--tp-only", action="store_true", help="Skip the grid; only auto-manage the trailing TP for the position")
     p.add_argument("--supervise", action="store_true", help="Autonomous: re-arm the grid when flat + manage the trailing TP (loop)")
+    p.add_argument(
+        "--once",
+        action="store_true",
+        help="With --supervise: run one trade cycle only (arm → manage → on flat after close, exit; no re-arm)",
+    )
+    p.add_argument(
+        "--loss-cooldown-min",
+        type=float,
+        default=_env_float("LOSS_COOLDOWN_MIN", 1440.0),
+        help="After a losing close, block re-entry on this symbol for N minutes "
+             "(0=off; default 1440 = 24h). Env: LOSS_COOLDOWN_MIN",
+    )
     p.add_argument("--tp-callback", type=float, default=0.2, help="Trailing callback rate %% (0.1..10)")
     p.add_argument("--tp-fee-buffer", type=float, default=0.12, help="Extra profit margin %% (fees+buffer) to stay green")
     p.add_argument("--tp-wall-min-mult", type=float, default=3.0, help="Min wall size vs median book qty to count as a wall")
     p.add_argument("--tp-wall-pick", choices=["nearest", "strongest"], default="nearest", help="Which opposite wall to target")
-    p.add_argument("--tp-poll-sec", type=float, default=5.0, help="Position/TP re-sync interval (manage-tp)")
+    p.add_argument(
+        "--tp-poll-sec",
+        type=float,
+        default=_env_float("TP_POLL_SEC", 15.0),
+        help="Position/TP re-sync interval (supervise / manage-tp). Env: TP_POLL_SEC (default 15)",
+    )
     p.add_argument("--rearm-backoff", type=float, default=_env_float("REARM_BACKOFF", 60.0),
                    help="When flat but a grid can't be armed (imbalance/no walls), wait this "
                         "long before retrying instead of --tp-poll-sec. Env: REARM_BACKOFF")
@@ -1177,11 +2011,281 @@ def parse_args() -> argparse.Namespace:
                    help="Cancel open orders and place a fresh grid (DCA-only if holding a position)")
     p.add_argument("--rearm-flat", action="store_true",
                    help="With --rearm: market-close the position first, then place a full grid")
+    p.add_argument("--audit", action="store_true",
+                   help="Show open grid orders, trailing TP, and position (read-only)")
+    p.add_argument("--audit-all", action="store_true",
+                   help="With --audit: every symbol in FUTURES_PAIRS from .env")
+    p.add_argument("--audit-symbols", default=None,
+                   help="With --audit: comma-separated symbols (e.g. LINKUSDT,DOGEUSDT)")
     p.add_argument("--keep-sl", action="store_true", help="Do NOT auto-cancel foreign STOP_MARKET SLs (e.g. Finandy's)")
-    args = p.parse_args()
+    args = p.parse_args(raw_argv)
     # Executes by default; --dry-run flips it off.
     args.execute = not args.dry_run
     return args
+
+
+def preview_grid_payload(
+    symbol: str,
+    *,
+    direction: str | None = None,
+    gate_price: float | None = None,
+) -> dict:
+    """Dry-run grid as structured levels for the Flutter / TradingView chart."""
+    argv = [symbol.upper(), "--dry-run"]
+    if direction in ("long", "short", "auto"):
+        argv.extend(["--direction", direction])
+    args = parse_args(argv)
+    if gate_price is not None and gate_price > 0:
+        args.gate_price = float(gate_price)
+
+    try:
+        depth = fetch_depth(args.symbol, args.limit)
+    except Exception as exc:
+        return {"ok": False, "error": f"Depth fetch failed: {exc}", "levels": []}
+
+    bids = [[float(p), float(q)] for p, q in depth["bids"]]
+    asks = [[float(p), float(q)] for p, q in depth["asks"]]
+    if not bids or not asks:
+        return {"ok": False, "error": "Empty order book", "levels": []}
+
+    mid = (bids[0][0] + asks[0][0]) / 2
+    if args.direction == "auto":
+        d = decide_direction(bids, asks, mid, args.auto_range)
+        args.direction = d["direction"]
+        is_long = d["direction"] == "long"
+        book_note = f"auto→{args.direction.upper()} (bid {d['bid_vol']:,.0f} / ask {d['ask_vol']:,.0f})"
+    else:
+        is_long = args.direction == "long"
+        book_note = args.direction.upper()
+
+    if gate_price_blocks(args.gate_price, is_long, mid, verbose=False):
+        return {
+            "ok": False,
+            "error": "Gate blocks this direction at current mid",
+            "direction": args.direction,
+            "mid": mid,
+            "levels": [],
+        }
+
+    entry = args.price if args.price is not None else mid
+    api, sec = load_keys(args.env_file)
+    if args.base_size <= 0:
+        if not api or not sec:
+            return {"ok": False, "error": "API keys required to size from wallet %", "levels": []}
+        try:
+            bal = get_wallet_balance(api, sec, args.recv_window)
+            args.base_size = bal * args.wallet_pct / 100.0
+        except Exception as exc:
+            return {"ok": False, "error": f"Wallet balance failed: {exc}", "levels": []}
+
+    if not args.no_max_leverage and args.set_leverage <= 0 and api and sec:
+        try:
+            args.leverage = get_max_leverage(args.symbol, api, sec, args.recv_window)
+        except Exception:
+            pass
+
+    book_side = bids if is_long else asks
+    walls = select_walls(
+        book_side, entry, is_long, args.so_count, args.min_gap, args.min_dist, args.max_range,
+    )
+    if not walls:
+        return {
+            "ok": False,
+            "error": "No qualifying walls found",
+            "direction": args.direction,
+            "mid": mid,
+            "levels": [],
+        }
+
+    orders = build_grid(
+        entry,
+        is_long,
+        walls,
+        args.base_size,
+        args.tp,
+        args.size_mode,
+        args.comp_factor,
+        args.so_size,
+        args.volume_scale,
+    )
+
+    levels: list[dict] = []
+    for o in orders:
+        name = str(o.get("name") or "")
+        price = float(o.get("price") or 0)
+        if price <= 0:
+            continue
+        if name.startswith("Base") or name.upper() == "ENTRY":
+            kind, label, color = "preview_entry", "ENTRY", "#c084fc"
+        else:
+            kind, label, color = "preview_dca", name.upper().replace(" ", ""), "#58a6ff"
+        levels.append({"kind": kind, "label": label, "price": price, "color": color})
+
+    tp_price = float(orders[-1].get("tp") or 0)
+    if tp_price > 0:
+        levels.append(
+            {"kind": "preview_tp", "label": "TP", "price": tp_price, "color": "#3fb950"}
+        )
+
+    if args.gate_price is not None and float(args.gate_price) > 0:
+        levels.append(
+            {
+                "kind": "preview_gate",
+                "label": "GATE",
+                "price": float(args.gate_price),
+                "color": "#f472b6",
+            }
+        )
+
+    full_notional = float(orders[-1].get("cum_usdt") or 0)
+    n_dca = max(0, len(orders) - 1)
+    summary = (
+        f"Preview {book_note} · {n_dca} DCA · "
+        f"grid {full_notional:,.2f} USDT · TP {args.tp:g}% from avg"
+    )
+    return {
+        "ok": True,
+        "symbol": args.symbol.upper(),
+        "direction": args.direction,
+        "mid": mid,
+        "entry": entry,
+        "leverage": float(args.leverage or 0),
+        "dca_count": n_dca,
+        "notional": full_notional,
+        "tp_price": tp_price,
+        "message": summary,
+        "levels": levels,
+    }
+
+
+def _parse_symbol_list(raw: str) -> list[str]:
+    """Parse 'BTCUSDT, ETHUSDT' → ['BTCUSDT', 'ETHUSDT']."""
+    pairs: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        sym = part.strip().upper()
+        if sym:
+            pairs.append(sym)
+    return pairs
+
+
+def _list_trailing_tps(symbol: str, api: str, sec: str, recv: int) -> list[dict]:
+    """All open TRAILING_STOP_MARKET algo orders on the symbol."""
+    try:
+        resp = _signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol.upper()}, api, sec, recv)
+    except Exception:
+        return []
+    orders = resp if isinstance(resp, list) else resp.get("orders", resp.get("data", []))
+    out: list[dict] = []
+    for o in orders or []:
+        otype = str(o.get("orderType") or o.get("type") or "").upper()
+        if otype == "TRAILING_STOP_MARKET":
+            out.append(o)
+    return out
+
+
+def audit_symbol(
+    symbol: str,
+    args: argparse.Namespace,
+    api: str,
+    sec: str,
+    hedge: bool,
+    *,
+    so_count: int,
+) -> None:
+    """Print open grid orders, trailing TP, and position for one symbol."""
+    sym = symbol.upper()
+    recv = args.recv_window
+
+    oo = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, recv) or []
+    dca = [o for o in oo if _order_client_id(o).startswith(f"obdcaS{sym}")]
+    entry = [o for o in oo if _order_client_id(o).startswith(f"obdcaE{sym}")]
+    other = [o for o in oo if not _order_client_id(o).startswith("obdca")]
+
+    side_is_long, qty, pos_entry = _detect_open_side(sym, hedge, api, sec, recv)
+    trailings = _list_trailing_tps(sym, api, sec, recv)
+
+    print(f"\n{BOLD}{CYAN}=== {sym} ==={RESET}")
+    print(f"  Open limits: {len(dca)} DCA  |  {len(entry)} entry  |  {len(other)} other")
+    print(f"  Trailing TP (algo): {len(trailings)}")
+
+    if side_is_long is not None:
+        side = "LONG" if side_is_long else "SHORT"
+        mark = 0.0
+        try:
+            idx = _signed_request("GET", "/fapi/v1/premiumIndex", {"symbol": sym}, api, sec, recv)
+            mark = float(idx.get("markPrice", 0) or 0)
+        except Exception:
+            pass
+        notional = abs(qty) * mark if mark else 0.0
+        print(f"  Position: {side} {qty:g} @ {pos_entry:g}  notional≈{notional:.1f} USDT")
+    else:
+        print(f"  Position: flat")
+
+    if side_is_long is not None and len(dca) == 0:
+        status = f"{YELLOW}⚠ position open, no DCA grid — run --rearm{RESET}"
+    elif side_is_long is None and oo and grid_is_orphaned(oo, sym):
+        status = f"{YELLOW}⚠ orphan grid (entry expired){RESET}"
+    elif side_is_long is not None and len(dca) < so_count:
+        status = f"{DIM}DCA {len(dca)}/{so_count} open (rest may have filled){RESET}"
+    elif side_is_long is not None and len(dca) >= so_count:
+        status = f"{GREEN}✓ grid armed ({len(dca)}/{so_count} DCA){RESET}"
+    elif side_is_long is None and not oo:
+        status = f"{DIM}flat, no orders{RESET}"
+    else:
+        status = f"{DIM}flat, grid waiting ({len(oo)} orders){RESET}"
+    print(f"  Status: {status}")
+
+    if len(trailings) > 1:
+        print(f"  {YELLOW}⚠ {len(trailings)} trailing stops — consider consolidating{RESET}")
+
+    sort_long = side_is_long if side_is_long is not None else True
+    for o in sorted(dca, key=lambda x: float(x["price"]), reverse=sort_long):
+        cid = _order_client_id(o)
+        tag = f"  {cid}" if cid else ""
+        print(f"    DCA  {o['side']} {o['origQty']} @ {o['price']}{tag}")
+
+    for o in entry:
+        cid = _order_client_id(o)
+        tag = f"  {cid}" if cid else ""
+        print(f"    ENTRY {o['side']} {o['origQty']} @ {o['price']}{tag}")
+
+    for t in trailings:
+        cb = t.get("callbackRate", "?")
+        print(f"    TRAIL {t.get('side')} qty={t.get('quantity')} "
+              f"callback={cb}% algoId={t.get('algoId')}")
+
+
+def run_audit(args: argparse.Namespace) -> None:
+    """Audit grid orders and positions (one symbol, --audit-symbols, or --audit-all)."""
+    api, sec = load_keys(args.env_file)
+    if not api or not sec:
+        print(f"{RED}No API keys — cannot audit.{RESET}")
+        return
+    hedge = _resolve_hedge(args, api, sec)
+
+    if args.audit_all:
+        symbols = _parse_symbol_list(os.getenv("FUTURES_PAIRS", ""))
+        if not symbols:
+            print(f"{RED}FUTURES_PAIRS empty or unset in .env — use SYMBOL --audit or --audit-symbols.{RESET}")
+            return
+    elif args.audit_symbols:
+        symbols = _parse_symbol_list(args.audit_symbols)
+        if not symbols:
+            print(f"{RED}--audit-symbols is empty.{RESET}")
+            return
+    elif args.symbol:
+        symbols = [args.symbol.upper()]
+    else:
+        print(f"{RED}Symbol required: SYMBOL --audit, --audit-all, or --audit-symbols LIST.{RESET}")
+        return
+
+    print(f"{BOLD}Grid audit{RESET}  {DIM}({len(symbols)} symbol(s), "
+          f"expect up to {args.so_count} DCA when fully armed){RESET}")
+    for sym in symbols:
+        try:
+            audit_symbol(sym, args, api, sec, hedge, so_count=args.so_count)
+        except Exception as exc:
+            print(f"\n{RED}=== {sym.upper()} === audit failed: {exc}{RESET}")
 
 
 def _resolve_hedge(args: argparse.Namespace, api: str, sec: str) -> bool:
@@ -1236,6 +2340,14 @@ def run_tp_manager(args: argparse.Namespace, is_long: bool | None) -> None:
 def main() -> None:
     args = parse_args()
 
+    if args.audit or args.audit_all:
+        run_audit(args)
+        return
+
+    if not args.symbol:
+        print(f"{RED}Symbol required (e.g. ADAUSDT).{RESET}")
+        return
+
     if args.rearm:
         rearm_grid(args)
         return
@@ -1276,6 +2388,9 @@ def main() -> None:
     else:
         is_long = args.direction == "long"
 
+    if gate_price_blocks(args.gate_price, is_long, mid):
+        return
+
     entry = args.price if args.price is not None else mid
 
     # Resolve entry size (base) from wallet % and show the symbol's max leverage.
@@ -1300,12 +2415,6 @@ def main() -> None:
             except Exception:
                 pass
 
-    # Account-level LONG/SHORT exposure guard (needs API keys).
-    if args.max_imbalance > 0:
-        api, sec = load_keys(args.env_file)
-        if api and sec and account_imbalance_blocks(args, is_long, args.base_size, api, sec):
-            return
-
     levels = bids if is_long else asks
     walls = select_walls(
         levels, entry, is_long, args.so_count, args.min_gap, args.min_dist, args.max_range
@@ -1327,12 +2436,25 @@ def main() -> None:
     )
     print(render(args.symbol.upper(), args, orders, entry, len(walls)))
 
-    # Prepare orders with exchange precision (price/qty rounding, min notional)
     try:
         filt = load_symbol_filters(args.symbol)
     except Exception as exc:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
+
+    # Account-level risk guards (needs API keys).
+    api, sec = load_keys(args.env_file)
+    if api and sec:
+        lev = float(args.leverage or 10.0)
+        if not args.no_max_leverage:
+            try:
+                lev = float(get_max_leverage(args.symbol, api, sec, args.recv_window))
+            except Exception:
+                pass
+        add_notional = grid_add_notional(orders, args, dca_only=False)
+        if account_risk_blocks(args, is_long, add_notional, api, sec, leverage=lev):
+            return
+
     prepared = prepare_orders(orders, args.symbol, is_long, filt)
 
     side = "BUY" if is_long else "SELL"
@@ -1346,23 +2468,30 @@ def main() -> None:
 
     if not args.execute:
         print(f"\n{DIM}DRY-RUN — no orders sent. Remove --dry-run to place the grid "
-              f"and auto-manage the TP (or --no-tp to skip the TP).{RESET}")
+              f"and auto-manage exit (or --exit none to skip).{RESET}")
         return
 
     placed_ok = place_orders(args.symbol, is_long, prepared, args)
     if not placed_ok:
         return
 
-    # TP is AUTOMATIC: after placing the grid, keep the trailing TP synced to the position.
-    if args.no_tp:
-        print(f"\n{DIM}--no-tp set: skipping automatic TP management.{RESET}")
+    from exits import EXIT_TRAILING, resolve_exit_mode, run_exit_once
+
+    exit_mode = resolve_exit_mode(args)
+    if exit_mode == "none":
+        print(f"\n{DIM}Exit mode none — skipping automatic exit management.{RESET}")
         return
     api, sec = load_keys(args.env_file)
     if not api or not sec:
-        print(f"{RED}No API keys — cannot auto-manage trailing TP.{RESET}")
+        print(f"{RED}No API keys — cannot auto-manage exit.{RESET}")
         return
     hedge = _resolve_hedge(args, api, sec)
-    manage_trailing_tp(args.symbol, is_long, args, hedge, api, sec, filt)
+    if exit_mode == EXIT_TRAILING:
+        manage_trailing_tp(args.symbol, is_long, args, hedge, api, sec, filt)
+        return
+    side_is_long, qty, entry = _detect_open_side(args.symbol, hedge, api, sec, args.recv_window, is_long)
+    if side_is_long is not None and qty > 0:
+        run_exit_once(exit_mode, args.symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
 
 
 if __name__ == "__main__":

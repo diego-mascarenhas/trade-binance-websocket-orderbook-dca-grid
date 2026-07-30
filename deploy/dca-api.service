@@ -1,0 +1,15 @@
+[Unit]
+Description=Orderbook Trading HTTP API (Flutter control plane)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=forge
+WorkingDirectory=/opt/trade-binance-websocket-orderbook-dca-grid
+ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/api_server.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# One-shot scan with the early-stall TEST profile (see ./pump-stall-watch-early).
+# Default ./pump-stall is unchanged.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$ROOT/pump_stall_scan.py" \
+  --min-stall 25 \
+  --min-near-high 82 \
+  --ideal-near 90 \
+  --why 20 \
+  "$@"

@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram remote control for DCA futures supervisors
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=forge
+WorkingDirectory=/opt/trade-binance-websocket-orderbook-dca-grid
+ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/telegram_botctl.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

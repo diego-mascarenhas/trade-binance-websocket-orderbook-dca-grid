@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Short wrapper: pick [-y] [--bg] [--dry-run] [--local-only] ...
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$ROOT/trade_pick.py" "$@"
