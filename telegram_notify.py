@@ -303,17 +303,44 @@ def notify_position_closed(
     pnl_usdt: float | None = None,
     reason: str | None = None,
 ) -> None:
-    vol = f" · {fmt_vol_usdt(vol_usdt, leverage)}" if vol_usdt and vol_usdt > 0 else ""
-    emoji = _close_emoji(pnl_usdt)
-    pnl_line = pnl_suffix(pnl_usdt, vol_usdt or 0.0, leverage) if pnl_usdt is not None else ""
     why = (reason or "").strip()
     if not why and after_runner:
         why = "runner"
-    reason_line = f"\nReason: {why}" if why else ""
-    _send_async(
-        f"{emoji} {symbol.upper()} futures\n"
-        f"#CLOSED {direction.upper()}{vol}{pnl_line}{reason_line}"
-    )
+
+    public_chat = ""
+    try:
+        import pumpstall_telegram as pst
+
+        public_chat = pst.chat_id()
+    except Exception:
+        pst = None  # type: ignore[assignment]
+
+    ops_chat = _chat_id()
+    # Never post volume/USDT size to the public Pumpstall channel.
+    same_as_public = bool(public_chat) and public_chat == ops_chat
+
+    if not same_as_public:
+        vol = f" · {fmt_vol_usdt(vol_usdt, leverage)}" if vol_usdt and vol_usdt > 0 else ""
+        emoji = _close_emoji(pnl_usdt)
+        pnl_line = pnl_suffix(pnl_usdt, vol_usdt or 0.0, leverage) if pnl_usdt is not None else ""
+        reason_line = f"\nReason: {why}" if why else ""
+        _send_async(
+            f"{emoji} {symbol.upper()} futures\n"
+            f"#CLOSED {direction.upper()}{vol}{pnl_line}{reason_line}"
+        )
+
+    if pst is not None and public_chat:
+        try:
+            pst.notify_close(
+                symbol,
+                direction,
+                pnl_usdt=pnl_usdt,
+                notional=vol_usdt,
+                leverage=leverage,
+                reason=why or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Pumpstall channel close notify failed: %s", exc)
 
 
 def notify_sl_at_entry(symbol: str, direction: str, qty: float, entry: float) -> None:

@@ -16,6 +16,7 @@
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec python3 "$ROOT/pump_stall_scan.py" --watch \
   --auto-trade \
+  --telegram \
   --max-trades 3 \
   --interval 60 \
   --loss-cooldown-min 1440 \

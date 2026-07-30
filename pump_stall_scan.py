@@ -658,6 +658,56 @@ def print_hits(
         print(f"{DIM}(no blocked rows){RESET}")
     return {}
 
+def _maybe_telegram_notify(
+    hits: list[PumpStallHit],
+    *,
+    ideal_near: float,
+    prev_map: dict[str, float] | None,
+    enabled: bool,
+    bootstrap: bool = False,
+) -> None:
+    """Post ★ ideals to the public Pumpstall channel."""
+    if not enabled:
+        return
+    try:
+        import pumpstall_telegram as pst
+    except ImportError:
+        print(f"{DIM}Telegram: pumpstall_telegram not available{RESET}")
+        return
+    if not pst.is_configured():
+        print(f"{DIM}Telegram: Pumpstall channel not configured — skip{RESET}")
+        return
+    if prev_map is None and not bootstrap:
+        return
+
+    sent = 0
+    for h in hits:
+        if h.near_high_pct < ideal_near:
+            continue
+        if prev_map is not None and h.symbol in prev_map and not bootstrap:
+            continue
+        if pst.notify_open_hit(h):
+            sent += 1
+            print(f"{GREEN}Telegram ★ {h.symbol}{RESET}")
+        else:
+            print(f"{YELLOW}Telegram failed {h.symbol}{RESET}")
+    if sent:
+        print(f"{DIM}Telegram: posted {sent} ★ setup(s){RESET}")
+    elif bootstrap:
+        print(f"{DIM}Telegram: no ★ ideals to post{RESET}")
+
+
+def _maybe_daily_summary(enabled: bool) -> None:
+    if not enabled:
+        return
+    try:
+        import pumpstall_telegram as pst
+    except ImportError:
+        return
+    if pst.maybe_send_daily_summary():
+        print(f"{GREEN}Telegram: daily PnL summary sent{RESET}")
+
+
 def _clear_screen() -> None:
     # Keep scrollback usable; full clear each refresh
     sys.stdout.write("\033[2J\033[H")
@@ -903,6 +953,7 @@ def watch_loop(args: argparse.Namespace) -> int:
             )
             print()
             why_n = int(getattr(args, "why", 15) or 0)
+            prev_before = prev
             prev = print_hits(
                 hits,
                 ideal_near=args.ideal_near,
@@ -910,6 +961,14 @@ def watch_loop(args: argparse.Namespace) -> int:
                 blocked=blocked,
                 why_limit=why_n,
             )
+            tg_on = bool(getattr(args, "telegram", False))
+            _maybe_telegram_notify(
+                hits,
+                ideal_near=args.ideal_near,
+                prev_map=prev_before,
+                enabled=tg_on,
+            )
+            _maybe_daily_summary(tg_on)
             maybe_write_snapshot(
                 args,
                 hits=hits,
@@ -1072,6 +1131,13 @@ Production (VPS):
         action="store_true",
         help="Do not write the web snapshot JSON (trading unchanged either way)",
     )
+    p.add_argument(
+        "--telegram",
+        action="store_true",
+        help="Post ★ opens + daily PnL %% summary to the public Pumpstall channel "
+             "(TELEGRAM_BOT_TOKEN + TELEGRAM_PUMPSTALL_CHAT_ID=@pumpstall). "
+             "Closes with %% only are mirrored whenever the channel is configured.",
+    )
     return p.parse_args(argv)
 
 
@@ -1094,6 +1160,14 @@ def main(argv: list[str] | None = None) -> int:
         blocked=blocked,
         why_limit=int(getattr(args, "why", 15) or 0),
     )
+    if getattr(args, "telegram", False):
+        _maybe_telegram_notify(
+            hits,
+            ideal_near=args.ideal_near,
+            prev_map=None,
+            enabled=True,
+            bootstrap=True,
+        )
     maybe_write_snapshot(
         args,
         hits=hits,
