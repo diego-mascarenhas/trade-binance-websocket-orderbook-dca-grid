@@ -25,8 +25,61 @@ def _chat_id() -> str:
     return os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 
+def _public_chat_id() -> str:
+    try:
+        import pumpstall_telegram as pst
+
+        return pst.chat_id()
+    except Exception:
+        return os.getenv("TELEGRAM_PUMPSTALL_CHAT_ID", "").strip()
+
+
+def _ops_is_public_channel() -> bool:
+    """True when TELEGRAM_CHAT_ID points at the public Pumpstall channel."""
+    ops = _chat_id()
+    pub = _public_chat_id()
+    return bool(ops) and bool(pub) and ops == pub
+
+
+def _pnl_pct_public(
+    pnl_usdt: float | None,
+    notional: float | None,
+    leverage: float | int | None,
+) -> float | None:
+    try:
+        import pumpstall_telegram as pst
+
+        return pst.pnl_pct_from_close(pnl_usdt, notional, leverage)
+    except Exception:
+        return None
+
+
+def _send_public_html(text: str) -> bool:
+    try:
+        import pumpstall_telegram as pst
+
+        return pst._send_html(text)  # noqa: SLF001
+    except Exception as exc:
+        logger.warning("Public channel send failed: %s", exc)
+        return False
+
+
+def _looks_like_size_leak(text: str) -> bool:
+    t = text.lower()
+    return (
+        "vol:" in t
+        or " usdt" in t
+        or "qty " in t
+        or "position " in t and "@" in t
+    )
+
+
 def _send_sync(text: str) -> bool:
     if not is_configured():
+        return False
+    # Safety: never post size/volume to the public Pumpstall channel
+    if _ops_is_public_channel() and _looks_like_size_leak(text):
+        logger.warning("Blocked Telegram size leak to public channel")
         return False
     url = f"https://api.telegram.org/bot{_token()}/sendMessage"
     body: dict[str, Any] = {"chat_id": _chat_id(), "text": text}
@@ -144,6 +197,17 @@ def notify_dca_filled(
     pnl_usdt: float | None = None,
 ) -> None:
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(pos_qty) * abs(entry)
+    # Public channel: PnL %% only — never qty / Vol USDT
+    if _ops_is_public_channel():
+        pct = _pnl_pct_public(pnl_usdt, notional, leverage)
+        if pct is None:
+            return
+        emoji = _dir_emoji(direction)
+        _send_public_html(
+            f"{emoji} <b>#DCA {direction.upper()}</b> · <b>{symbol.upper()}</b>\n"
+            f"PnL · <b>{pct:+.2f}%</b>"
+        )
+        return
     fill_vol = abs(fill_qty) * abs(fill_price)
     send_position(
         direction,
@@ -155,6 +219,8 @@ def notify_dca_filled(
 
 
 def notify_supervise_started(symbol: str, exit_mode: str) -> None:
+    if _ops_is_public_channel():
+        return
     send_bot(f"{symbol.upper()} DCA supervise started\nExit: {exit_mode}")
 
 
@@ -167,6 +233,8 @@ def notify_grid_armed(
     grid_vol_usdt: float | None = None,
     leverage: float | int | None = None,
 ) -> None:
+    if _ops_is_public_channel():
+        return
     kind = "DCA-only re-arm" if dca_only else "Grid armed"
     vol_line = ""
     if grid_vol_usdt and grid_vol_usdt > 0:
@@ -187,6 +255,9 @@ def notify_position_open(
     pnl_usdt: float | None = None,
 ) -> None:
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(qty) * abs(entry)
+    if _ops_is_public_channel():
+        # ★ OPEN SHORT already covers public entries; skip size-bearing open
+        return
     send_position(
         direction,
         f"{symbol.upper()} futures\n#OPEN {direction.upper()}\n"
@@ -205,6 +276,8 @@ def notify_orphan_recovery(
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
 ) -> None:
+    if _ops_is_public_channel():
+        return
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else (abs(qty) * abs(entry) if entry > 0 else 0)
     vol = f" · {fmt_vol_usdt(notional, leverage)}" if notional > 0 else ""
     send_warn(
