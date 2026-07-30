@@ -44,12 +44,23 @@ def _ops_is_public_channel() -> bool:
 def _pnl_pct_public(
     pnl_usdt: float | None,
     notional: float | None,
-    leverage: float | int | None,
+    leverage: float | int | None = None,
+    *,
+    entry: float | None = None,
+    mark: float | None = None,
+    direction: str | None = None,
 ) -> float | None:
     try:
         import pumpstall_telegram as pst
 
-        return pst.pnl_pct_from_close(pnl_usdt, notional, leverage)
+        return pst.pnl_pct_from_close(
+            pnl_usdt,
+            notional,
+            leverage,
+            entry=entry,
+            mark=mark,
+            direction=direction,
+        )
     except Exception:
         return None
 
@@ -152,14 +163,35 @@ def send_grid(message: str) -> None:
     _send_async(f"🧱 {message}")
 
 
-def fmt_pnl(pnl_usdt: float, notional: float, leverage: float | int | None = None) -> str:
-    """Standard PnL line: PnL: +X.XX USDT (+Y.YY% ROI)."""
-    lev = float(leverage) if leverage else 0.0
-    margin = notional / lev if lev > 0 and notional > 0 else 0.0
-    roi = (pnl_usdt / margin * 100.0) if margin > 0 else None
+def fmt_pnl(
+    pnl_usdt: float,
+    notional: float,
+    leverage: float | int | None = None,
+    *,
+    entry: float | None = None,
+    mark: float | None = None,
+    direction: str | None = None,
+) -> str:
+    """Standard PnL line: PnL: +X.XX USDT (+Y.YY%). %% from avg entry when possible."""
+    pct: float | None = None
+    try:
+        import pumpstall_telegram as pst
+
+        pct = pst.pnl_pct_from_close(
+            pnl_usdt,
+            notional,
+            leverage,
+            entry=entry,
+            mark=mark,
+            direction=direction,
+        )
+    except Exception:
+        notion = abs(float(notional or 0))
+        if notion > 0:
+            pct = pnl_usdt / notion * 100.0
     line = f"PnL: {pnl_usdt:+,.2f} USDT"
-    if roi is not None:
-        line += f" ({roi:+.2f}% ROI)"
+    if pct is not None:
+        line += f" ({pct:+.2f}%)"
     return line
 
 
@@ -167,11 +199,17 @@ def pnl_suffix(
     pnl_usdt: float | None,
     notional: float,
     leverage: float | int | None = None,
+    *,
+    entry: float | None = None,
+    mark: float | None = None,
+    direction: str | None = None,
 ) -> str:
     """Newline-prefixed PnL line, or empty if unknown."""
     if pnl_usdt is None:
         return ""
-    return f"\n{fmt_pnl(pnl_usdt, notional, leverage)}"
+    return (
+        f"\n{fmt_pnl(pnl_usdt, notional, leverage, entry=entry, mark=mark, direction=direction)}"
+    )
 
 
 def _close_emoji(pnl_usdt: float | None) -> str:
@@ -195,11 +233,19 @@ def notify_dca_filled(
     vol_usdt: float | None = None,
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
+    mark: float | None = None,
 ) -> None:
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(pos_qty) * abs(entry)
-    # Public channel: PnL %% only — never qty / Vol USDT
+    # Public channel: PnL %% from avg entry only — never qty / Vol USDT
     if _ops_is_public_channel():
-        pct = _pnl_pct_public(pnl_usdt, notional, leverage)
+        pct = _pnl_pct_public(
+            pnl_usdt,
+            notional,
+            leverage,
+            entry=entry,
+            mark=mark if mark and mark > 0 else fill_price,
+            direction=direction,
+        )
         if pct is None:
             return
         emoji = _dir_emoji(direction)
@@ -214,7 +260,7 @@ def notify_dca_filled(
         f"{symbol.upper()} futures\n#DCA {direction.upper()}\n"
         f"+{fill_qty:g} @ {fill_price:g} · Vol: {fill_vol:,.2f} USDT\n"
         f"Position {pos_qty:g} @ {entry:g} · {fmt_vol_usdt(notional, leverage)}"
-        f"{pnl_suffix(pnl_usdt, notional, leverage)}",
+        f"{pnl_suffix(pnl_usdt, notional, leverage, entry=entry, mark=mark, direction=direction)}",
     )
 
 
@@ -374,6 +420,8 @@ def notify_position_closed(
     vol_usdt: float | None = None,
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
+    entry: float | None = None,
+    mark: float | None = None,
     reason: str | None = None,
 ) -> None:
     why = (reason or "").strip()
@@ -395,7 +443,18 @@ def notify_position_closed(
     if not same_as_public:
         vol = f" · {fmt_vol_usdt(vol_usdt, leverage)}" if vol_usdt and vol_usdt > 0 else ""
         emoji = _close_emoji(pnl_usdt)
-        pnl_line = pnl_suffix(pnl_usdt, vol_usdt or 0.0, leverage) if pnl_usdt is not None else ""
+        pnl_line = (
+            pnl_suffix(
+                pnl_usdt,
+                vol_usdt or 0.0,
+                leverage,
+                entry=entry,
+                mark=mark,
+                direction=direction,
+            )
+            if pnl_usdt is not None
+            else ""
+        )
         reason_line = f"\nReason: {why}" if why else ""
         _send_async(
             f"{emoji} {symbol.upper()} futures\n"
@@ -410,6 +469,8 @@ def notify_position_closed(
                 pnl_usdt=pnl_usdt,
                 notional=vol_usdt,
                 leverage=leverage,
+                entry=entry,
+                mark=mark,
                 reason=why or None,
             )
         except Exception as exc:  # noqa: BLE001

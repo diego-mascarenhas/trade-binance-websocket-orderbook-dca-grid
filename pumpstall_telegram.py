@@ -1,7 +1,7 @@
 """Public Pumpstall Telegram channel (@pumpstall).
 
-★ OPEN SHORT setups, CLOSE with PnL % only (never volume/USDT size),
-and a morning summary (yesterday / week / month).
+★ OPEN SHORT setups, CLOSE / DCA with PnL %% from avg entry (Finandy-style;
+never volume/USDT size), and a morning summary (yesterday / week / month).
 
 Env:
   TELEGRAM_BOT_TOKEN
@@ -133,20 +133,48 @@ def _send_html(text: str) -> bool:
         return False
 
 
+def pnl_pct_from_entry(
+    entry: float | None,
+    mark: float | None,
+    direction: str | None = None,
+) -> float | None:
+    """Finandy-style %%: price distance from avg entry. Independent of leverage/size.
+
+    LONG  → (mark − entry) / entry × 100
+    SHORT → (entry − mark) / entry × 100
+
+    After DCA compensation the avg entry moves, so the %% shrinks naturally.
+    """
+    e = float(entry or 0)
+    m = float(mark or 0)
+    if e <= 0 or m <= 0:
+        return None
+    side = (direction or "SHORT").strip().upper()
+    if side == "LONG":
+        return (m - e) / e * 100.0
+    return (e - m) / e * 100.0
+
+
 def pnl_pct_from_close(
     pnl_usdt: float | None,
     notional: float | None,
-    leverage: float | int | None,
+    leverage: float | int | None = None,
+    *,
+    entry: float | None = None,
+    mark: float | None = None,
+    direction: str | None = None,
 ) -> float | None:
-    """ROI %% on margin when possible; else %% of notional. Never exposes size."""
+    """Public PnL %% from avg entry (Finandy). Falls back to unlevered pnl/notional.
+
+    ``leverage`` is accepted for call-site compatibility but never used.
+    Never exposes size.
+    """
+    pct = pnl_pct_from_entry(entry, mark, direction)
+    if pct is not None:
+        return pct
     if pnl_usdt is None:
         return None
     notion = abs(float(notional or 0))
-    lev = float(leverage or 0)
-    if lev > 0 and notion > 0:
-        margin = notion / lev
-        if margin > 0:
-            return pnl_usdt / margin * 100.0
     if notion > 0:
         return pnl_usdt / notion * 100.0
     return None
@@ -283,15 +311,24 @@ def notify_close(
     pnl_usdt: float | None = None,
     notional: float | None = None,
     leverage: float | int | None = None,
+    entry: float | None = None,
+    mark: float | None = None,
     pnl_pct: float | None = None,
     reason: str | None = None,
 ) -> bool:
-    """Public close: percentage only — never volume / USDT size."""
+    """Public close: %% from avg entry only — never volume / USDT size."""
     if not is_configured():
         return False
     pct = pnl_pct
     if pct is None:
-        pct = pnl_pct_from_close(pnl_usdt, notional, leverage)
+        pct = pnl_pct_from_close(
+            pnl_usdt,
+            notional,
+            leverage,
+            entry=entry,
+            mark=mark,
+            direction=direction,
+        )
     if pct is None:
         logger.info("Pumpstall CLOSE skipped %s (no pnl %%)", symbol)
         return False
@@ -417,8 +454,8 @@ def format_daily_summary(*, as_of: date | None = None) -> str:
         f"{line('Week', week_sum, week_n)}\n"
         f"{line('Month', month_sum, month_n)}\n"
         f"\n"
-        f"<i>Sum of closed trade ROI %% — not account equity. "
-        f"Software, not advice.</i>\n"
+        f"<i>Sum of closed trade %% from avg entry (Finandy-style) — "
+        f"not account equity. Software, not advice.</i>\n"
         f"\n"
         f'<a href="{_html_escape(site)}">{_html_escape(site_label)}</a>'
     )

@@ -966,9 +966,10 @@ def get_position(symbol: str, is_long: bool, hedge: bool, api: str, sec: str, re
 def get_position_meta(
     symbol: str, is_long: bool, hedge: bool, api: str, sec: str, recv: int,
 ) -> dict[str, float | int]:
-    """Return qty, entry, notional (USDT), leverage for the open position side."""
+    """Return qty, entry, mark, notional (USDT), leverage for the open position side."""
     empty: dict[str, float | int] = {
-        "qty": 0.0, "entry": 0.0, "notional": 0.0, "leverage": 0, "unrealized_pnl": 0.0,
+        "qty": 0.0, "entry": 0.0, "mark": 0.0, "notional": 0.0,
+        "leverage": 0, "unrealized_pnl": 0.0,
     }
     rows = _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()}, api, sec, recv)
     want_side = ("LONG" if is_long else "SHORT") if hedge else "BOTH"
@@ -989,6 +990,7 @@ def get_position_meta(
         return {
             "qty": abs(amt),
             "entry": entry,
+            "mark": mark,
             "notional": notional,
             "leverage": lev,
             "unrealized_pnl": float(r.get("unRealizedProfit", 0) or 0),
@@ -1450,6 +1452,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             vol_usdt=notional,
                             leverage=lev,
                             pnl_usdt=pnl,
+                            mark=float(pos_meta.get("mark", 0) or 0),
                         )
                         trade_sounds.play_sound("dca")
                     last_position_qty = qty
@@ -1530,6 +1533,8 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             vol_usdt=float(last_pos_meta.get("notional", 0) or 0),
                             leverage=lev,
                             pnl_usdt=close_pnl,
+                            entry=float(last_pos_meta.get("entry", 0) or 0),
+                            mark=float(last_pos_meta.get("mark", 0) or 0),
                             reason=close_reason,
                         )
                         trade_sounds.play_close_sound(close_pnl)
