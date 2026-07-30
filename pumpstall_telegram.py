@@ -31,6 +31,28 @@ TRADES_FILE = STATE_DIR / "pumpstall_trades.jsonl"
 SUMMARY_STAMP = STATE_DIR / "pumpstall_summary_sent_date.txt"
 
 
+def _load_dotenv() -> None:
+    """Load ROOT/.env into os.environ without overwriting existing vars."""
+    path = ROOT / ".env"
+    if not path.is_file():
+        return
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip("'").strip('"')
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except OSError as exc:
+        logger.warning("Could not read %s: %s", path, exc)
+
+
+_load_dotenv()
+
+
 def _token() -> str:
     return os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
@@ -44,6 +66,16 @@ def chat_id() -> str:
 
 def is_configured() -> bool:
     return bool(_token() and chat_id())
+
+
+def config_status() -> str:
+    tok = bool(_token())
+    chat = chat_id()
+    return (
+        f"token={'yes' if tok else 'NO'} "
+        f"chat={chat or 'NO'} "
+        f"configured={is_configured()}"
+    )
 
 
 def _site_url() -> str:
@@ -394,7 +426,9 @@ def format_daily_summary(*, as_of: date | None = None) -> str:
 
 def maybe_send_daily_summary(*, force: bool = False) -> bool:
     """Send once per local day at PUMPSTALL_SUMMARY_HOUR (default 08:00)."""
+    _load_dotenv()
     if not is_configured():
+        logger.warning("Pumpstall summary skipped — %s", config_status())
         return False
     tz = _tz()
     now = datetime.now(tz)
@@ -413,4 +447,6 @@ def maybe_send_daily_summary(*, force: bool = False) -> bool:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         SUMMARY_STAMP.write_text(today_s + "\n", encoding="utf-8")
         logger.info("Pumpstall daily summary sent for %s", today_s)
+    else:
+        logger.warning("Pumpstall summary send failed — %s", config_status())
     return ok
