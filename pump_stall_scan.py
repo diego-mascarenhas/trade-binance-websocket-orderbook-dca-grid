@@ -697,6 +697,22 @@ def _maybe_telegram_notify(
         print(f"{DIM}Telegram: no ★ ideals to post{RESET}")
 
 
+def _maybe_daily_orphan_sweep() -> None:
+    """Cancel bot limit/algo orphans on flat symbols (same cadence as #REPORT)."""
+    try:
+        import botctl
+    except ImportError as exc:
+        print(f"{DIM}Daily sweep skipped: botctl unavailable ({exc}){RESET}")
+        return
+    try:
+        result = botctl.sweep(None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{YELLOW}Daily orphan sweep failed: {exc}{RESET}")
+        return
+    for line in str(result).splitlines():
+        print(f"{DIM}Sweep: {line}{RESET}")
+
+
 def _maybe_daily_summary(enabled: bool) -> None:
     if not enabled:
         return
@@ -706,6 +722,7 @@ def _maybe_daily_summary(enabled: bool) -> None:
         return
     if pst.maybe_send_daily_summary():
         print(f"{GREEN}Telegram: daily PnL summary sent{RESET}")
+        _maybe_daily_orphan_sweep()
 
 
 def _clear_screen() -> None:

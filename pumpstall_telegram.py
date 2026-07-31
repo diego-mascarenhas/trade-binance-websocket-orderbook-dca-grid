@@ -455,7 +455,10 @@ def format_daily_summary(*, as_of: date | None = None) -> str:
 
 
 def maybe_send_daily_summary(*, force: bool = False) -> bool:
-    """Send once per local day at PUMPSTALL_SUMMARY_HOUR (default 08:00)."""
+    """Send once per local day at PUMPSTALL_SUMMARY_HOUR (default 08:00).
+
+    On success the watch also runs ``botctl.sweep`` (orphan orders on flat symbols).
+    """
     _load_dotenv()
     if not is_configured():
         logger.warning("Pumpstall summary skipped — %s", config_status())
