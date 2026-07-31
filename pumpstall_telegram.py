@@ -10,6 +10,8 @@ Env:
   PUMPSTALL_SITE_URL=https://pumpstall.idoneo.dev
   PUMPSTALL_TZ=Europe/Madrid
   PUMPSTALL_SUMMARY_HOUR=8
+  PUMPSTALL_BANK_PCT=30          # after report: % of yesterday net futures PnL → spot (0=off)
+  PUMPSTALL_BANK_MIN_USDT=1
 """
 
 from __future__ import annotations
@@ -458,6 +460,8 @@ def maybe_send_daily_summary(*, force: bool = False) -> bool:
     """Send once per local day at PUMPSTALL_SUMMARY_HOUR (default 08:00).
 
     On success the watch also runs ``botctl.sweep`` (orphan orders on flat symbols).
+    After today's report exists, banks ``PUMPSTALL_BANK_PCT`` of yesterday's net
+    futures PnL to spot (see ``pumpstall_bank``).
     """
     _load_dotenv()
     if not is_configured():
@@ -470,16 +474,32 @@ def maybe_send_daily_summary(*, force: bool = False) -> bool:
         return False
 
     today_s = now.date().isoformat()
-    if not force and SUMMARY_STAMP.is_file():
-        if SUMMARY_STAMP.read_text(encoding="utf-8").strip() == today_s:
-            return False
+    already = False
+    if SUMMARY_STAMP.is_file():
+        already = SUMMARY_STAMP.read_text(encoding="utf-8").strip() == today_s
 
-    text = format_daily_summary(as_of=now.date())
-    ok = _send_html(text)
-    if ok:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        SUMMARY_STAMP.write_text(today_s + "\n", encoding="utf-8")
-        logger.info("Pumpstall daily summary sent for %s", today_s)
-    else:
-        logger.warning("Pumpstall summary send failed — %s", config_status())
-    return ok
+    newly_sent = False
+    if not already or force:
+        text = format_daily_summary(as_of=now.date())
+        ok = _send_html(text)
+        if ok:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            SUMMARY_STAMP.write_text(today_s + "\n", encoding="utf-8")
+            newly_sent = True
+            already = True
+            logger.info("Pumpstall daily summary sent for %s", today_s)
+        else:
+            logger.warning("Pumpstall summary send failed — %s", config_status())
+            if not already:
+                return False
+
+    if already:
+        try:
+            from pumpstall_bank import maybe_bank_profits_to_spot
+
+            # Never force-transfer on summary --force (avoids double bank while testing).
+            maybe_bank_profits_to_spot(as_of=now.date(), force=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Pumpstall bank step failed: %s", exc)
+
+    return newly_sent
