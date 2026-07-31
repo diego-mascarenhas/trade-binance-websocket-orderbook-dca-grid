@@ -818,12 +818,58 @@ def liq_distance_pct(amt: float, mark: float, liq_price: float) -> float | None:
 
 
 def account_margin_snapshot(api: str, sec: str, recv: int) -> dict[str, float]:
+    """Futures account margin snapshot.
+
+    ``margin_ratio_pct`` matches the Binance UI: maint / equity × 100
+    (liquidation approaches 100%).
+    """
     acc = _signed_request("GET", "/fapi/v2/account", {}, api, sec, recv)
+    margin_balance = float(acc.get("totalMarginBalance", 0) or 0)
+    maint = float(acc.get("totalMaintMargin", 0) or 0)
+    ratio = (maint / margin_balance * 100.0) if margin_balance > 0 else 0.0
     return {
-        "margin_balance": float(acc.get("totalMarginBalance", 0) or 0),
+        "margin_balance": margin_balance,
         "initial_margin": float(acc.get("totalInitialMargin", 0) or 0),
         "available": float(acc.get("availableBalance", 0) or 0),
+        "maint_margin": maint,
+        "margin_ratio_pct": ratio,
     }
+
+
+def get_margin_ratio_pct(api: str, sec: str, recv: int) -> float | None:
+    """Binance UI margin ratio %%, or None if the account cannot be read."""
+    try:
+        return float(account_margin_snapshot(api, sec, recv)["margin_ratio_pct"])
+    except Exception:
+        return None
+
+
+def account_margin_ratio_blocks(
+    args: argparse.Namespace, api: str, sec: str, verbose: bool = True,
+) -> bool:
+    """True if Binance margin ratio ≥ --margin-ratio-soft (block new grids / ★)."""
+    soft = float(getattr(args, "margin_ratio_soft", 0) or 0)
+    if soft <= 0:
+        return False
+    try:
+        ratio = get_margin_ratio_pct(api, sec, args.recv_window)
+    except Exception as exc:
+        if verbose:
+            print(f"{YELLOW}Could not read margin ratio ({exc}); skipping.{RESET}")
+        return False
+    if ratio is None:
+        return False
+    if ratio < soft:
+        return False
+    if verbose:
+        if getattr(args, "force", False):
+            print(f"{YELLOW}Margin ratio {ratio:.2f}% ≥ soft {soft:g}% "
+                  f"— continuing due to --force.{RESET}")
+        else:
+            print(f"{RED}Margin ratio {ratio:.2f}% ≥ soft {soft:g}% "
+                  f"— skipping new grid / entries "
+                  f"(hard strip DCA at --margin-ratio-hard).{RESET}")
+    return not getattr(args, "force", False)
 
 
 def account_liq_distance_blocks(
@@ -947,6 +993,8 @@ def account_risk_blocks(
     """True if any account risk guard blocks opening `add_notional` on this side."""
     lev = leverage if leverage and leverage > 0 else getattr(args, "leverage", 10.0)
     if account_imbalance_blocks(args, is_long, add_notional, api, sec, verbose):
+        return True
+    if account_margin_ratio_blocks(args, api, sec, verbose):
         return True
     if account_liq_distance_blocks(args, api, sec, verbose):
         return True
@@ -1401,9 +1449,14 @@ def supervise_loop(args: argparse.Namespace) -> None:
             gate_note = f", gate {float(gate):g} (long mid< · short mid>)"
     once = bool(getattr(args, "once", False))
     once_note = ", once (no re-arm after close)" if once else ""
+    soft_mr = float(getattr(args, "margin_ratio_soft", 0) or 0)
+    hard_mr = float(getattr(args, "margin_ratio_hard", 0) or 0)
+    mr_note = ""
+    if soft_mr > 0 or hard_mr > 0:
+        mr_note = f", margin soft {soft_mr:g}% / hard {hard_mr:g}%"
     print(f"\n{BOLD}{CYAN}Supervising {args.symbol.upper()} "
           f"(auto re-arm grid + exit: {exit_mode_label(exit_mode)}, poll {args.tp_poll_sec:g}s"
-          f"{ttl_note}{gate_note}{once_note}). "
+          f"{ttl_note}{gate_note}{once_note}{mr_note}). "
           f"Ctrl+C to stop.{RESET}")
     import telegram_notify as telegram
     import trade_sounds
@@ -1415,6 +1468,8 @@ def supervise_loop(args: argparse.Namespace) -> None:
     dca_missing_retry_at: float = 0.0
     exit_preset_armed: bool = False
     seen_position = False  # --once: true after any open qty this cycle
+    margin_dca_frozen = False  # True after hard strip until ratio < hard
+    last_mr_log: str | None = None
     sym = args.symbol.upper()
     try:
         while True:
@@ -1486,8 +1541,56 @@ def supervise_loop(args: argparse.Namespace) -> None:
                         ) or []
                     except Exception:
                         oo_pos = []
+
+                    # Account Margin Ratio (Binance UI): hard → strip DCA; below hard → re-arm.
+                    ratio_now: float | None = None
+                    if hard_mr > 0:
+                        ratio_now = get_margin_ratio_pct(api, sec, args.recv_window)
+                        if ratio_now is not None:
+                            mr_state = (
+                                f"hard:{ratio_now:.2f}" if ratio_now >= hard_mr
+                                else f"ok:{ratio_now:.2f}"
+                            )
+                            if ratio_now >= hard_mr:
+                                n_dca = count_dca_orders(oo_pos, sym)
+                                if n_dca > 0:
+                                    print(
+                                        f"{YELLOW}Margin ratio {ratio_now:.2f}% ≥ hard "
+                                        f"{hard_mr:g}% → cancelling {n_dca} DCA "
+                                        f"limit(s) (TP/BE/trail kept)…{RESET}"
+                                    )
+                                    cancel_dca_grid_orders(
+                                        sym, api, sec, args.recv_window,
+                                    )
+                                    try:
+                                        oo_pos = _signed_request(
+                                            "GET", "/fapi/v1/openOrders",
+                                            {"symbol": sym}, api, sec, args.recv_window,
+                                        ) or []
+                                    except Exception:
+                                        oo_pos = []
+                                elif not margin_dca_frozen and mr_state != last_mr_log:
+                                    print(
+                                        f"{DIM}Margin ratio {ratio_now:.2f}% ≥ hard "
+                                        f"{hard_mr:g}% · DCA frozen "
+                                        f"(no re-arm){RESET}"
+                                    )
+                                margin_dca_frozen = True
+                            elif margin_dca_frozen:
+                                print(
+                                    f"{GREEN}Margin ratio {ratio_now:.2f}% < hard "
+                                    f"{hard_mr:g}% → thaw DCA re-arm{RESET}"
+                                )
+                                margin_dca_frozen = False
+                                dca_missing_retry_at = 0.0
+                            last_mr_log = mr_state
+
+                    dca_blocked = margin_dca_frozen or (
+                        hard_mr > 0 and ratio_now is not None and ratio_now >= hard_mr
+                    )
                     if (
-                        count_dca_orders(oo_pos, sym) == 0
+                        not dca_blocked
+                        and count_dca_orders(oo_pos, sym) == 0
                         and time.time() >= dca_missing_retry_at
                         and (exit_mode != EXIT_STAGED or dca_rearm_allowed(sym))
                     ):
@@ -1855,6 +1958,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-margin-pct", type=float, default=_env_float("MAX_MARGIN_PCT", 50.0),
                    help="Skip new grid if projected initial margin / balance exceeds this %% "
                         "(0=off). Env: MAX_MARGIN_PCT")
+    p.add_argument("--margin-ratio-soft", type=float,
+                   default=_env_float("MARGIN_RATIO_SOFT", 5.0),
+                   help="Binance Margin Ratio %% (maint/equity). ≥ this → no new grids / ★ "
+                        "(default 5; 0=off). Env: MARGIN_RATIO_SOFT")
+    p.add_argument("--margin-ratio-hard", type=float,
+                   default=_env_float("MARGIN_RATIO_HARD", 8.0),
+                   help="Binance Margin Ratio %%. ≥ this → cancel open DCA limits (keep TP/BE/trail); "
+                        "when it drops back below, re-arm DCA (default 8; 0=off). "
+                        "Env: MARGIN_RATIO_HARD")
     p.add_argument("--min-liq-distance-pct", type=float, default=_env_float("MIN_LIQ_DISTANCE_PCT", 20.0),
                    help="Skip new grid if any open position is closer to liquidation than this %% "
                         "(0=off). Env: MIN_LIQ_DISTANCE_PCT")

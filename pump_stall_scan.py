@@ -13,6 +13,8 @@ Display-only by default. With --watch --auto-trade: run the top
 `dca SYMBOL short --exit structure` (TP=EQL) + BE protect (arm 1% → lock 0.3%)
 + post-BE trail (arm 1.3% → callback 0.45%).
 Other open pairs on the account do not consume these slots.
+Account Margin Ratio (Binance UI): ≥ soft (default 5%) → no new ★;
+≥ hard (default 8%) → cancel DCA limits (keep exits); below hard → re-arm DCA.
 
   python3 pump_stall_scan.py
   ./pump-stall --top 15 --min-near-regime 80 --min-sharp 35
@@ -829,6 +831,8 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         "--post-be-callback", str(getattr(args, "post_be_callback", 0.45) or 0.45),
         "--once",
         "--loss-cooldown-min", str(getattr(args, "loss_cooldown_min", 1440)),
+        "--margin-ratio-soft", str(getattr(args, "margin_ratio_soft", 5.0)),
+        "--margin-ratio-hard", str(getattr(args, "margin_ratio_hard", 8.0)),
         "--so-count", str(args.so_count),
         "--min-gap", str(args.min_gap),
         "--min-dist", str(args.min_dist),
@@ -878,6 +882,21 @@ def _maybe_auto_trade(
     max_trades = max(1, int(getattr(args, "max_trades", 3) or 3))
 
     import loss_cooldown as lcd
+    from orderbook_dca_grid import get_margin_ratio_pct, load_keys
+
+    soft_mr = float(getattr(args, "margin_ratio_soft", 5.0) or 0)
+    if soft_mr > 0:
+        api, sec = load_keys(None)
+        if api and sec:
+            ratio = get_margin_ratio_pct(api, sec, 15000)
+            if ratio is not None and ratio >= soft_mr:
+                print(
+                    f"{YELLOW}AUTO: margin ratio {ratio:.2f}% ≥ soft "
+                    f"{soft_mr:g}% — no new ★ "
+                    f"(DCA strip at hard "
+                    f"{getattr(args, 'margin_ratio_hard', 8):g}%){RESET}"
+                )
+                return active
 
     cooling = lcd.cooling_map()
     if cooling:
@@ -1126,6 +1145,20 @@ Production (VPS):
         type=float,
         default=0.45,
         help="With --auto-trade: post-BE trailing callbackRate %% (default 0.45)",
+    )
+    p.add_argument(
+        "--margin-ratio-soft",
+        type=float,
+        default=float(os.getenv("MARGIN_RATIO_SOFT", "5") or 5),
+        help="Binance Margin Ratio %% ≥ this → no new ★ (default 5; 0=off). "
+             "Env: MARGIN_RATIO_SOFT",
+    )
+    p.add_argument(
+        "--margin-ratio-hard",
+        type=float,
+        default=float(os.getenv("MARGIN_RATIO_HARD", "8") or 8),
+        help="Passed to dca: %% ≥ this → cancel DCA limits; below → re-arm "
+             "(default 8; 0=off). Env: MARGIN_RATIO_HARD",
     )
     p.add_argument(
         "--why",
