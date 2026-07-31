@@ -4,9 +4,10 @@
 Sibling of orderbook_dca_grid.py, but for Binance **Spot** (api.binance.com):
   - Spot is LONG-only: the grid places BUY LIMIT orders on real BID walls below
     the entry price to accumulate the base asset (DCA on dips).
-  - When the position is held, it maintains a single **OCO** SELL order
-    (LIMIT_MAKER take-profit above + STOP_LOSS_LIMIT stop-loss below), so one
-    leg cancels the other automatically.
+  - While holding, ``--supervise`` keeps those DCA buys visible/re-armed below
+    until the take-profit leg fills (wider defaults: TP 1.5%, min-gap 0.8%).
+  - It also maintains a single **OCO** SELL (LIMIT_MAKER TP + STOP_LOSS_LIMIT SL)
+    so one exit leg cancels the other automatically.
   - No leverage, no shorting, no hedge mode (none exist on Spot).
 
 Uses the SAME .env as the futures bot (BINANCE_API_KEY / BINANCE_SECRET_KEY);
@@ -911,6 +912,11 @@ def rearm_grid(args: argparse.Namespace) -> bool:
 
 # --- Loops ---------------------------------------------------------------
 
+def _open_buy_orders(symbol: str, api: str, sec: str, recv_window: int) -> list[dict]:
+    oo = open_orders(symbol, api, sec, recv_window)
+    return [o for o in oo if str(o.get("side", "")).upper() == "BUY"]
+
+
 def supervise_loop(args: argparse.Namespace) -> None:
     api, sec = load_keys(args.env_file)
     if not api or not sec:
@@ -921,8 +927,10 @@ def supervise_loop(args: argparse.Namespace) -> None:
     except Exception as exc:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
+    keep_dca = bool(getattr(args, "keep_dca", True))
     print(f"\n{BOLD}{CYAN}Supervising SPOT {args.symbol.upper()} "
-          f"(auto re-arm buy grid + OCO exit, poll {args.poll_sec:g}s). Ctrl+C to stop.{RESET}")
+          f"(buy grid until TP · OCO exit · poll {args.poll_sec:g}s"
+          f"{'' if keep_dca else ' · keep-dca OFF'}). Ctrl+C to stop.{RESET}")
     armed_log_state: str | None = None
     try:
         while True:
@@ -932,14 +940,39 @@ def supervise_loop(args: argparse.Namespace) -> None:
                 mid = (best_bid + best_ask) / 2
                 base_qty = get_total(api, sec, args.recv_window, filt["base_asset"])
                 holding_usdt = base_qty * mid
+                min_n = float(filt["min_notional"])
 
-                if holding_usdt >= float(filt["min_notional"]):
-                    armed_log_state = None
-                    # We hold the asset → keep the OCO (TP + SL) synced.
+                if holding_usdt >= min_n:
+                    # Holding → OCO (TP+SL) + keep DCA buys below until TP fills.
                     manage_oco_once(args.symbol, args, filt, api, sec, verbose=True)
+                    if keep_dca:
+                        buys = _open_buy_orders(
+                            args.symbol, api, sec, args.recv_window,
+                        )
+                        if buys:
+                            state = f"hold-dca:{len(buys)}"
+                            if state != armed_log_state:
+                                print(f"{DIM}Holding · {len(buys)} DCA buy(s) below "
+                                      f"until TP (+{args.tp:g}%)…{RESET}")
+                                armed_log_state = state
+                        else:
+                            armed_log_state = None
+                            print(f"{BOLD}Holding · no DCA buys left → "
+                                  f"placing ladder below (until TP)…{RESET}")
+                            placed = build_and_place_grid(
+                                args, api, sec, filt, verbose=True,
+                                dca_only=True, force=True,
+                            )
+                            if not placed:
+                                sleep_s = max(args.poll_sec, args.rearm_backoff)
+                                print(f"{DIM}Could not place hold-DCA "
+                                      f"(budget/cap?) → retry in {sleep_s:g}s.{RESET}")
+                    else:
+                        armed_log_state = None
                 else:
-                    oo = open_orders(args.symbol, api, sec, args.recv_window)
-                    buys = [o for o in oo if str(o.get("side", "")).upper() == "BUY"]
+                    buys = _open_buy_orders(
+                        args.symbol, api, sec, args.recv_window,
+                    )
                     if buys and args.grid_ttl > 0 and grid_age_sec(buys) >= args.grid_ttl:
                         armed_log_state = None
                         age_h = grid_age_sec(buys) / 3600
@@ -1038,10 +1071,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--so-wall-mult", type=float, default=_env_float("SO_WALL_MULT", 2.0),
                    help="A bid level counts as a wall (DCA) if its size ≥ this × median book size. Env: SO_WALL_MULT")
     p.add_argument("--limit", type=int, default=5000, help="Order book depth to fetch (deep = reaches walls on pricey/liquid coins)")
-    p.add_argument("--min-gap", type=float, default=0.2,
-                   help="Min %% spacing between chosen walls (lower = more DCA on dense books like BTC/ETH)")
+    p.add_argument("--min-gap", type=float, default=_env_float("SPOT_MIN_GAP", 0.8),
+                   help="Min %% spacing between chosen walls (higher = wider swing ladder). "
+                        "Env: SPOT_MIN_GAP")
     p.add_argument("--min-dist", type=float, default=0.1, help="Min %% distance of first wall from entry")
-    p.add_argument("--max-range", type=float, default=15.0, help="Only DCA walls within this %% of entry (0=off)")
+    p.add_argument("--max-range", type=float, default=_env_float("SPOT_MAX_RANGE", 15.0),
+                   help="Only DCA walls within this %% of entry (0=off). Env: SPOT_MAX_RANGE")
     p.add_argument("--size-mode", choices=["comp", "wall", "scale", "flat"], default="comp",
                    help="comp=distance compensation, wall=∝ wall liquidity, scale=geometric, flat=equal")
     p.add_argument("--base-size", type=float, default=_env_float("BASE_SIZE", 0.0),
@@ -1054,8 +1089,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--comp-factor", type=float, default=1.0, help="USDT per %% band per base size (comp mode)")
     p.add_argument("--so-size", type=float, default=58.99, help="First/each DCA size (scale/flat modes)")
     p.add_argument("--volume-scale", type=float, default=1.3, help="Size multiplier per DCA (scale mode)")
-    p.add_argument("--tp", type=float, default=_env_float("SPOT_TP", 0.5),
-                   help="Min take-profit %% above avg (profit floor; TP anchors to an ask wall at/above it). Env: SPOT_TP")
+    p.add_argument("--tp", type=float, default=_env_float("SPOT_TP", 1.5),
+                   help="Min take-profit %% above avg (profit floor; TP anchors to an ask wall at/above it). "
+                        "Default 1.5 so spot rounds clear fees. Env: SPOT_TP")
     p.add_argument("--sl", type=float, default=_env_float("SPOT_SL", 5.0),
                    help="Fallback stop-loss %% below avg when the grid is fully filled (no open DCA). Env: SPOT_SL")
     p.add_argument("--sl-buffer", type=float, default=_env_float("SPOT_SL_BUFFER", 0.5),
@@ -1082,13 +1118,17 @@ def parse_args() -> argparse.Namespace:
                    help="Cancel open orders; DCA-only + OCO if holding, full grid if flat")
     p.add_argument("--rearm-flat", action="store_true",
                    help="With --rearm: market-sell the holding first so the symbol starts flat")
-    p.add_argument("--supervise", action="store_true", help="Autonomous: re-arm grid when flat + manage OCO (loop)")
+    p.add_argument("--supervise", action="store_true",
+                   help="Autonomous: keep buy grid until TP + manage OCO (loop)")
+    p.add_argument("--keep-dca", action=argparse.BooleanOptionalAction, default=True,
+                   help="While holding, keep/re-place DCA buys below until TP hits "
+                        "(default on). Use --no-keep-dca for old OCO-only behaviour.")
     p.add_argument("--poll-sec", type=float, default=5.0, help="Position/OCO re-sync interval")
     p.add_argument("--rearm-backoff", type=float, default=_env_float("REARM_BACKOFF", 60.0),
                    help="When flat but a grid can't be armed, wait this long before retrying. Env: REARM_BACKOFF")
-    p.add_argument("--grid-ttl", type=float, default=_env_float("GRID_TTL", 3600.0),
+    p.add_argument("--grid-ttl", type=float, default=_env_float("GRID_TTL", 14400.0),
                    help="Refresh a flat armed grid after this many seconds (cancel + re-arm). "
-                        "0=off. Default 1h. Env: GRID_TTL")
+                        "0=off. Default 4h. Does not cancel DCA while holding. Env: GRID_TTL")
     args = p.parse_args()
     args.execute = not args.dry_run
     return args
