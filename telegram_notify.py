@@ -41,6 +41,30 @@ def _ops_is_public_channel() -> bool:
     return bool(ops) and bool(pub) and ops == pub
 
 
+def _ops_trade_alerts() -> bool:
+    """Mirror size-bearing trade alerts to TELEGRAM_CHAT_ID.
+
+    Default **off** when ``TELEGRAM_PUMPSTALL_CHAT_ID`` is a separate public
+    channel — private chat stays for botctl (/pump, /report) and bank notices.
+    Set ``TELEGRAM_OPS_TRADE_ALERTS=1`` to also get detailed Vol/qty privately.
+    """
+    raw = os.getenv("TELEGRAM_OPS_TRADE_ALERTS", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    pub = _public_chat_id()
+    ops = _chat_id()
+    if pub and ops and str(pub) != str(ops):
+        return False
+    return True
+
+
+def _skip_ops_trade() -> bool:
+    """True → do not send detailed trade alert to private ops."""
+    return _ops_is_public_channel() or not is_configured() or not _ops_trade_alerts()
+
+
 def _pnl_pct_public(
     pnl_usdt: float | None,
     notional: float | None,
@@ -293,7 +317,7 @@ def notify_dca_filled(
         pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
         entry=entry, mark=mark_px,
     )
-    if _ops_is_public_channel() or not is_configured():
+    if _skip_ops_trade():
         return
     fill_vol = abs(fill_qty) * abs(fill_price)
     send_position(
@@ -306,7 +330,7 @@ def notify_dca_filled(
 
 
 def notify_supervise_started(symbol: str, exit_mode: str) -> None:
-    if _ops_is_public_channel():
+    if _skip_ops_trade():
         return
     send_bot(f"{symbol.upper()} DCA supervise started\nExit: {exit_mode}")
 
@@ -326,7 +350,7 @@ def notify_grid_armed(
             "OPEN", symbol, direction,
             notional=grid_vol_usdt, leverage=leverage,
         )
-    if _ops_is_public_channel() or not is_configured():
+    if _skip_ops_trade():
         return
     kind = "DCA-only re-arm" if dca_only else "Grid armed"
     vol_line = ""
@@ -349,7 +373,7 @@ def notify_position_open(
 ) -> None:
     """Private ops detail on fill. Public #OPEN already sent when grid orders were placed."""
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(qty) * abs(entry)
-    if _ops_is_public_channel() or not is_configured():
+    if _skip_ops_trade():
         return
     send_position(
         direction,
@@ -369,7 +393,7 @@ def notify_orphan_recovery(
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
 ) -> None:
-    if _ops_is_public_channel():
+    if _skip_ops_trade():
         return
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else (abs(qty) * abs(entry) if entry > 0 else 0)
     vol = f" · {fmt_vol_usdt(notional, leverage)}" if notional > 0 else ""
@@ -397,6 +421,8 @@ def notify_staged_armed(
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
 ) -> None:
+    if _skip_ops_trade():
+        return
     tp1_q = tp1_qty if tp1_qty is not None else qty * 0.7
     notional = abs(qty) * abs(entry)
     send_position(
@@ -426,7 +452,7 @@ def notify_tp1_filled(
         pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
         entry=entry, mark=price,
     )
-    if _ops_is_public_channel() or not is_configured():
+    if _skip_ops_trade():
         return
     send_tp(
         f"{symbol.upper()} futures #TP {direction.upper()}\n"
@@ -464,7 +490,7 @@ def notify_profit_lock_sl(
         pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
         entry=entry, mark=sl_price if sl_price > 0 else entry,
     )
-    if _ops_is_public_channel() or not is_configured():
+    if _skip_ops_trade():
         return
     closed_vol = ""
     if closed_qty is not None and closed_qty > 0:
@@ -514,7 +540,7 @@ def notify_position_closed(
     # Never post volume/USDT size to the public Pumpstall channel.
     same_as_public = bool(public_chat) and public_chat == ops_chat
 
-    if not same_as_public:
+    if not same_as_public and _ops_trade_alerts() and is_configured():
         vol = f" · {fmt_vol_usdt(vol_usdt, leverage)}" if vol_usdt and vol_usdt > 0 else ""
         emoji = _close_emoji(pnl_usdt)
         pnl_line = (
@@ -574,7 +600,7 @@ def notify_trail_started(
         entry=entry if entry and entry > 0 else None,
         mark=activate,
     )
-    if _ops_is_public_channel() or not is_configured():
+    if _skip_ops_trade():
         return
     send_trailing(
         f"{symbol.upper()} futures #TRAIL {direction.upper()}\n"
@@ -588,6 +614,8 @@ def notify_trail_started(
 # ── Fib / micro-grid ─────────────────────────────────────────────────────────
 
 def notify_fib_started(symbol: str, *, direction: str = "auto", note: str = "") -> None:
+    if _skip_ops_trade():
+        return
     extra = f"\n{note}" if note else ""
     send_bot(f"{symbol.upper()} FIB micro-grid started\nDir: {direction.upper()}{extra}")
 
@@ -602,6 +630,8 @@ def notify_fib_grid_armed(
     mark: float | None = None,
     leverage: float | int | None = None,
 ) -> None:
+    if _skip_ops_trade():
+        return
     kind = "LIMIT pullback" if wait_pullback else "MARKET + grid"
     vol_line = ""
     if grid_vol_usdt and grid_vol_usdt > 0:
@@ -625,6 +655,8 @@ def notify_fib_open(
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
 ) -> None:
+    if _skip_ops_trade():
+        return
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(qty) * abs(entry)
     exits = ""
     if tp and tp > 0:
@@ -651,6 +683,8 @@ def notify_fib_fill(
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
 ) -> None:
+    if _skip_ops_trade():
+        return
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(pos_qty) * abs(entry)
     fill_vol = abs(fill_qty) * abs(fill_price)
     send_position(
@@ -673,6 +707,8 @@ def notify_fib_protect_trail(
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
 ) -> None:
+    if _skip_ops_trade():
+        return
     notional = abs(qty) * abs(entry)
     profit = f"\nProfit {profit_pct:+.2f}%" if profit_pct is not None else ""
     send_trailing(
@@ -684,6 +720,8 @@ def notify_fib_protect_trail(
 
 
 def notify_fib_disarm(symbol: str, direction: str, reason: str) -> None:
+    if _skip_ops_trade():
+        return
     send_warn(
         f"{symbol.upper()} futures\n#FIB DISARM {direction.upper()}\n"
         f"Reason: {reason}",
@@ -701,6 +739,8 @@ def notify_fib_adopt(
     pnl_usdt: float | None = None,
     trail: bool = False,
 ) -> None:
+    if _skip_ops_trade():
+        return
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(qty) * abs(entry)
     trail_note = " · trail on" if trail else ""
     send_bot(
@@ -719,6 +759,8 @@ def notify_fib_closed(
     pnl_usdt: float | None = None,
     reason: str | None = None,
 ) -> None:
+    if _skip_ops_trade():
+        return
     vol = f" · {fmt_vol_usdt(vol_usdt, leverage)}" if vol_usdt and vol_usdt > 0 else ""
     emoji = _close_emoji(pnl_usdt)
     pnl_line = pnl_suffix(pnl_usdt, vol_usdt or 0.0, leverage) if pnl_usdt is not None else ""
