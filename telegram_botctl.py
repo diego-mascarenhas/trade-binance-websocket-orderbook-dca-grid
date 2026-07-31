@@ -306,23 +306,37 @@ def _authorized(chat: dict) -> bool:
 def poll_once(offset: int) -> int:
     data = _api("getUpdates", timeout=30, offset=offset if offset else None)
     for upd in data.get("result", []):
-        offset = max(offset, int(upd.get("update_id", 0)) + 1)
-        msg = upd.get("message") or upd.get("edited_message")
-        if not msg:
-            continue
-        chat = msg.get("chat") or {}
-        if not _authorized(chat):
-            logger.warning("Ignored message from unauthorized chat %s", chat.get("id"))
-            continue
-        text = msg.get("text") or ""
-        cmd, args = _parse_message(text)
-        if not cmd:
-            continue
-        if cmd == "/start" and not args:
-            reply = handle_command("/help", [])
-        else:
-            reply = handle_command(cmd, args)
-        send_reply(reply)
+        uid = int(upd.get("update_id", 0))
+        # Confirm each update immediately. A corrupt high watermark in the
+        # offset file (max(old, uid+1)) can leave Telegram redelivering the
+        # same /start forever → help spam.
+        if offset and uid + 1 < offset:
+            logger.warning(
+                "Offset file ahead of Telegram (%s > %s); rewinding",
+                offset,
+                uid + 1,
+            )
+        offset = uid + 1
+        _save_offset(offset)
+        try:
+            msg = upd.get("message") or upd.get("edited_message")
+            if not msg:
+                continue
+            chat = msg.get("chat") or {}
+            if not _authorized(chat):
+                logger.warning("Ignored message from unauthorized chat %s", chat.get("id"))
+                continue
+            text = msg.get("text") or ""
+            cmd, args = _parse_message(text)
+            if not cmd:
+                continue
+            if cmd == "/start" and not args:
+                reply = handle_command("/help", [])
+            else:
+                reply = handle_command(cmd, args)
+            send_reply(reply)
+        except Exception:
+            logger.exception("Failed handling update %s", uid)
     return offset
 
 
@@ -333,7 +347,7 @@ def run_daemon(poll_sec: float = 1.0) -> None:
 
     botctl.ROOT  # ensure import side ok
     backend = botctl.detect_backend()
-    send_reply(f"🤖 Bot control active ({backend}). /help · /report · /pump")
+    # No startup Telegram ping — systemd restarts would spam the ops chat.
     logger.info("Telegram botctl started (backend=%s)", backend)
 
     offset = _load_offset()
