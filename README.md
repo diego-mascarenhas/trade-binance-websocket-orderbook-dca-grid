@@ -228,9 +228,9 @@ python3 orderbook_staged_exit.py LINKUSDT
 ```bash
 dca ZAMAUSDT short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 \
   --partial-tp --tp-partial-pct 70 \
-  --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once
+  --post-be trail --post-be-arm-pct 1.3 --post-be-callback 0.45 --once
 # 70% TAKE_PROFIT @ +0.3% gross (only if notional ≥ 500 USDT) · BE @ +1% → entry+0.3%
-# · trail from +2% · TP resto = EQL
+# · trail from +1.3% (cb 0.45%) · TP resto = EQL
 ```
 
 Add new exit strategies under `exits/` and register them in `exits/__init__.py`.
@@ -266,8 +266,8 @@ python3 pump_stall_scan.py --help
 1. Keeps scanning; picks the top **`--max-trades`** ★ symbols (default **3**) by score  
 2. Slots are **only for this bot’s ★ list** — other open pairs on the account do not count  
 3. Launches:  
-   `dca SYMBOL short --exit structure --protect-be --partial-tp --tp-partial-pct 70 --be-arm-pct 1 --be-profit-pct 0.3 --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once`  
-4. Exits: **70% TP @ +0.3% gross** (only if notional ≥ **500 USDT**); **BE** at +1% → SL entry+0.3%; **trail** from +2%; resto **EQL**  
+   `dca SYMBOL short --exit structure --protect-be --partial-tp --tp-partial-pct 70 --be-arm-pct 1 --be-profit-pct 0.3 --post-be trail --post-be-arm-pct 1.3 --post-be-callback 0.45 --once`  
+4. Exits: **70% TP @ +0.3% gross** (only if notional ≥ **500 USDT**); **BE** at +1% → SL entry+0.3%; **trail** from +1.3% (cb 0.45%); resto **EQL**  
 5. `--once` = one cycle then exit (no re-arm)  
 6. When a slot frees, rescans and may take the next best ★  
 7. Losing close → **`--loss-cooldown-min`** (default **1440 = 24h**) on that symbol (`.state/loss_cooldown.json`)
@@ -280,8 +280,8 @@ python3 pump_stall_scan.py --help
 | `--interval` | `60` | Refresh seconds (min 15) |
 | `--ideal-near` | `92` | near% ≥ this → ★ (early profile: 90) |
 | `--loss-cooldown-min` | `1440` | Skip symbol after loss (minutes) |
-| `--post-be-arm-pct` | `2` | Arm post-BE trail at this profit % |
-| `--post-be-callback` | `0.8` | Trailing `callbackRate` % |
+| `--post-be-arm-pct` | `1.3` | Arm post-BE trail at this profit % |
+| `--post-be-callback` | `0.45` | Trailing `callbackRate` % |
 | `--why [N]` | off | Show top N blocked seeds by failing filter |
 
 Trade logs: `logs/pump-stall-SYMBOL.log`. Stop one child: `dca SYMBOL stop`.

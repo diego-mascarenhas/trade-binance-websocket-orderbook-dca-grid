@@ -1956,13 +1956,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="[--post-be trail] Arm trailing when unrealized profit %% ≥ this "
-             "(default 2.0). Env: POST_BE_ARM_PCT",
+             "(default 1.3). Env: POST_BE_ARM_PCT",
     )
     p.add_argument(
         "--post-be-callback",
         type=float,
         default=None,
-        help="[--post-be trail] TRAILING_STOP callbackRate %% (default 0.8). "
+        help="[--post-be trail] TRAILING_STOP callbackRate %% (default 0.45). "
              "Env: POST_BE_CALLBACK",
     )
     p.add_argument("--tp-partial-pct", type=float, default=None,

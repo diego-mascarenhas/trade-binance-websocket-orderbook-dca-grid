@@ -5,8 +5,8 @@ STOP_MARKET on the full position at entry ± --be-profit-pct (default 0.3%).
 Lock is pure profit % from entry — no fee buffer.
 
 After BE is armed, optional ``--post-be trail`` waits for
-``--post-be-arm-pct`` (default 2%) then places TRAILING_STOP_MARKET with
-``--post-be-callback`` (default 0.8%), keeping the BE SL as a floor.
+``--post-be-arm-pct`` (default 1.3%) then places TRAILING_STOP_MARKET with
+``--post-be-callback`` (default 0.45%), keeping the BE SL as a floor.
 
 Used alone via `--exit be`, or as the protect layer under `--exit structure`
 (TP remains EQH/EQL). DCA grid stays active; BE/trail qty are resynced if size grows.
@@ -58,14 +58,14 @@ def post_be_arm_pct(args: argparse.Namespace) -> float:
     v = getattr(args, "post_be_arm_pct", None)
     if v is not None:
         return float(v)
-    return _env_float("POST_BE_ARM_PCT", 2.0)
+    return _env_float("POST_BE_ARM_PCT", 1.3)
 
 
 def post_be_callback(args: argparse.Namespace) -> float:
     v = getattr(args, "post_be_callback", None)
     if v is not None:
         return float(v)
-    return _env_float("POST_BE_CALLBACK", 0.8)
+    return _env_float("POST_BE_CALLBACK", 0.45)
 
 
 def _place_immediate_trail(

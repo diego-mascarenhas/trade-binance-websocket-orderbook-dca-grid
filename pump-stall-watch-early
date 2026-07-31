@@ -5,7 +5,7 @@
 #   stall ≥ 25 (default 35) · near ≥ 82 (default 85) · ★ near ≥ 90 (default 92)
 #
 # Default exit stack on auto-trade ★:
-#   structure (EQL) + BE@1%→0.3% + post-BE trail@2%/callback 0.8%
+#   structure (EQL) + BE@1%→0.3% + post-BE trail@1.3%/callback 0.45%
 #
 # Usage:
 #   ./pump-stall-watch-early
@@ -20,8 +20,8 @@ exec python3 "$ROOT/pump_stall_scan.py" --watch \
   --max-trades 3 \
   --interval 60 \
   --loss-cooldown-min 1440 \
-  --post-be-arm-pct 2 \
-  --post-be-callback 0.8 \
+  --post-be-arm-pct 1.3 \
+  --post-be-callback 0.45 \
   --min-stall 25 \
   --min-near-high 82 \
   --ideal-near 90 \

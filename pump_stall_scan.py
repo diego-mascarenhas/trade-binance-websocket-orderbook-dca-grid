@@ -11,7 +11,7 @@
 Display-only by default. With --watch --auto-trade: run the top
 `--max-trades` ★ from this list (default 3) via
 `dca SYMBOL short --exit structure` (TP=EQL) + BE protect (arm 1% → lock 0.3%)
-+ post-BE trail (arm 2% → callback 0.8%).
++ post-BE trail (arm 1.3% → callback 0.45%).
 Other open pairs on the account do not consume these slots.
 
   python3 pump_stall_scan.py
@@ -21,7 +21,7 @@ Other open pairs on the account do not consume these slots.
 Profiles (wrappers; defaults of ./pump-stall-watch stay strict):
   ./pump-stall-watch          # stall≥35 · near≥85 · ★≥92
   ./pump-stall-watch-early    # TEST: stall≥25 · near≥82 · ★≥90
-                              # + auto-trade · BE + trail@2%/0.8%
+                              # + auto-trade · BE + trail@1.3%/0.45%
   ./pump-stall-early          # one-shot scan with the early profile
 """
 
@@ -643,7 +643,7 @@ def print_hits(
         print()
         print(
         f"{DIM}Hint: dca SYMBOL short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 "
-        f"--post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 "
+        f"--post-be trail --post-be-arm-pct 1.3 --post-be-callback 0.45 "
         f"--min-gap … --so-count …{RESET}"
     )
         if why_limit > 0 and blocked is not None:
@@ -825,8 +825,8 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         "--tp1-profit-pct", "0.3",
         "--partial-tp-min-notional", "500",
         "--post-be", "trail",
-        "--post-be-arm-pct", str(getattr(args, "post_be_arm_pct", 2.0) or 2.0),
-        "--post-be-callback", str(getattr(args, "post_be_callback", 0.8) or 0.8),
+        "--post-be-arm-pct", str(getattr(args, "post_be_arm_pct", 1.3) or 1.3),
+        "--post-be-callback", str(getattr(args, "post_be_callback", 0.45) or 0.45),
         "--once",
         "--loss-cooldown-min", str(getattr(args, "loss_cooldown_min", 1440)),
         "--so-count", str(args.so_count),
@@ -854,7 +854,7 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         print(
             f"{BOLD}{GREEN}AUTO ★ {hit.symbol}{RESET}  "
             f"{DIM}pid={proc.pid} · dca short --exit structure "
-            f"+ TP70%@+0.3%(≥500U) + BE@1%→0.3% + trail@2%/0.8% --once · "
+            f"+ TP70%@+0.3%(≥500U) + BE@1%→0.3% + trail@1.3%/0.45% --once · "
             f"log {log_path}{RESET}"
         )
         return proc
@@ -1032,7 +1032,7 @@ Examples:
 Auto-trade launches per ★:
   dca SYMBOL short --exit structure --protect-be \\
     --be-arm-pct 1 --be-profit-pct 0.3 \\
-    --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once
+    --post-be trail --post-be-arm-pct 1.3 --post-be-callback 0.45 --once
 
   TP = EQL (short) / EQH (long).
   BE protect arms at +1% → SL @ entry+0.3%; trail from +2% (cb 0.8%).
@@ -1118,14 +1118,14 @@ Production (VPS):
     p.add_argument(
         "--post-be-arm-pct",
         type=float,
-        default=2.0,
-        help="With --auto-trade: arm post-BE trail at this profit %% (default 2)",
+        default=1.3,
+        help="With --auto-trade: arm post-BE trail at this profit %% (default 1.3)",
     )
     p.add_argument(
         "--post-be-callback",
         type=float,
-        default=0.8,
-        help="With --auto-trade: post-BE trailing callbackRate %% (default 0.8)",
+        default=0.45,
+        help="With --auto-trade: post-BE trailing callbackRate %% (default 0.45)",
     )
     p.add_argument(
         "--why",
