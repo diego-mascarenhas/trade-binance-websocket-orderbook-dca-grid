@@ -7,6 +7,8 @@ import argparse
 import json
 import logging
 import os
+import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -20,6 +22,10 @@ import telegram_notify
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent
 OFFSET_FILE = ROOT / ".run" / "telegram_botctl.offset"
+
+PUMP_EARLY = "pump-stall-watch-early"
+PUMP_STRICT = "pump-stall-watch"
+SYSTEMCTL = "/bin/systemctl"
 
 
 def _token() -> str:
@@ -60,6 +66,126 @@ def send_reply(text: str) -> None:
     telegram_notify._send_sync(text[:4096])
 
 
+def _html_to_plain(html: str) -> str:
+    text = (
+        str(html)
+        .replace("<b>", "")
+        .replace("</b>", "")
+        .replace("<i>", "")
+        .replace("</i>", "")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+    )
+    return re.sub(r"<[^>]+>", "", text)
+
+
+def _systemctl(*args: str) -> tuple[int, str]:
+    """Run passwordless sudo systemctl (see /etc/sudoers.d/pump-stall-ctl)."""
+    cmd = ["sudo", "-n", SYSTEMCTL, *args]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, str(exc)
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    return proc.returncode, out
+
+
+def _unit_state(unit: str) -> str:
+    code, out = _systemctl("is-active", unit)
+    active = out.splitlines()[0].strip() if out else "unknown"
+    if code != 0 and active not in ("active", "inactive", "failed", "activating"):
+        return f"error ({out or code})"
+    _c2, en = _systemctl("is-enabled", unit)
+    enabled = en.splitlines()[0].strip() if en else "?"
+    return f"{active} · {enabled}"
+
+
+def _pump_status() -> str:
+    early = _unit_state(PUMP_EARLY)
+    strict = _unit_state(PUMP_STRICT)
+    if early.startswith("active"):
+        mode = "EARLY"
+    elif strict.startswith("active"):
+        mode = "STRICT"
+    else:
+        mode = "STOPPED"
+    return (
+        f"Pump-stall · {mode}\n"
+        f"early:  {early}\n"
+        f"strict: {strict}"
+    )
+
+
+def _pump_stop() -> str:
+    lines: list[str] = []
+    for unit in (PUMP_EARLY, PUMP_STRICT):
+        code, out = _systemctl("stop", unit)
+        if code != 0 and out and "not loaded" not in out.lower():
+            lines.append(f"stop {unit}: {out or code}")
+    lines.append(_pump_status())
+    return "\n".join(lines)
+
+
+def _pump_start(profile: str | None = None) -> str:
+    """Start early or strict. If profile is None, start whichever is enabled."""
+    if profile == "early":
+        target = PUMP_EARLY
+    elif profile == "strict":
+        target = PUMP_STRICT
+    else:
+        _c, early_en = _systemctl("is-enabled", PUMP_EARLY)
+        if (early_en or "").strip() == "enabled":
+            target = PUMP_EARLY
+        else:
+            target = PUMP_STRICT
+    # Prefer a single active profile.
+    other = PUMP_STRICT if target == PUMP_EARLY else PUMP_EARLY
+    _systemctl("stop", other)
+    code, out = _systemctl("start", target)
+    if code != 0:
+        return f"❌ start {target} failed: {out or code}\n{_pump_status()}"
+    return f"✅ started {target}\n{_pump_status()}"
+
+
+def _pump_switch(profile: str) -> str:
+    if profile == "early":
+        on, off = PUMP_EARLY, PUMP_STRICT
+    elif profile == "strict":
+        on, off = PUMP_STRICT, PUMP_EARLY
+    else:
+        return "Usage: /pump early | /pump strict"
+    steps = [
+        ("stop", off),
+        ("disable", off),
+        ("enable", on),
+        ("start", on),
+    ]
+    errors: list[str] = []
+    for action, unit in steps:
+        code, out = _systemctl(action, unit)
+        if code != 0:
+            errors.append(f"{action} {unit}: {out or code}")
+    if errors:
+        return "❌ Switch failed:\n" + "\n".join(errors) + f"\n{_pump_status()}"
+    label = "EARLY" if profile == "early" else "STRICT"
+    return f"✅ Pump-stall → {label}\n{_pump_status()}"
+
+
+def _report_private() -> str:
+    try:
+        import pumpstall_telegram as pst
+    except ImportError as exc:
+        return f"❌ pumpstall_telegram unavailable: {exc}"
+    try:
+        html = pst.format_daily_summary()
+    except Exception as exc:  # noqa: BLE001
+        return f"❌ Report failed: {exc}"
+    return _html_to_plain(html)
+
+
 def _parse_message(text: str) -> tuple[str, list[str]]:
     text = (text or "").strip()
     if not text.startswith("/"):
@@ -84,6 +210,8 @@ def handle_command(cmd: str, args: list[str]) -> str:
             "/sweep [SYMBOL] — cancel orphan bot limits/algos when flat\n"
             "/review SYMBOL — DeepSeek situational review\n"
             "/list — all running bots\n"
+            "/report — Pumpstall #REPORT in this chat (private)\n"
+            "/pump status|start|stop|early|strict|sweep — pump-stall service\n"
             "gate: SHORT only if mid>gate · LONG only if mid<gate\n"
             f"Backend: {backend}"
         )
@@ -143,6 +271,28 @@ def handle_command(cmd: str, args: list[str]) -> str:
         sym = args[0].upper() if args else None
         return botctl.sweep(sym)
 
+    if cmd == "/report":
+        return _report_private()
+
+    if cmd == "/pump":
+        action = (args[0].lower() if args else "status").strip()
+        if action in ("status", "st"):
+            return _pump_status()
+        if action == "stop":
+            return _pump_stop()
+        if action == "start":
+            return _pump_start(None)
+        if action == "early":
+            return _pump_switch("early")
+        if action in ("strict", "normal"):
+            return _pump_switch("strict")
+        if action == "sweep":
+            return botctl.sweep(None)
+        return (
+            "Usage: /pump status|start|stop|early|strict|sweep\n"
+            f"{_pump_status()}"
+        )
+
     return "Unknown command. Try /help"
 
 
@@ -183,7 +333,7 @@ def run_daemon(poll_sec: float = 1.0) -> None:
 
     botctl.ROOT  # ensure import side ok
     backend = botctl.detect_backend()
-    send_reply(f"🤖 Bot control active ({backend}). /help · /fib · /stop")
+    send_reply(f"🤖 Bot control active ({backend}). /help · /report · /pump")
     logger.info("Telegram botctl started (backend=%s)", backend)
 
     offset = _load_offset()
