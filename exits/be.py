@@ -307,6 +307,7 @@ def run_once(
                 closed_qty=0.0,
                 leverage=lev,
                 pnl_usdt=upnl,
+                hashtag="#BE",
             )
         except Exception:
             pass

@@ -212,14 +212,65 @@ def pnl_suffix(
     )
 
 
-def _close_emoji(pnl_usdt: float | None) -> str:
-    if pnl_usdt is None:
-        return "🤖"
-    if pnl_usdt > 0:
-        return "🥳"
-    if pnl_usdt < 0:
+def _close_emoji(pnl_usdt: float | None = None) -> str:
+    """Always 🥳 for #CLOSE (same as send_tp / other bots in this repo)."""
+    return "🥳"
+
+
+def _sl_emoji(pnl_usdt: float | None) -> str:
+    """#SL: 😢 when losing, else 🛡️ (protect)."""
+    if pnl_usdt is not None and float(pnl_usdt) < 0:
         return "😢"
-    return "🤖"
+    return "🛡️"
+
+
+def _tag_emoji(tag: str, direction: str, pnl_usdt: float | None = None) -> str:
+    t = tag.strip().upper().lstrip("#")
+    if t == "CLOSE":
+        return _close_emoji(pnl_usdt)
+    if t == "TP":
+        return "🥳"
+    if t == "BE":
+        return "🛡️"
+    if t == "TRAIL":
+        return "🏄"
+    if t == "SL":
+        return _sl_emoji(pnl_usdt)
+    if t in ("OPEN", "DCA"):
+        return _dir_emoji(direction)
+    return _dir_emoji(direction)
+
+
+def _post_public_tag(
+    tag: str,
+    symbol: str,
+    direction: str,
+    *,
+    pnl_usdt: float | None = None,
+    notional: float | None = None,
+    leverage: float | int | None = None,
+    entry: float | None = None,
+    mark: float | None = None,
+) -> None:
+    """Compact Pumpstall public alert — hashtag + %% only, never size."""
+    if not _public_chat_id():
+        return
+    tag_u = tag.strip().upper().lstrip("#")
+    emoji = _tag_emoji(tag_u, direction, pnl_usdt)
+    pct = _pnl_pct_public(
+        pnl_usdt,
+        notional,
+        leverage,
+        entry=entry,
+        mark=mark,
+        direction=direction,
+    )
+    lines = [
+        f"{emoji} <b>#{tag_u} {direction.upper()}</b> · <b>{symbol.upper()}</b>",
+    ]
+    if pct is not None:
+        lines.append(f"PnL · <b>{pct:+.2f}%</b>")
+    _send_public_html("\n".join(lines))
 
 
 def notify_dca_filled(
@@ -236,31 +287,21 @@ def notify_dca_filled(
     mark: float | None = None,
 ) -> None:
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(pos_qty) * abs(entry)
-    # Public channel: PnL %% from avg entry only — never qty / Vol USDT
-    if _ops_is_public_channel():
-        pct = _pnl_pct_public(
-            pnl_usdt,
-            notional,
-            leverage,
-            entry=entry,
-            mark=mark if mark and mark > 0 else fill_price,
-            direction=direction,
-        )
-        if pct is None:
-            return
-        emoji = _dir_emoji(direction)
-        _send_public_html(
-            f"{emoji} <b>#DCA {direction.upper()}</b> · <b>{symbol.upper()}</b>\n"
-            f"PnL · <b>{pct:+.2f}%</b>"
-        )
+    mark_px = mark if mark and mark > 0 else fill_price
+    _post_public_tag(
+        "DCA", symbol, direction,
+        pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
+        entry=entry, mark=mark_px,
+    )
+    if _ops_is_public_channel() or not is_configured():
         return
     fill_vol = abs(fill_qty) * abs(fill_price)
     send_position(
         direction,
-        f"{symbol.upper()} futures\n#DCA {direction.upper()}\n"
+        f"{symbol.upper()} futures #DCA {direction.upper()}\n"
         f"+{fill_qty:g} @ {fill_price:g} · Vol: {fill_vol:,.2f} USDT\n"
         f"Position {pos_qty:g} @ {entry:g} · {fmt_vol_usdt(notional, leverage)}"
-        f"{pnl_suffix(pnl_usdt, notional, leverage, entry=entry, mark=mark, direction=direction)}",
+        f"{pnl_suffix(pnl_usdt, notional, leverage, entry=entry, mark=mark_px, direction=direction)}",
     )
 
 
@@ -279,7 +320,13 @@ def notify_grid_armed(
     grid_vol_usdt: float | None = None,
     leverage: float | int | None = None,
 ) -> None:
-    if _ops_is_public_channel():
+    # Public #OPEN when orders are placed (🍎 SHORT / 🍏 LONG). Skip re-arms.
+    if not dca_only:
+        _post_public_tag(
+            "OPEN", symbol, direction,
+            notional=grid_vol_usdt, leverage=leverage,
+        )
+    if _ops_is_public_channel() or not is_configured():
         return
     kind = "DCA-only re-arm" if dca_only else "Grid armed"
     vol_line = ""
@@ -300,13 +347,13 @@ def notify_position_open(
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
 ) -> None:
+    """Private ops detail on fill. Public #OPEN already sent when grid orders were placed."""
     notional = vol_usdt if vol_usdt and vol_usdt > 0 else abs(qty) * abs(entry)
-    if _ops_is_public_channel():
-        # ★ OPEN SHORT already covers public entries; skip size-bearing open
+    if _ops_is_public_channel() or not is_configured():
         return
     send_position(
         direction,
-        f"{symbol.upper()} futures\n#OPEN {direction.upper()}\n"
+        f"{symbol.upper()} futures #OPEN {direction.upper()}\n"
         f"Qty {qty:g} @ {entry:g} · {fmt_vol_usdt(notional, leverage)}"
         f"{pnl_suffix(pnl_usdt, notional, leverage)}",
     )
@@ -374,8 +421,16 @@ def notify_tp1_filled(
 ) -> None:
     price = tp1_price if tp1_price and tp1_price > 0 else entry
     notional = abs(remain_qty) * abs(entry)
+    _post_public_tag(
+        "TP", symbol, direction,
+        pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
+        entry=entry, mark=price,
+    )
+    if _ops_is_public_channel() or not is_configured():
+        return
     send_tp(
-        f"{symbol.upper()} futures\nTP1 filled · {direction.upper()}\n"
+        f"{symbol.upper()} futures #TP {direction.upper()}\n"
+        f"TP1 filled\n"
         f"Closed {tp1_qty:g} · {fmt_vol(tp1_qty, price, leverage)}\n"
         f"Runner {remain_qty:g} · {fmt_vol(remain_qty, entry, leverage)}"
         f"{pnl_suffix(pnl_usdt, notional, leverage)}",
@@ -395,21 +450,40 @@ def notify_profit_lock_sl(
     closed_qty: float | None = None,
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
+    hashtag: str = "#SL",
 ) -> None:
-    """Profit lock after partial TP — shield icon (matches dashboard format)."""
+    """Profit lock / BE protect. ``hashtag`` is #BE or #SL (#SL loss → 😢)."""
+    tag = (hashtag or "#SL").strip()
+    if not tag.startswith("#"):
+        tag = f"#{tag}"
+    tag_u = tag.upper().lstrip("#")
     run_pct = runner_pct if runner_pct is not None else max(0.0, 100.0 - closed_pct)
     notional = abs(runner_qty) * abs(entry)
+    _post_public_tag(
+        tag_u, symbol, direction,
+        pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
+        entry=entry, mark=sl_price if sl_price > 0 else entry,
+    )
+    if _ops_is_public_channel() or not is_configured():
+        return
     closed_vol = ""
     if closed_qty is not None and closed_qty > 0:
         closed_vol = f" · {fmt_vol(closed_qty, entry, leverage)}"
-    send_shield(
-        f"{symbol.upper()} futures\n"
-        f"PROFIT LOCK SL · {direction.upper()}\n"
+    label = "BE protect" if tag_u == "BE" else "PROFIT LOCK SL"
+    emoji = _tag_emoji(tag_u, direction, pnl_usdt)
+    body = (
+        f"{symbol.upper()} futures {tag} {direction.upper()}\n"
+        f"{label}\n"
         f"Trigger: {trigger}\n"
-        f"~{closed_pct:.0f}% closed{closed_vol} · runner {run_pct:.0f}% · {fmt_vol(runner_qty, entry, leverage)}"
+        f"~{closed_pct:.0f}% closed{closed_vol} · runner {run_pct:.0f}% · "
+        f"{fmt_vol(runner_qty, entry, leverage)}"
         f"{pnl_suffix(pnl_usdt, notional, leverage)}\n"
         f"SL → {sl_price:g}"
     )
+    if tag_u == "SL" and pnl_usdt is not None and float(pnl_usdt) < 0:
+        _send_async(f"{emoji} {body}")
+    else:
+        send_shield(body)
 
 
 def notify_position_closed(
@@ -457,8 +531,8 @@ def notify_position_closed(
         )
         reason_line = f"\nReason: {why}" if why else ""
         _send_async(
-            f"{emoji} {symbol.upper()} futures\n"
-            f"#CLOSED {direction.upper()}{vol}{pnl_line}{reason_line}"
+            f"{emoji} {symbol.upper()} futures #CLOSE {direction.upper()}"
+            f"{vol}{pnl_line}{reason_line}"
         )
 
     if pst is not None and public_chat:
@@ -478,7 +552,7 @@ def notify_position_closed(
 
 
 def notify_sl_at_entry(symbol: str, direction: str, qty: float, entry: float) -> None:
-    notify_profit_lock_sl(symbol, direction, qty, entry, entry)
+    notify_profit_lock_sl(symbol, direction, qty, entry, entry, hashtag="#BE")
 
 
 def notify_trail_started(
@@ -494,8 +568,17 @@ def notify_trail_started(
 ) -> None:
     ref = entry if entry and entry > 0 else activate
     notional = abs(qty) * abs(ref)
+    _post_public_tag(
+        "TRAIL", symbol, direction,
+        pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
+        entry=entry if entry and entry > 0 else None,
+        mark=activate,
+    )
+    if _ops_is_public_channel() or not is_configured():
+        return
     send_trailing(
-        f"{symbol.upper()} futures\nTrailing runner · {direction.upper()}\n"
+        f"{symbol.upper()} futures #TRAIL {direction.upper()}\n"
+        f"Trailing runner\n"
         f"Qty {qty:g} · {fmt_vol(qty, ref, leverage)}\n"
         f"Activate {activate:g} · callback {callback:g}%"
         f"{pnl_suffix(pnl_usdt, notional, leverage)}",

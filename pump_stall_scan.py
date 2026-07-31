@@ -666,7 +666,7 @@ def _maybe_telegram_notify(
     enabled: bool,
     bootstrap: bool = False,
 ) -> None:
-    """Post ★ ideals to the public Pumpstall channel."""
+    """Post ★ candidates (setup only — not #OPEN) to the public Pumpstall channel."""
     if not enabled:
         return
     try:

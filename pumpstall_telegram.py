@@ -1,7 +1,8 @@
 """Public Pumpstall Telegram channel (@pumpstall).
 
-★ OPEN SHORT setups, CLOSE / DCA with PnL %% from avg entry (Finandy-style;
-never volume/USDT size), and a morning summary (yesterday / week / month).
+★ SHORT candidates (setup only), #OPEN when grid orders are placed,
+CLOSE / DCA / etc. with PnL %% from avg entry (never volume/USDT size),
+and a morning #REPORT summary (yesterday / week / month).
 
 Env:
   TELEGRAM_BOT_TOKEN
@@ -102,7 +103,16 @@ def _html_escape(text: str) -> str:
 
 
 def _fmt_wall_px(price: float) -> str:
-    s = f"{price:.4f}".rstrip("0").rstrip(".")
+    """Adaptive decimals so micro-priced walls stay distinguishable (e.g. 0.000623 vs 0.000631)."""
+    import math
+
+    p = abs(float(price))
+    if p == 0:
+        return "0"
+    # Keep ~4 significant digits after the first non-zero decimal digit.
+    order = int(math.floor(math.log10(p)))
+    decimals = max(4, min(12, -order + 4))
+    s = f"{float(price):.{decimals}f}".rstrip("0").rstrip(".")
     return s or "0"
 
 
@@ -196,7 +206,6 @@ def format_open_signal(
     note: str = "",
 ) -> str:
     sym = _html_escape(symbol.upper())
-    site = _site_url()
     chg_emoji = "📈" if change_24h >= 0 else "📉"
     metrics = ", ".join(
         [
@@ -222,10 +231,10 @@ def format_open_signal(
         f"1D regime {near_regime_pct:.0f}% · sharp {sharp_pct:.0f} · "
         f"stall {stall_score:.0f} · {ask_walls} walls / {ask_span_pct:.1f}%"
     )
-    site_label = site.replace("https://", "").replace("http://", "")
 
+    # ★ ideal only — not a filled trade. Real #OPEN comes when orders are placed.
     return (
-        f"⭐ <b>OPEN SHORT</b> · <b>{sym}</b>\n"
+        f"⭐ <b>IDEAL</b> · <b>{sym}</b>\n"
         f"\n"
         f"{chg_emoji} <b>{change_24h:+.1f}%</b> 24h · "
         f"🚀 pump {_html_escape(f'{pump_7d_pct:.0f}%')} · "
@@ -235,10 +244,7 @@ def format_open_signal(
         f"\n"
         f"{walls_line}\n"
         f"\n"
-        f"<i>{note_line}</i>\n"
-        f"\n"
-        f'<a href="{_html_escape(site)}">{_html_escape(site_label)}</a>'
-        f" · software, not advice"
+        f"<i>{note_line}</i>"
     )
 
 
@@ -251,19 +257,13 @@ def format_close_signal(
 ) -> str:
     sym = _html_escape(symbol.upper())
     side = _html_escape((direction or "SHORT").upper())
-    emoji = "✅" if pnl_pct >= 0 else "❌"
     reason_line = ""
     if reason and str(reason).strip():
         reason_line = f"\n{_html_escape(str(reason).strip())}"
-    site = _site_url()
-    site_label = site.replace("https://", "").replace("http://", "")
     return (
-        f"{emoji} <b>CLOSE {side}</b> · <b>{sym}</b>\n"
+        f"🥳 <b>#CLOSE {side}</b> · <b>{sym}</b>\n"
         f"PnL · <b>{pnl_pct:+.2f}%</b>"
-        f"{reason_line}\n"
-        f"\n"
-        f'<a href="{_html_escape(site)}">{_html_escape(site_label)}</a>'
-        f" · software, not advice"
+        f"{reason_line}"
     )
 
 
@@ -443,21 +443,14 @@ def format_daily_summary(*, as_of: date | None = None) -> str:
     def line(label: str, total: float, n: int) -> str:
         return f"{label:<5} · <b>{total:+.2f}%</b>  <i>({n} trade{'s' if n != 1 else ''})</i>"
 
-    site = _site_url()
-    site_label = site.replace("https://", "").replace("http://", "")
     title = yesterday.strftime("%d %b %Y")
 
     return (
-        f"📊 <b>Pumpstall report</b> · {_html_escape(title)}\n"
+        f"📊 <b>#REPORT</b> · {_html_escape(title)}\n"
         f"\n"
         f"{line('Day', day_sum, day_n)}\n"
         f"{line('Week', week_sum, week_n)}\n"
-        f"{line('Month', month_sum, month_n)}\n"
-        f"\n"
-        f"<i>Sum of closed trade %% from avg entry (Finandy-style) — "
-        f"not account equity. Software, not advice.</i>\n"
-        f"\n"
-        f'<a href="{_html_escape(site)}">{_html_escape(site_label)}</a>'
+        f"{line('Month', month_sum, month_n)}"
     )
 
 
