@@ -180,7 +180,7 @@ def _report_private() -> str:
     except ImportError as exc:
         return f"❌ pumpstall_telegram unavailable: {exc}"
     try:
-        html = pst.format_daily_summary()
+        html = pst.format_daily_summary(private=True)
     except Exception as exc:  # noqa: BLE001
         return f"❌ Report failed: {exc}"
     return _html_to_plain(html)

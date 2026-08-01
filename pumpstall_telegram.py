@@ -460,11 +460,18 @@ def _wallet_roi_pct(net_usdt: float, start_equity: float) -> float | None:
     return net_usdt / start_equity * 100.0
 
 
-def format_daily_summary(*, as_of: date | None = None) -> str:
+def format_daily_summary(
+    *,
+    as_of: date | None = None,
+    private: bool = False,
+) -> str:
     """Yesterday + week/month-to-yesterday as futures wallet ROI.
 
     % = Binance income (REALIZED_PNL + COMMISSION) ÷ starting futures equity
     for that window. Close count still comes from local trade log.
+
+    Public (``private=False``): percentages + closes only.
+    Private ops (``private=True``): also includes USDT net PnL.
     """
     _load_dotenv()
     tz = _tz()
@@ -523,10 +530,17 @@ def format_daily_summary(*, as_of: date | None = None) -> str:
     week_pct = _wallet_roi_pct(week_net, week_base)
     month_pct = _wallet_roi_pct(month_net, month_base)
 
-    def line(label: str, pct: float | None, n: int) -> str:
+    def line(label: str, pct: float | None, net: float, n: int) -> str:
         closes = f"{n} close{'s' if n != 1 else ''}"
         if pct is None:
+            if private and api_ok:
+                return f"{label:<5} · <b>{net:+.2f} USDT</b>  <i>({closes})</i>"
             return f"{label:<5} · <i>n/a</i>  <i>({closes})</i>"
+        if private:
+            return (
+                f"{label:<5} · <b>{pct:+.2f}%</b>  "
+                f"<i>({net:+.2f} USDT · {closes})</i>"
+            )
         return f"{label:<5} · <b>{pct:+.2f}%</b>  <i>({closes})</i>"
 
     title = yesterday.strftime("%d %b %Y")
@@ -539,9 +553,9 @@ def format_daily_summary(*, as_of: date | None = None) -> str:
     return (
         f"📊 <b>#REPORT</b> · {_html_escape(title)}\n"
         f"\n"
-        f"{line('Day', day_pct, day_n)}\n"
-        f"{line('Week', week_pct, week_n)}\n"
-        f"{line('Month', month_pct, month_n)}"
+        f"{line('Day', day_pct, day_net, day_n)}\n"
+        f"{line('Week', week_pct, week_net, week_n)}\n"
+        f"{line('Month', month_pct, month_net, month_n)}"
         f"{foot}"
     )
 
@@ -570,7 +584,8 @@ def maybe_send_daily_summary(*, force: bool = False) -> bool:
 
     newly_sent = False
     if not already or force:
-        text = format_daily_summary(as_of=now.date())
+        # Public channel: % + closes only (no USDT).
+        text = format_daily_summary(as_of=now.date(), private=False)
         ok = _send_html(text)
         if ok:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
