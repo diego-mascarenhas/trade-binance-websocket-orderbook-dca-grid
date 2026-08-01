@@ -2,7 +2,8 @@
 
 ★ SHORT candidates (setup only), #OPEN when grid orders are placed,
 CLOSE / DCA / etc. with PnL %% from avg entry (never volume/USDT size),
-and a morning #REPORT summary (yesterday / week / month).
+and a morning #REPORT: futures wallet ROI from Binance income
+(REALIZED_PNL + COMMISSION) ÷ equity — not the sum of per-trade price %%.
 
 Env:
   TELEGRAM_BOT_TOKEN
@@ -32,6 +33,7 @@ ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / ".state"
 TRADES_FILE = STATE_DIR / "pumpstall_trades.jsonl"
 SUMMARY_STAMP = STATE_DIR / "pumpstall_summary_sent_date.txt"
+EQUITY_LOG = STATE_DIR / "pumpstall_equity.jsonl"
 
 
 def _load_dotenv() -> None:
@@ -390,18 +392,6 @@ def _parse_ts(raw: str) -> datetime | None:
         return None
 
 
-def _sum_pct(rows: list[dict[str, Any]]) -> tuple[float, int]:
-    total = 0.0
-    n = 0
-    for r in rows:
-        try:
-            total += float(r.get("pnl_pct", 0))
-            n += 1
-        except (TypeError, ValueError):
-            continue
-    return total, n
-
-
 def _trades_between(
     rows: list[dict[str, Any]],
     start: datetime,
@@ -417,8 +407,66 @@ def _trades_between(
     return picked
 
 
+def _append_equity_snapshot(wallet_usdt: float, *, as_of: date) -> None:
+    """Record futures wallet once per local day (for period start equity)."""
+    day_s = as_of.isoformat()
+    for row in _load_equity_snapshots():
+        if str(row.get("date", "")) == day_s:
+            return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    row = {
+        "date": day_s,
+        "wallet_usdt": float(wallet_usdt),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    with EQUITY_LOG.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _load_equity_snapshots() -> list[dict[str, Any]]:
+    if not EQUITY_LOG.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    for line in EQUITY_LOG.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _equity_on_or_before(snapshots: list[dict[str, Any]], day: date) -> float | None:
+    """Latest snapshot wallet on or before ``day``."""
+    best: tuple[date, float] | None = None
+    for row in snapshots:
+        try:
+            d = date.fromisoformat(str(row.get("date", "")))
+            w = float(row.get("wallet_usdt", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if d > day or w <= 0:
+            continue
+        if best is None or d > best[0]:
+            best = (d, w)
+    return None if best is None else best[1]
+
+
+def _wallet_roi_pct(net_usdt: float, start_equity: float) -> float | None:
+    if start_equity <= 0:
+        return None
+    return net_usdt / start_equity * 100.0
+
+
 def format_daily_summary(*, as_of: date | None = None) -> str:
-    """Yesterday + calendar week-to-yesterday + month-to-yesterday (local TZ)."""
+    """Yesterday + week/month-to-yesterday as futures wallet ROI.
+
+    % = Binance income (REALIZED_PNL + COMMISSION) ÷ starting futures equity
+    for that window. Close count still comes from local trade log.
+    """
+    _load_dotenv()
     tz = _tz()
     today = as_of or datetime.now(tz).date()
     yesterday = today - timedelta(days=1)
@@ -430,29 +478,77 @@ def format_daily_summary(*, as_of: date | None = None) -> str:
     week_start = datetime(
         week_start_date.year, week_start_date.month, week_start_date.day, tzinfo=tz,
     )
-
     month_start = datetime(yesterday.year, yesterday.month, 1, tzinfo=tz)
 
     rows = _load_trades()
-    day_rows = _trades_between(rows, day_start, day_end)
-    week_rows = _trades_between(rows, week_start, day_end)
-    month_rows = _trades_between(rows, month_start, day_end)
+    day_n = len(_trades_between(rows, day_start, day_end))
+    week_n = len(_trades_between(rows, week_start, day_end))
+    month_n = len(_trades_between(rows, month_start, day_end))
 
-    day_sum, day_n = _sum_pct(day_rows)
-    week_sum, week_n = _sum_pct(week_rows)
-    month_sum, month_n = _sum_pct(month_rows)
+    day_net = week_net = month_net = 0.0
+    wallet_now = 0.0
+    snaps = _load_equity_snapshots()
+    api_ok = False
+    try:
+        from pumpstall_bank import (
+            fetch_period_net_pnl_usdt,
+            futures_wallet_usdt,
+            _keys,
+        )
 
-    def line(label: str, total: float, n: int) -> str:
-        return f"{label:<5} · <b>{total:+.2f}%</b>  <i>({n} trade{'s' if n != 1 else ''})</i>"
+        api, sec = _keys()
+        if api and sec:
+            day_net, _ = fetch_period_net_pnl_usdt(api, sec, day_start, day_end)
+            week_net, _ = fetch_period_net_pnl_usdt(api, sec, week_start, day_end)
+            month_net, _ = fetch_period_net_pnl_usdt(api, sec, month_start, day_end)
+            wallet_now = futures_wallet_usdt(api, sec, "USDT")
+            api_ok = True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Pumpstall #REPORT wallet ROI fetch failed: %s", exc)
+
+    # Start equity: snapshot on/before period start; else estimate from now − net.
+    def start_eq(period_start_date: date, net: float) -> float:
+        snap = _equity_on_or_before(snaps, period_start_date)
+        if snap is not None and snap > 0:
+            return snap
+        if wallet_now > 0:
+            return max(wallet_now - net, wallet_now * 0.25, 1.0)
+        return 0.0
+
+    day_base = start_eq(yesterday, day_net)
+    week_base = start_eq(week_start_date, week_net)
+    month_base = start_eq(month_start.date(), month_net)
+
+    day_pct = _wallet_roi_pct(day_net, day_base)
+    week_pct = _wallet_roi_pct(week_net, week_base)
+    month_pct = _wallet_roi_pct(month_net, month_base)
+
+    def line(label: str, pct: float | None, net: float, n: int) -> str:
+        closes = f"{n} close{'s' if n != 1 else ''}"
+        if pct is None:
+            return (
+                f"{label:<5} · <b>{net:+.2f} USDT</b>  "
+                f"<i>({closes})</i>"
+            )
+        return (
+            f"{label:<5} · <b>{pct:+.2f}%</b>  "
+            f"<i>({net:+.2f} USDT · {closes})</i>"
+        )
 
     title = yesterday.strftime("%d %b %Y")
+    foot = (
+        "\n\n<i>wallet ROI · futures net PnL ÷ equity</i>"
+        if api_ok
+        else "\n\n<i>wallet ROI unavailable — check API keys</i>"
+    )
 
     return (
         f"📊 <b>#REPORT</b> · {_html_escape(title)}\n"
         f"\n"
-        f"{line('Day', day_sum, day_n)}\n"
-        f"{line('Week', week_sum, week_n)}\n"
-        f"{line('Month', month_sum, month_n)}"
+        f"{line('Day', day_pct, day_net, day_n)}\n"
+        f"{line('Week', week_pct, week_net, week_n)}\n"
+        f"{line('Month', month_pct, month_net, month_n)}"
+        f"{foot}"
     )
 
 
@@ -487,6 +583,17 @@ def maybe_send_daily_summary(*, force: bool = False) -> bool:
             SUMMARY_STAMP.write_text(today_s + "\n", encoding="utf-8")
             newly_sent = True
             already = True
+            try:
+                from pumpstall_bank import futures_wallet_usdt, _keys
+
+                api, sec = _keys()
+                if api and sec:
+                    _append_equity_snapshot(
+                        futures_wallet_usdt(api, sec, "USDT"),
+                        as_of=now.date(),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Pumpstall equity snapshot skipped: %s", exc)
             logger.info("Pumpstall daily summary sent for %s", today_s)
         else:
             logger.warning("Pumpstall summary send failed — %s", config_status())

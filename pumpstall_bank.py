@@ -125,6 +125,83 @@ def _ms(dt: datetime) -> int:
     return int(dt.astimezone(timezone.utc).timestamp() * 1000)
 
 
+def _fetch_income_chunk(
+    api: str,
+    sec: str,
+    income_type: str,
+    start_ms: int,
+    end_ms: int,
+) -> float:
+    """Sum one incomeType over [start_ms, end_ms). Window must be ≤ 7 days (Binance)."""
+    total = 0.0
+    cursor_end = end_ms
+    guard = 0
+    while guard < 40:
+        guard += 1
+        rows = _signed(
+            FAPI_BASE,
+            "GET",
+            "/fapi/v1/income",
+            {
+                "incomeType": income_type,
+                "startTime": start_ms,
+                "endTime": cursor_end,
+                "limit": 1000,
+            },
+            api,
+            sec,
+        )
+        if not isinstance(rows, list) or not rows:
+            break
+        oldest_ts = None
+        for row in rows:
+            try:
+                ts = int(row.get("time", 0))
+                if ts < start_ms or ts >= end_ms:
+                    continue
+                total += float(row.get("income", 0) or 0)
+                if oldest_ts is None or ts < oldest_ts:
+                    oldest_ts = ts
+            except (TypeError, ValueError):
+                continue
+        if len(rows) < 1000 or oldest_ts is None:
+            break
+        cursor_end = oldest_ts - 1
+        if cursor_end < start_ms:
+            break
+    return total
+
+
+def fetch_period_net_pnl_usdt(
+    api: str,
+    sec: str,
+    start: datetime,
+    end: datetime,
+) -> tuple[float, dict[str, float]]:
+    """Net USDT for [start, end): REALIZED_PNL + COMMISSION (funding excluded).
+
+    Binance caps each /income request at 7 days — longer ranges are chunked.
+    """
+    buckets: dict[str, float] = {"REALIZED_PNL": 0.0, "COMMISSION": 0.0}
+    if end <= start:
+        return 0.0, buckets
+
+    # Walk forward in ≤7d slices (Binance income limit).
+    chunk = timedelta(days=7)
+    cursor = start
+    while cursor < end:
+        chunk_end = min(cursor + chunk, end)
+        start_ms, end_ms = _ms(cursor), _ms(chunk_end)
+        for income_type in ("REALIZED_PNL", "COMMISSION"):
+            buckets[income_type] += _fetch_income_chunk(
+                api, sec, income_type, start_ms, end_ms,
+            )
+        cursor = chunk_end
+
+    net = buckets["REALIZED_PNL"] + buckets["COMMISSION"]
+    return net, buckets
+
+
 def fetch_day_net_pnl_usdt(
     api: str,
     sec: str,
@@ -133,49 +210,22 @@ def fetch_day_net_pnl_usdt(
 ) -> tuple[float, date, dict[str, float]]:
     """Net USDT for report day: REALIZED_PNL + COMMISSION (funding excluded)."""
     start, end, day = _yesterday_window(as_of)
-    start_ms, end_ms = _ms(start), _ms(end)
-    buckets: dict[str, float] = {"REALIZED_PNL": 0.0, "COMMISSION": 0.0}
-
-    for income_type in ("REALIZED_PNL", "COMMISSION"):
-        cursor_end = end_ms
-        guard = 0
-        while guard < 20:
-            guard += 1
-            rows = _signed(
-                FAPI_BASE,
-                "GET",
-                "/fapi/v1/income",
-                {
-                    "incomeType": income_type,
-                    "startTime": start_ms,
-                    "endTime": cursor_end,
-                    "limit": 1000,
-                },
-                api,
-                sec,
-            )
-            if not isinstance(rows, list) or not rows:
-                break
-            oldest_ts = None
-            for row in rows:
-                try:
-                    ts = int(row.get("time", 0))
-                    if ts < start_ms or ts >= end_ms:
-                        continue
-                    buckets[income_type] += float(row.get("income", 0) or 0)
-                    if oldest_ts is None or ts < oldest_ts:
-                        oldest_ts = ts
-                except (TypeError, ValueError):
-                    continue
-            if len(rows) < 1000 or oldest_ts is None:
-                break
-            # Page older: end just before oldest row seen in this batch.
-            cursor_end = oldest_ts - 1
-            if cursor_end < start_ms:
-                break
-
-    net = buckets["REALIZED_PNL"] + buckets["COMMISSION"]
+    net, buckets = fetch_period_net_pnl_usdt(api, sec, start, end)
     return net, day, buckets
+
+
+def futures_wallet_usdt(api: str, sec: str, asset: str = "USDT") -> float:
+    """Total futures wallet balance for asset (not just available)."""
+    rows = _signed(FAPI_BASE, "GET", "/fapi/v2/balance", {}, api, sec)
+    if not isinstance(rows, list):
+        return 0.0
+    for row in rows:
+        if str(row.get("asset", "")).upper() == asset.upper():
+            try:
+                return float(row.get("balance", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
 
 
 def futures_available_usdt(api: str, sec: str, asset: str) -> float:
