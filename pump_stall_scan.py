@@ -463,6 +463,19 @@ def _blocked_to_dict(r: AnalyzeRow) -> dict:
     }
 
 
+def format_dca_hint(args: argparse.Namespace | None = None) -> str:
+    """Display hint with the flags this watch would pass to `dca`."""
+    arm = float(getattr(args, "post_be_arm_pct", 1.3) or 1.3) if args else 1.3
+    cb = float(getattr(args, "post_be_callback", 0.45) or 0.45) if args else 0.45
+    gap = float(getattr(args, "min_gap", 0.8) or 0.8) if args else 0.8
+    so = int(getattr(args, "so_count", 8) or 8) if args else 8
+    return (
+        "Hint: dca SYMBOL short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 "
+        f"--post-be trail --post-be-arm-pct {arm:g} --post-be-callback {cb:g} "
+        f"--min-gap {gap:g} --so-count {so}"
+    )
+
+
 def build_snapshot(
     *,
     hits: list[PumpStallHit],
@@ -474,6 +487,7 @@ def build_snapshot(
     next_s: float,
     mode: str,
     why_limit: int,
+    hint: str | None = None,
 ) -> dict:
     """Payload for Pumpstall web (same keys as DemoScanSnapshot)."""
     ranked = sorted(
@@ -497,6 +511,7 @@ def build_snapshot(
         "blocked": [_blocked_to_dict(r) for r in blocked[:show_n]],
         "block_counts": block_counts,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "hint": hint or format_dca_hint(),
     }
 
 
@@ -539,6 +554,7 @@ def maybe_write_snapshot(
         next_s=float(getattr(args, "interval", 60.0) or 60.0),
         mode=mode,
         why_limit=int(getattr(args, "why", 15) or 0),
+        hint=format_dca_hint(args),
     )
     write_snapshot(path, payload)
 
@@ -586,6 +602,7 @@ def print_hits(
     prev: dict[str, float] | None = None,
     blocked: list[AnalyzeRow] | None = None,
     why_limit: int = 0,
+    hint: str | None = None,
 ) -> dict[str, float]:
     """Render table. Returns symbol→score map for the next refresh diff."""
     if not hits:
@@ -643,11 +660,7 @@ def print_hits(
             if gone:
                 print(f"{DIM}left: {', '.join(gone)}{RESET}")
         print()
-        print(
-        f"{DIM}Hint: dca SYMBOL short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 "
-        f"--post-be trail --post-be-arm-pct 1.3 --post-be-callback 0.45 "
-        f"--min-gap … --so-count …{RESET}"
-    )
+        print(f"{DIM}{hint or format_dca_hint()}{RESET}")
         if why_limit > 0 and blocked is not None:
             print()
             print_blocked(blocked, limit=why_limit)
@@ -996,6 +1009,7 @@ def watch_loop(args: argparse.Namespace) -> int:
                 prev=prev,
                 blocked=blocked,
                 why_limit=why_n,
+                hint=format_dca_hint(args),
             )
             tg_on = bool(getattr(args, "telegram", False))
             _maybe_telegram_notify(
@@ -1209,6 +1223,7 @@ def main(argv: list[str] | None = None) -> int:
         ideal_near=args.ideal_near,
         blocked=blocked,
         why_limit=int(getattr(args, "why", 15) or 0),
+        hint=format_dca_hint(args),
     )
     if getattr(args, "telegram", False):
         _maybe_telegram_notify(
