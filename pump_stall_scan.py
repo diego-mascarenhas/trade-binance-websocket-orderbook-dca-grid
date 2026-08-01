@@ -37,6 +37,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from futures_scan import (
@@ -546,7 +547,7 @@ def build_snapshot(
         "hits": [_hit_to_dict(h) for h in ranked],
         "blocked": [_blocked_to_dict(r) for r in blocked[:show_n]],
         "block_counts": block_counts,
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "hint": hint or format_dca_hint(),
         "stack": stack or stack_params(),
     }
