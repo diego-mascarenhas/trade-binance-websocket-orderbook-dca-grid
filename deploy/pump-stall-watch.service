@@ -9,7 +9,7 @@ User=forge
 # Reads API keys from .env in WorkingDirectory.
 WorkingDirectory=/opt/trade-binance-websocket-orderbook-dca-grid
 EnvironmentFile=-/opt/trade-binance-websocket-orderbook-dca-grid/.env
-# Top 3 ★ · structure TP (EQL) + BE@1% + trail@1.3%/0.45% · loss cooldown 24h · refresh 60s
+# Top 3 ★ · structure TP (EQL) + BE@1% + trail@1.5%/0.6% · loss cooldown 24h · refresh 60s
 # Margin Ratio: soft 5% no new ★ · hard 8% strip DCA / re-arm below
 # Override flags via drop-in if needed (systemctl edit pump-stall-watch).
 ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/pump_stall_scan.py \
@@ -19,8 +19,8 @@ ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/pu
   --max-trades 3 \
   --interval 60 \
   --loss-cooldown-min 1440 \
-  --post-be-arm-pct 1.3 \
-  --post-be-callback 0.45 \
+  --post-be-arm-pct 1.5 \
+  --post-be-callback 0.6 \
   --margin-ratio-soft 5 \
   --margin-ratio-hard 8
 Restart=always

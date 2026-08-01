@@ -3,8 +3,11 @@
 Arms a reduce-only TAKE_PROFIT_MARKET on ``--tp-partial-pct`` of the position
 at entry ± ``--tp1-profit-pct`` (default **0.3%**, gross — fees not added).
 
-Only arms when position notional (qty × entry) ≥ ``--partial-tp-min-notional``
-(default **500** USDT). Smaller positions skip this layer.
+Only arms when position notional (qty × avg entry) reaches a size gate:
+  • default: ``--partial-tp-min-entry-pct`` of the entry base size
+    (default **500%** = 5× entry — typically mid-grid / ~5th DCA fill)
+  • optional absolute override: ``--partial-tp-min-notional`` /
+    ``PARTIAL_TP_MIN_NOTIONAL``
 
 Does **not** cancel BE / post-BE trail algos. On TP1 fill: cancel leftover DCA
 limits so the runner is not re-averaged; BE/structure continue on the remainder.
@@ -27,6 +30,16 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_float_optional(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def partial_tp_enabled(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "partial_tp", True))
 
@@ -46,12 +59,63 @@ def tp1_profit_pct(args: argparse.Namespace) -> float:
     return _env_float("TP1_PROFIT_PCT", 0.3)
 
 
-def partial_tp_min_notional(args: argparse.Namespace) -> float:
-    """Only arm partial TP when |qty×entry| ≥ this USDT (default 500)."""
-    v = getattr(args, "partial_tp_min_notional", None)
+def partial_tp_min_entry_pct(args: argparse.Namespace) -> float:
+    """Position must reach this %% of entry base size (default 500 = 5×)."""
+    v = getattr(args, "partial_tp_min_entry_pct", None)
     if v is not None:
         return float(v)
-    return _env_float("PARTIAL_TP_MIN_NOTIONAL", 500.0)
+    return _env_float("PARTIAL_TP_MIN_ENTRY_PCT", 500.0)
+
+
+def resolve_entry_base_usdt(
+    args: argparse.Namespace,
+    api: str,
+    sec: str,
+    recv: int,
+) -> float:
+    """Entry base size in USDT (BASE_SIZE or WALLET_PCT × wallet)."""
+    base = float(getattr(args, "base_size", 0) or 0)
+    if base > 0:
+        return base
+    try:
+        import orderbook_dca_grid as grid
+
+        bal = grid.get_wallet_balance(api, sec, recv)
+        pct = float(getattr(args, "wallet_pct", None) or _env_float("WALLET_PCT", 10.0))
+        if bal > 0 and pct > 0:
+            return bal * pct / 100.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def partial_tp_threshold(
+    args: argparse.Namespace,
+    *,
+    api: str,
+    sec: str,
+    recv: int,
+) -> tuple[float, str]:
+    """Return (min_notional_usdt, human label) for the arm gate.
+
+    Absolute ``--partial-tp-min-notional`` / ``PARTIAL_TP_MIN_NOTIONAL`` wins when set.
+    Otherwise: entry_base × ``partial_tp_min_entry_pct`` / 100.
+    """
+    abs_v = getattr(args, "partial_tp_min_notional", None)
+    if abs_v is None:
+        abs_v = _env_float_optional("PARTIAL_TP_MIN_NOTIONAL")
+    if abs_v is not None:
+        thr = float(abs_v)
+        return thr, f"{thr:g} USDT (absolute)"
+
+    pct = partial_tp_min_entry_pct(args)
+    base = resolve_entry_base_usdt(args, api, sec, recv)
+    if base <= 0 or pct <= 0:
+        # No reliable entry size — refuse to arm rather than use a stale fixed floor
+        return float("inf"), "unresolved entry base"
+
+    thr = base * (pct / 100.0)
+    return thr, f"{pct:g}% of entry {base:,.2f} USDT (= {thr:,.2f})"
 
 
 def run_once(
@@ -77,7 +141,9 @@ def run_once(
     dry = bool(getattr(args, "dry_run", False))
     partial = tp_partial_pct(args)
     profit_pct = tp1_profit_pct(args)
-    min_notional = partial_tp_min_notional(args)
+    min_notional, thr_label = partial_tp_threshold(
+        args, api=api, sec=sec, recv=recv,
+    )
     if partial <= 0 or partial >= 100 or profit_pct <= 0:
         return
 
@@ -85,7 +151,7 @@ def run_once(
     if notional < min_notional:
         print(
             f"{grid.DIM}Partial TP skip · notional {notional:,.0f} USDT "
-            f"< {min_notional:g} (need larger position){grid.RESET}"
+            f"< {thr_label}{grid.RESET}"
         )
         return
 
@@ -196,7 +262,7 @@ def run_once(
 
     print(
         f"{close_side} TAKE_PROFIT_MARKET {tp1_str} ({partial:g}%) @ {tp1_trig} "
-        f"(+{profit_pct:g}% gross · notional {notional:,.0f} USDT ≥ {min_notional:g})"
+        f"(+{profit_pct:g}% gross · notional {notional:,.0f} USDT ≥ {thr_label})"
     )
     if dry:
         return
@@ -229,7 +295,7 @@ def run_once(
 
     print(
         f"{grid.GREEN}✓ Partial TP algoId={resp.get('algoId')} "
-        f"(+{profit_pct:g}% / {partial:g}% · ≥{min_notional:g} USDT){grid.RESET}"
+        f"(+{profit_pct:g}% / {partial:g}% · ≥ {thr_label}){grid.RESET}"
     )
     algo_ids = dict(state.get("algo_ids") or {})
     algo_ids["tp1"] = resp.get("algoId")

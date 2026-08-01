@@ -11,7 +11,7 @@
 Display-only by default. With --watch --auto-trade: run the top
 `--max-trades` ★ from this list (default 3) via
 `dca SYMBOL short --exit structure` (TP=EQL) + BE protect (arm 1% → lock 0.3%)
-+ post-BE trail (arm 1.3% → callback 0.45%).
++ post-BE trail (arm 1.5% → callback 0.6%).
 Other open pairs on the account do not consume these slots.
 Account Margin Ratio (Binance UI): ≥ soft (default 5%) → no new ★;
 ≥ hard (default 8%) → cancel DCA limits (keep exits); below hard → re-arm DCA.
@@ -23,7 +23,7 @@ Account Margin Ratio (Binance UI): ≥ soft (default 5%) → no new ★;
 Profiles (wrappers; defaults of ./pump-stall-watch stay strict):
   ./pump-stall-watch          # stall≥35 · near≥85 · ★≥92
   ./pump-stall-watch-early    # TEST: stall≥25 · near≥82 · ★≥90
-                              # + auto-trade · BE + trail@1.3%/0.45%
+                              # + auto-trade · BE + trail@1.5%/0.6%
   ./pump-stall-early          # one-shot scan with the early profile
 """
 
@@ -463,16 +463,51 @@ def _blocked_to_dict(r: AnalyzeRow) -> dict:
     }
 
 
+def stack_params(args: argparse.Namespace | None = None) -> dict:
+    """Live exit/stack knobs for Pumpstall web (help + scanner)."""
+    def g(name: str, default):
+        if args is None:
+            return default
+        v = getattr(args, name, default)
+        return default if v is None else v
+
+    be_arm = 1.0
+    be_profit = 0.3
+    tp_partial = 70.0
+    tp1_profit = 0.3
+    partial_entry_pct = 500.0
+    post_arm = float(g("post_be_arm_pct", 1.5) or 1.5)
+    post_cb = float(g("post_be_callback", 0.6) or 0.6)
+    try:
+        wallet_pct = float(os.getenv("WALLET_PCT", "10") or 10)
+    except (TypeError, ValueError):
+        wallet_pct = 10.0
+    return {
+        "be_arm_pct": be_arm,
+        "be_profit_pct": be_profit,
+        "post_be_arm_pct": post_arm,
+        "post_be_callback": post_cb,
+        "tp_partial_pct": tp_partial,
+        "tp1_profit_pct": tp1_profit,
+        "partial_tp_min_entry_pct": partial_entry_pct,
+        "loss_cooldown_min": float(g("loss_cooldown_min", 1440.0) or 1440.0),
+        "margin_ratio_soft": float(g("margin_ratio_soft", 5.0) or 5.0),
+        "margin_ratio_hard": float(g("margin_ratio_hard", 8.0) or 8.0),
+        "wallet_pct": wallet_pct,
+        "min_gap": float(g("min_gap", 0.8) or 0.8),
+        "so_count": int(g("so_count", 8) or 8),
+    }
+
+
 def format_dca_hint(args: argparse.Namespace | None = None) -> str:
     """Display hint with the flags this watch would pass to `dca`."""
-    arm = float(getattr(args, "post_be_arm_pct", 1.3) or 1.3) if args else 1.3
-    cb = float(getattr(args, "post_be_callback", 0.45) or 0.45) if args else 0.45
-    gap = float(getattr(args, "min_gap", 0.8) or 0.8) if args else 0.8
-    so = int(getattr(args, "so_count", 8) or 8) if args else 8
+    s = stack_params(args)
     return (
-        "Hint: dca SYMBOL short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 "
-        f"--post-be trail --post-be-arm-pct {arm:g} --post-be-callback {cb:g} "
-        f"--min-gap {gap:g} --so-count {so}"
+        "Hint: dca SYMBOL short --exit structure "
+        f"--be-arm-pct {s['be_arm_pct']:g} --be-profit-pct {s['be_profit_pct']:g} "
+        f"--post-be trail --post-be-arm-pct {s['post_be_arm_pct']:g} "
+        f"--post-be-callback {s['post_be_callback']:g} "
+        f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
     )
 
 
@@ -488,6 +523,7 @@ def build_snapshot(
     mode: str,
     why_limit: int,
     hint: str | None = None,
+    stack: dict | None = None,
 ) -> dict:
     """Payload for Pumpstall web (same keys as DemoScanSnapshot)."""
     ranked = sorted(
@@ -512,6 +548,7 @@ def build_snapshot(
         "block_counts": block_counts,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "hint": hint or format_dca_hint(),
+        "stack": stack or stack_params(),
     }
 
 
@@ -555,6 +592,7 @@ def maybe_write_snapshot(
         mode=mode,
         why_limit=int(getattr(args, "why", 15) or 0),
         hint=format_dca_hint(args),
+        stack=stack_params(args),
     )
     write_snapshot(path, payload)
 
@@ -838,10 +876,10 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         "--partial-tp",
         "--tp-partial-pct", "70",
         "--tp1-profit-pct", "0.3",
-        "--partial-tp-min-notional", "500",
+        "--partial-tp-min-entry-pct", "500",
         "--post-be", "trail",
-        "--post-be-arm-pct", str(getattr(args, "post_be_arm_pct", 1.3) or 1.3),
-        "--post-be-callback", str(getattr(args, "post_be_callback", 0.45) or 0.45),
+        "--post-be-arm-pct", str(getattr(args, "post_be_arm_pct", 1.5) or 1.5),
+        "--post-be-callback", str(getattr(args, "post_be_callback", 0.6) or 0.6),
         "--once",
         "--loss-cooldown-min", str(getattr(args, "loss_cooldown_min", 1440)),
         "--margin-ratio-soft", str(getattr(args, "margin_ratio_soft", 5.0)),
@@ -871,7 +909,7 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         print(
             f"{BOLD}{GREEN}AUTO ★ {hit.symbol}{RESET}  "
             f"{DIM}pid={proc.pid} · dca short --exit structure "
-            f"+ TP70%@+0.3%(≥500U) + BE@1%→0.3% + trail@1.3%/0.45% --once · "
+            f"+ TP70%@+0.3%(≥500% entry) + BE@1%→0.3% + trail@1.5%/0.6% --once · "
             f"log {log_path}{RESET}"
         )
         return proc
@@ -1065,7 +1103,7 @@ Examples:
 Auto-trade launches per ★:
   dca SYMBOL short --exit structure --protect-be \\
     --be-arm-pct 1 --be-profit-pct 0.3 \\
-    --post-be trail --post-be-arm-pct 1.3 --post-be-callback 0.45 --once
+    --post-be trail --post-be-arm-pct 1.5 --post-be-callback 0.6 --once
 
   TP = EQL (short) / EQH (long).
   BE protect arms at +1% → SL @ entry+0.3%; trail from +2% (cb 0.8%).
@@ -1151,14 +1189,14 @@ Production (VPS):
     p.add_argument(
         "--post-be-arm-pct",
         type=float,
-        default=1.3,
-        help="With --auto-trade: arm post-BE trail at this profit %% (default 1.3)",
+        default=1.5,
+        help="With --auto-trade: arm post-BE trail at this profit %% (default 1.5)",
     )
     p.add_argument(
         "--post-be-callback",
         type=float,
-        default=0.45,
-        help="With --auto-trade: post-BE trailing callbackRate %% (default 0.45)",
+        default=0.6,
+        help="With --auto-trade: post-BE trailing callbackRate %% (default 0.6)",
     )
     p.add_argument(
         "--margin-ratio-soft",

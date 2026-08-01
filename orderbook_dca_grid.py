@@ -2032,15 +2032,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--partial-tp",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="[--exit structure] Arm TAKE_PROFIT on --tp-partial-pct when notional "
-             "≥ --partial-tp-min-notional (default on). Use --no-partial-tp to disable",
+        help="[--exit structure] Arm TAKE_PROFIT on --tp-partial-pct when position "
+             "notional ≥ --partial-tp-min-entry-pct of entry (default on). "
+             "Use --no-partial-tp to disable",
+    )
+    p.add_argument(
+        "--partial-tp-min-entry-pct",
+        type=float,
+        default=None,
+        help="[--exit structure] Arm partial TP when position notional ≥ this %% of "
+             "entry base size (default 500 = 5× entry, ~mid-grid). "
+             "Env: PARTIAL_TP_MIN_ENTRY_PCT",
     )
     p.add_argument(
         "--partial-tp-min-notional",
         type=float,
         default=None,
-        help="[--exit structure] Min position notional USDT to arm partial TP "
-             "(default 500). Env: PARTIAL_TP_MIN_NOTIONAL",
+        help="[--exit structure] Absolute USDT floor override for partial TP "
+             "(if set, ignores --partial-tp-min-entry-pct). "
+             "Env: PARTIAL_TP_MIN_NOTIONAL",
     )
     p.add_argument(
         "--protect-be",
@@ -2068,13 +2078,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="[--post-be trail] Arm trailing when unrealized profit %% ≥ this "
-             "(default 1.3). Env: POST_BE_ARM_PCT",
+             "(default 1.5). Env: POST_BE_ARM_PCT",
     )
     p.add_argument(
         "--post-be-callback",
         type=float,
         default=None,
-        help="[--post-be trail] TRAILING_STOP callbackRate %% (default 0.45). "
+        help="[--post-be trail] TRAILING_STOP callbackRate %% (default 0.6). "
              "Env: POST_BE_CALLBACK",
     )
     p.add_argument("--tp-partial-pct", type=float, default=None,
