@@ -523,17 +523,11 @@ def format_daily_summary(*, as_of: date | None = None) -> str:
     week_pct = _wallet_roi_pct(week_net, week_base)
     month_pct = _wallet_roi_pct(month_net, month_base)
 
-    def line(label: str, pct: float | None, net: float, n: int) -> str:
+    def line(label: str, pct: float | None, n: int) -> str:
         closes = f"{n} close{'s' if n != 1 else ''}"
         if pct is None:
-            return (
-                f"{label:<5} · <b>{net:+.2f} USDT</b>  "
-                f"<i>({closes})</i>"
-            )
-        return (
-            f"{label:<5} · <b>{pct:+.2f}%</b>  "
-            f"<i>({net:+.2f} USDT · {closes})</i>"
-        )
+            return f"{label:<5} · <i>n/a</i>  <i>({closes})</i>"
+        return f"{label:<5} · <b>{pct:+.2f}%</b>  <i>({closes})</i>"
 
     title = yesterday.strftime("%d %b %Y")
     foot = (
@@ -545,9 +539,9 @@ def format_daily_summary(*, as_of: date | None = None) -> str:
     return (
         f"📊 <b>#REPORT</b> · {_html_escape(title)}\n"
         f"\n"
-        f"{line('Day', day_pct, day_net, day_n)}\n"
-        f"{line('Week', week_pct, week_net, week_n)}\n"
-        f"{line('Month', month_pct, month_net, month_n)}"
+        f"{line('Day', day_pct, day_n)}\n"
+        f"{line('Week', week_pct, week_n)}\n"
+        f"{line('Month', month_pct, month_n)}"
         f"{foot}"
     )
 
