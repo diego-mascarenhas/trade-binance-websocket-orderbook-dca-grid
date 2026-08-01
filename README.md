@@ -271,6 +271,7 @@ python3 pump_stall_scan.py --help
 5. `--once` = one cycle then exit (no re-arm)  
 6. When a slot frees, rescans and may take the next best ★  
 7. Losing close → **`--loss-cooldown-min`** (default **1440 = 24h**) on that symbol (`.state/loss_cooldown.json`)
+8. Weekend block (default **on**): no new ★ from **Fri 21:00 UTC → Sun 23:00 UTC** (`PUMPSTALL_WEEKEND_BLOCK=0` to disable). Open positions are left alone.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -283,6 +284,7 @@ python3 pump_stall_scan.py --help
 | `--post-be-arm-pct` | `1.5` | Arm post-BE trail at this profit % |
 | `--post-be-callback` | `0.6` | Trailing `callbackRate` % |
 | `--why [N]` | off | Show top N blocked seeds by failing filter |
+| `PUMPSTALL_WEEKEND_BLOCK` | `1` | Env: block new ★ Fri 21:00→Sun 23:00 UTC |
 
 Trade logs: `logs/pump-stall-SYMBOL.log`. Stop one child: `dca SYMBOL stop`.
 

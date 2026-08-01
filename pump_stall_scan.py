@@ -859,6 +859,26 @@ def _reap_active(
     return alive
 
 
+def _weekend_block_active() -> bool:
+    """True during Fri 21:00 UTC → Sun 23:00 UTC (no new ★).
+
+    Override with PUMPSTALL_WEEKEND_BLOCK=0 to disable (default: on).
+    """
+    flag = (os.getenv("PUMPSTALL_WEEKEND_BLOCK", "1") or "1").strip().lower()
+    if flag in ("0", "false", "off", "no"):
+        return False
+    now = datetime.now(timezone.utc)
+    wd = now.weekday()  # Mon=0 … Sun=6
+    hm = (now.hour, now.minute)
+    if wd == 4 and hm >= (21, 0):  # Friday after 21:00 UTC
+        return True
+    if wd == 5:  # Saturday
+        return True
+    if wd == 6 and hm < (23, 0):  # Sunday before 23:00 UTC
+        return True
+    return False
+
+
 def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.Popen | None:
     """Start `dca SYMBOL short --exit structure` (EQL TP + BE protect) --once."""
     root = _repo_root()
@@ -932,6 +952,13 @@ def _maybe_auto_trade(
     """
     active = _reap_active(active)
     max_trades = max(1, int(getattr(args, "max_trades", 3) or 3))
+
+    if _weekend_block_active():
+        print(
+            f"{YELLOW}AUTO: weekend block Fri 21:00→Sun 23:00 UTC "
+            f"— no new ★{RESET}"
+        )
+        return active
 
     import loss_cooldown as lcd
     from orderbook_dca_grid import get_margin_ratio_pct, load_keys
