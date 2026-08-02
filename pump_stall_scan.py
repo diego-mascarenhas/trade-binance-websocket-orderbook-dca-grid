@@ -9,9 +9,10 @@
   5. Enough ask-side order-book walls for a SHORT DCA grid
 
 Display-only by default. With --watch --auto-trade: run the top
-`--max-trades` ★ from this list (default 3) via
-`dca SYMBOL short --exit structure` (TP=EQL) + BE protect (arm 1% → lock 0.3%)
-+ post-BE trail (arm 1.5% → callback 0.6%).
+`--max-trades` ★ from this list (default 3) via `dca SYMBOL short --once`.
+Primary exit via `--trade-exit structure|ob|trailing`; BE is optional
+via `--protect-be` / `--no-protect-be` (orthogonal).
+Early profile: `--trade-exit ob --protect-be`.
 Other open pairs on the account do not consume these slots.
 Account Margin Ratio (Binance UI): ≥ soft (default 5%) → no new ★;
 ≥ hard (default 8%) → cancel DCA limits (keep exits); below hard → re-arm DCA.
@@ -483,7 +484,18 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         wallet_pct = float(os.getenv("WALLET_PCT", "10") or 10)
     except (TypeError, ValueError):
         wallet_pct = 10.0
+    try:
+        imb_long = float(g("imb_long", 0.55) or 0.55)
+    except (TypeError, ValueError):
+        imb_long = 0.55
+    trade_exit = "structure"
+    protect_be = True
+    if args is not None:
+        trade_exit = _trade_exit_mode(args)
+        protect_be = _protect_be_for_trade(args)
     return {
+        "trade_exit": trade_exit,
+        "protect_be": protect_be,
         "be_arm_pct": be_arm,
         "be_profit_pct": be_profit,
         "post_be_arm_pct": post_arm,
@@ -491,6 +503,7 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "tp_partial_pct": tp_partial,
         "tp1_profit_pct": tp1_profit,
         "partial_tp_min_entry_pct": partial_entry_pct,
+        "imb_long": imb_long,
         "loss_cooldown_min": float(g("loss_cooldown_min", 1440.0) or 1440.0),
         "margin_ratio_soft": float(g("margin_ratio_soft", 5.0) or 5.0),
         "margin_ratio_hard": float(g("margin_ratio_hard", 8.0) or 8.0),
@@ -503,9 +516,21 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
 def format_dca_hint(args: argparse.Namespace | None = None) -> str:
     """Display hint with the flags this watch would pass to `dca`."""
     s = stack_params(args)
+    exit_mode = s.get("trade_exit", "structure")
+    be = " --protect-be" if s.get("protect_be", True) else " --no-protect-be"
+    if exit_mode == "ob":
+        return (
+            f"Hint: dca SYMBOL short --exit ob{be} "
+            f"--imb-long {s['imb_long']:g} "
+            f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
+        )
+    if exit_mode == "trailing":
+        return (
+            f"Hint: dca SYMBOL short --exit trailing{be} "
+            f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
+        )
     return (
-        "Hint: dca SYMBOL short --exit structure "
-        f"--be-arm-pct {s['be_arm_pct']:g} --be-profit-pct {s['be_profit_pct']:g} "
+        f"Hint: dca SYMBOL short --exit structure{be} "
         f"--post-be trail --post-be-arm-pct {s['post_be_arm_pct']:g} "
         f"--post-be-callback {s['post_be_callback']:g} "
         f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
@@ -879,28 +904,38 @@ def _weekend_block_active() -> bool:
     return False
 
 
+def _trade_exit_mode(args: argparse.Namespace) -> str:
+    """Primary exit for auto-trade children: structure | ob | trailing."""
+    raw = str(getattr(args, "trade_exit", None) or "structure").strip().lower()
+    if raw in ("be-ob", "be_ob", "beob", "ob-long", "ob_long", "oblong", "ob"):
+        return "ob"
+    if raw in ("trailing", "trail"):
+        return "trailing"
+    if raw in ("eql", "eq", "structure"):
+        return "structure"
+    return "structure"
+
+
+def _protect_be_for_trade(args: argparse.Namespace) -> bool:
+    """Whether child dca gets --protect-be (default on)."""
+    return bool(getattr(args, "protect_be", True))
+
+
 def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.Popen | None:
-    """Start `dca SYMBOL short --exit structure` (EQL TP + BE protect) --once."""
+    """Start `dca SYMBOL short` with the configured trade exit --once."""
     root = _repo_root()
     dca_bin = os.path.join(root, "dca")
     log_dir = os.path.join(root, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, f"pump-stall-{hit.symbol}.log")
+    exit_mode = _trade_exit_mode(args)
+    use_be = _protect_be_for_trade(args)
     cmd = [
         dca_bin,
         hit.symbol,
         "short",
-        "--exit", "structure",
-        "--protect-be",
-        "--be-arm-pct", "1",
-        "--be-profit-pct", "0.3",
-        "--partial-tp",
-        "--tp-partial-pct", "70",
-        "--tp1-profit-pct", "0.3",
-        "--partial-tp-min-entry-pct", "500",
-        "--post-be", "trail",
-        "--post-be-arm-pct", str(getattr(args, "post_be_arm_pct", 1.5) or 1.5),
-        "--post-be-callback", str(getattr(args, "post_be_callback", 0.6) or 0.6),
+        "--exit", exit_mode,
+        "--protect-be" if use_be else "--no-protect-be",
         "--once",
         "--loss-cooldown-min", str(getattr(args, "loss_cooldown_min", 1440)),
         "--margin-ratio-soft", str(getattr(args, "margin_ratio_soft", 5.0)),
@@ -911,13 +946,55 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         "--max-range", str(args.max_range),
         "--limit", str(args.limit),
     ]
-    if getattr(args, "structure_interval", None):
-        cmd.extend(["--structure-interval", str(args.structure_interval)])
+    if use_be:
+        cmd.extend(["--be-arm-pct", "1", "--be-profit-pct", "0.3"])
+    be_note = " + BE@1%→0.3%" if use_be else ""
+    if exit_mode == "structure":
+        cmd.extend([
+            "--partial-tp",
+            "--tp-partial-pct", "70",
+            "--tp1-profit-pct", "0.3",
+            "--partial-tp-min-entry-pct", "500",
+        ])
+        # post-BE trail only when BE is on and caller asked for it
+        if use_be and float(getattr(args, "post_be_arm_pct", 0) or 0) > 0:
+            cmd.extend([
+                "--post-be", "trail",
+                "--post-be-arm-pct", str(getattr(args, "post_be_arm_pct", 1.5) or 1.5),
+                "--post-be-callback", str(getattr(args, "post_be_callback", 0.6) or 0.6),
+            ])
+            trail_note = (
+                f" + post-BE trail@"
+                f"{float(getattr(args, 'post_be_arm_pct', 1.5) or 1.5):g}%/"
+                f"{float(getattr(args, 'post_be_callback', 0.6) or 0.6):g}%"
+            )
+        else:
+            trail_note = ""
+        if getattr(args, "structure_interval", None):
+            cmd.extend(["--structure-interval", str(args.structure_interval)])
+        launch_note = (
+            f"dca short --exit structure{be_note}{trail_note} "
+            f"+ TP70%@+0.3%(≥500% entry) --once"
+        )
+    elif exit_mode == "trailing":
+        launch_note = f"dca short --exit trailing{be_note} --once"
+    else:
+        imb = getattr(args, "imb_long", None)
+        if imb is not None:
+            cmd.extend(["--imb-long", str(imb)])
+        band = getattr(args, "ob_band_pct", None)
+        if band is not None:
+            cmd.extend(["--ob-band-pct", str(band)])
+        launch_note = (
+            f"dca short --exit ob{be_note} · OB Long "
+            f"(imb≥{float(imb if imb is not None else 0.55):g}) --once"
+        )
     try:
         log_f = open(log_path, "a", encoding="utf-8")
         log_f.write(
             f"\n--- launch {time.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"score={hit.score:.1f} near={hit.near_high_pct:.0f}% ---\n"
+            f"score={hit.score:.1f} near={hit.near_high_pct:.0f}% "
+            f"exit={exit_mode} ---\n"
         )
         log_f.flush()
         proc = subprocess.Popen(
@@ -929,9 +1006,7 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         )
         print(
             f"{BOLD}{GREEN}AUTO ★ {hit.symbol}{RESET}  "
-            f"{DIM}pid={proc.pid} · dca short --exit structure "
-            f"+ TP70%@+0.3%(≥500% entry) + BE@1%→0.3% + trail@1.5%/0.6% --once · "
-            f"log {log_path}{RESET}"
+            f"{DIM}pid={proc.pid} · {launch_note} · log {log_path}{RESET}"
         )
         return proc
     except Exception as exc:  # noqa: BLE001
@@ -1192,8 +1267,33 @@ Production (VPS):
         "--auto-trade",
         action="store_true",
         help="With --watch: run the top ★ from this list via "
-             "`dca SYMBOL short --exit structure` + BE protect --once "
-             "(up to --max-trades)",
+             "`dca SYMBOL short` + --trade-exit --once (up to --max-trades)",
+    )
+    p.add_argument(
+        "--trade-exit",
+        choices=["structure", "ob", "trailing"],
+        default="structure",
+        help="Primary exit for auto-trade children: structure (EQL) | ob (OB Long) "
+             "| trailing. BE is separate (--protect-be). Default: structure",
+    )
+    p.add_argument(
+        "--protect-be",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pass --protect-be to dca children (default on). "
+             "Use --no-protect-be for exit-only (no BE SL)",
+    )
+    p.add_argument(
+        "--imb-long",
+        type=float,
+        default=None,
+        help="With --trade-exit ob: OB Long imbalance threshold (default 0.55)",
+    )
+    p.add_argument(
+        "--ob-band-pct",
+        type=float,
+        default=None,
+        help="With --trade-exit ob: depth band %% for imbalance (default 1.0)",
     )
     p.add_argument(
         "--max-trades",

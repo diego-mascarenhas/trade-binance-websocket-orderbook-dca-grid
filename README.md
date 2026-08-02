@@ -246,7 +246,7 @@ Finds 1D blow-off → stall shorts with enough **ask** walls for a SHORT DCA gri
 | One-shot table | `./pump-stall` | No |
 | Live table | `./pump-stall-watch` | No |
 | Auto-trade (strict) | `./pump-stall-watch --auto-trade` | **Yes** |
-| Early profile (TEST) | `./pump-stall-watch-early` | **Yes** (looser filters + auto-trade) |
+| Early profile (prod) | `./pump-stall-watch-early` | **Yes** (looser filters + `--trade-exit ob --protect-be`) |
 | Early one-shot | `./pump-stall-early` | No |
 
 ```bash
@@ -273,10 +273,14 @@ python3 pump_stall_scan.py --help
 7. Losing close → **`--loss-cooldown-min`** (default **1440 = 24h**) on that symbol (`.state/loss_cooldown.json`)
 8. Weekend block (default **on**): no new ★ from **Fri 21:00 UTC → Sun 23:00 UTC** (`PUMPSTALL_WEEKEND_BLOCK=0` to disable). Open positions are left alone.
 
+**Exit composition (independent):** `--trade-exit structure|ob|trailing` picks the close method; `--protect-be` / `--no-protect-be` adds or skips BE. Early default: `ob` + BE.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--watch` | off | Refresh table live |
 | `--auto-trade` | off | Launch trades (requires `--watch`) |
+| `--trade-exit` | `structure` | Primary exit: `structure` (EQL) · `ob` · `trailing` |
+| `--protect-be` | on | Optional BE SL addon (`--no-protect-be` to skip) |
 | `--max-trades` | `3` | How many top ★ to run |
 | `--interval` | `60` | Refresh seconds (min 15) |
 | `--ideal-near` | `92` | near% ≥ this → ★ (early profile: 90) |

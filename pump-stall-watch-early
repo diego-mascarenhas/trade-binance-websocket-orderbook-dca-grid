@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# Early-stall TEST profile — does not change default ./pump-stall-watch.
+# Early-stall profile — production default (looser entry filters).
 #
 # Looser entry so blow-offs near the 1D top can appear / trade sooner:
 #   stall ≥ 25 (default 35) · near ≥ 82 (default 85) · ★ near ≥ 90 (default 92)
 #
-# Default exit stack on auto-trade ★:
-#   structure (EQL) + BE@1%→0.3% + post-BE trail@1.5%/callback 0.6%
+# Exit composition on auto-trade ★ (independent knobs):
+#   --trade-exit ob     → soft-close on OB Long
+#   --protect-be        → BE@1%→0.3% (omit / pass --no-protect-be to skip)
 #
 # Usage:
 #   ./pump-stall-watch-early
-#   ./pump-stall-watch-early --max-trades 2
-#   ./pump-stall-watch-early --why 30
+#   ./pump-stall-watch-early --no-protect-be
+#   ./pump-stall-watch-early --trade-exit structure --post-be-arm-pct 1.5
 #
-# Extra flags after the preset still work (later flags win in argparse).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec python3 "$ROOT/pump_stall_scan.py" --watch \
   --auto-trade \
   --telegram \
+  --trade-exit ob \
+  --protect-be \
   --max-trades 3 \
   --interval 60 \
   --loss-cooldown-min 1440 \
-  --post-be-arm-pct 1.5 \
-  --post-be-callback 0.6 \
   --min-stall 25 \
   --min-near-high 82 \
   --ideal-near 90 \

@@ -11,17 +11,17 @@ Type=simple
 User=forge
 WorkingDirectory=/opt/trade-binance-websocket-orderbook-dca-grid
 EnvironmentFile=-/opt/trade-binance-websocket-orderbook-dca-grid/.env
-# ★ · structure TP (EQL) + BE@1% + trail@1.5%/0.6% · early stall thresholds
+# ★ · --trade-exit ob + --protect-be (independent) · early stall thresholds
 # Margin Ratio (Binance UI): soft 5% no new ★ · hard 8% strip DCA / re-arm below
 ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/pump_stall_scan.py \
   --watch \
   --auto-trade \
   --telegram \
+  --trade-exit ob \
+  --protect-be \
   --max-trades 3 \
   --interval 60 \
   --loss-cooldown-min 1440 \
-  --post-be-arm-pct 1.5 \
-  --post-be-callback 0.6 \
   --margin-ratio-soft 5 \
   --margin-ratio-hard 8 \
   --min-stall 25 \

@@ -1424,6 +1424,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
     from exits import (
+        EXIT_OB,
         EXIT_STAGED,
         EXIT_STRUCTURE,
         clear_exit_presets,
@@ -1627,6 +1628,9 @@ def supervise_loop(args: argparse.Namespace) -> None:
                         close_reason = None
                         if exit_mode == EXIT_STRUCTURE:
                             close_reason = pop_close_reason(sym)
+                        elif exit_mode == EXIT_OB:
+                            from exits.ob_long import pop_close_reason as pop_ob_reason
+                            close_reason = pop_ob_reason(sym)
                         elif after_runner:
                             close_reason = "runner / trail"
                         close_pnl = float(last_pos_meta.get("unrealized_pnl", 0) or 0)
@@ -1658,6 +1662,9 @@ def supervise_loop(args: argparse.Namespace) -> None:
                     elif exit_mode == EXIT_STRUCTURE:
                         # Drop stale reason if we somehow flattened without notifying.
                         pop_close_reason(sym)
+                    elif exit_mode == EXIT_OB:
+                        from exits.ob_long import pop_close_reason as pop_ob_reason
+                        pop_ob_reason(sym)
                     last_position_qty = 0.0
                     last_direction = None
                     last_pos_meta = {}
@@ -2018,10 +2025,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Exit strategy (plugins in exits/ — default staged TP1 + trail)
     p.add_argument(
         "--exit", dest="exit_mode",
-        choices=["trailing", "staged", "structure", "be", "none"],
+        choices=["trailing", "staged", "structure", "be", "ob", "none"],
         default=None,
-        help="Exit strategy: trailing | staged | structure (TP=EQH/EQL; BE protect on by default) "
-             "| be (protect only, no TP) | none (default: staged; EXIT_MODE env)",
+        help="Primary exit: trailing | staged | structure (EQL/EQH) | ob (OB flip close) "
+             "| be (BE only) | none. BE is separate via --protect-be / --no-protect-be. "
+             "Default: staged (EXIT_MODE env)",
     )
     p.add_argument("--no-tp", action="store_true",
                    help="Legacy alias for --exit none (skip automatic exit management)")
@@ -2056,22 +2064,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--protect-be",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="[--exit structure] Also arm BE protect SL (default on). "
-             "Use --no-protect-be for structure TP only",
+        help="Optional BE protect SL addon for --exit structure|ob|trailing "
+             "(default on). Use --no-protect-be to wait only for the primary exit",
     )
     p.add_argument("--be-arm-pct", type=float, default=None,
-                   help="[--exit structure|be] Arm BE SL when unrealized profit %% ≥ this "
+                   help="[--protect-be] Arm BE SL when unrealized profit %% ≥ this "
                         "(default 1.0). Env: BE_ARM_PCT")
     p.add_argument("--be-profit-pct", type=float, default=None,
-                   help="[--exit structure|be|staged] SL profit lock %% from entry "
-                        "(structure/be default 0.3, staged default 0.1; no fee buffer). "
+                   help="[--protect-be / --exit staged] SL profit lock %% from entry "
+                        "(protect-be default 0.3, staged default 0.1; no fee buffer). "
                         "Env: BE_PROFIT_PCT")
     p.add_argument(
         "--post-be",
         choices=["none", "trail"],
         default=None,
-        help="[--exit structure|be] After BE is armed: none (default) or trail "
-             "(arm trailing at --post-be-arm-pct). Env: POST_BE",
+        help="[--protect-be with --exit structure|be] After BE: none (default) or trail. "
+             "For trail-as-primary-exit use --exit trailing. Env: POST_BE",
+    )
+    p.add_argument(
+        "--imb-long",
+        type=float,
+        default=None,
+        help="[--exit ob] OB Long imbalance threshold 0..1 (default 0.55). Env: IMB_LONG",
+    )
+    p.add_argument(
+        "--imb-short",
+        type=float,
+        default=None,
+        help="[--exit ob] OB Short imbalance threshold 0..1 (default 0.45). Env: IMB_SHORT",
+    )
+    p.add_argument(
+        "--ob-band-pct",
+        type=float,
+        default=None,
+        help="[--exit ob] Depth band %% around mid for imbalance (default 1.0). "
+             "Env: OB_BAND_PCT",
     )
     p.add_argument(
         "--post-be-arm-pct",
