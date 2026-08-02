@@ -237,8 +237,14 @@ def pnl_suffix(
 
 
 def _close_emoji(pnl_usdt: float | None = None) -> str:
-    """Always 🥳 for #CLOSE (same as send_tp / other bots in this repo)."""
-    return "🥳"
+    """#CLOSE: 🥳 win · 😢 loss · 🤖 flat/unknown."""
+    if pnl_usdt is None:
+        return "🤖"
+    if float(pnl_usdt) < 0:
+        return "😢"
+    if float(pnl_usdt) > 0:
+        return "🥳"
+    return "🤖"
 
 
 def _sl_emoji(pnl_usdt: float | None) -> str:

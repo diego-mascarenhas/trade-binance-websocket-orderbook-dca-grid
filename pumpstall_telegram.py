@@ -252,6 +252,15 @@ def format_open_signal(
     )
 
 
+def _close_emoji(pnl_pct: float) -> str:
+    """🥳 win · 😢 loss · 🤖 flat."""
+    if pnl_pct < 0:
+        return "😢"
+    if pnl_pct > 0:
+        return "🥳"
+    return "🤖"
+
+
 def format_close_signal(
     *,
     symbol: str,
@@ -264,8 +273,9 @@ def format_close_signal(
     reason_line = ""
     if reason and str(reason).strip():
         reason_line = f"\n{_html_escape(str(reason).strip())}"
+    emoji = _close_emoji(float(pnl_pct))
     return (
-        f"🥳 <b>#CLOSE {side}</b> · <b>{sym}</b>\n"
+        f"{emoji} <b>#CLOSE {side}</b> · <b>{sym}</b>\n"
         f"PnL · <b>{pnl_pct:+.2f}%</b>"
         f"{reason_line}"
     )
