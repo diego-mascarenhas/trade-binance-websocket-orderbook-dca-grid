@@ -2101,6 +2101,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "Env: OB_BAND_PCT",
     )
     p.add_argument(
+        "--ob-min-profit-pct",
+        type=float,
+        default=None,
+        help="[--exit ob] Min gross profit %% before OB-flip close (default 0.3). "
+             "Also requires net>0 after --tp-fee-buffer. Env: OB_MIN_PROFIT_PCT",
+    )
+    p.add_argument(
         "--post-be-arm-pct",
         type=float,
         default=None,

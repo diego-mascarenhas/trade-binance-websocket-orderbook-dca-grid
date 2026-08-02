@@ -6,6 +6,9 @@ LONG  → close on OB Short (imbalance ≤ imb_short)
 Independent of BE — use ``--protect-be`` separately if you also want a BE SL.
 Uses a single depth snapshot per supervise poll (same imbalance metric as scalp).
 No exchange TAKE_PROFIT — market-closes like structure TP.
+
+Profit gate (default): gross ≥ ``--ob-min-profit-pct`` (0.3%) and estimated
+net after ``--tp-fee-buffer`` (0.12%) stays green — same idea as structure TP.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ import time
 from decimal import Decimal
 
 from ob_bars import OBBar, _book_metrics, depth_to_levels
-from ob_signals import SignalConfig, exit_on_flip, profit_pct
+from ob_signals import SignalConfig, estimated_net_pct, exit_on_flip, profit_pct
 
 _CLOSE_REASONS: dict[str, str] = {}
 
@@ -56,6 +59,20 @@ def _band_pct(args: argparse.Namespace) -> float:
     if v is not None:
         return float(v)
     return _env_float("OB_BAND_PCT", 1.0)
+
+
+def _min_profit_pct(args: argparse.Namespace) -> float:
+    v = getattr(args, "ob_min_profit_pct", None)
+    if v is not None:
+        return float(v)
+    return _env_float("OB_MIN_PROFIT_PCT", 0.3)
+
+
+def _fee_buffer_pct(args: argparse.Namespace) -> float:
+    v = getattr(args, "tp_fee_buffer", None)
+    if v is not None:
+        return float(v)
+    return _env_float("TP_FEE_BUFFER", 0.12)
 
 
 def _snapshot_bar(bids: list[list[float]], asks: list[list[float]], band_pct: float) -> OBBar | None:
@@ -116,23 +133,36 @@ def run_once(
     if bar is None:
         return
 
+    gross = profit_pct(entry, bar.mid_c, side_is_long)
+    min_pct = _min_profit_pct(args)
+    fee_buf = _fee_buffer_pct(args)
+    net = estimated_net_pct(gross, fee_buf)
+    # Min gross (default 0.3%) and still green after fee buffer (default 0.12%).
+    profit_ok = gross >= min_pct and net > 0
+
     need = "OB Long" if not side_is_long else "OB Short"
     if not side_is_long:
         need_note = f"imb≥{cfg.imb_long:g}"
     else:
         need_note = f"imb≤{cfg.imb_short:g}"
-    if not exit_on_flip(side_is_long, bar, cfg):
+    flipped = exit_on_flip(side_is_long, bar, cfg)
+
+    if not flipped or not profit_ok:
+        wait_bits = [need_note]
+        if flipped and not profit_ok:
+            wait_bits.append(f"pnl≥{min_pct:g}% net>0 (now {gross:+.3f}% net≈{net:+.3f}%)")
+        elif not flipped:
+            wait_bits.append(f"pnl={gross:+.3f}%")
         print(
             f"{grid.DIM}OB-flip armed · {side} imb={bar.imbalance:.3f} "
-            f"(need {need} {need_note}) · "
-            f"pnl={profit_pct(entry, bar.mid_c, side_is_long):+.3f}%{grid.RESET}"
+            f"(need {need} {' · '.join(wait_bits)}){grid.RESET}"
         )
         return
 
     reason = f"{need} imb={bar.imbalance:.3f}"
     print(
         f"{grid.GREEN}✓ OB-flip TP {side} · {reason} · "
-        f"pnl={profit_pct(entry, bar.mid_c, side_is_long):+.3f}% "
+        f"pnl={gross:+.3f}% net≈{net:+.3f}% "
         f"@ {grid.price_fmt(bar.mid_c)}{grid.RESET}"
     )
     if bool(getattr(args, "dry_run", False)):
