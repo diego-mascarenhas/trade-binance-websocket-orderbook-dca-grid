@@ -1,8 +1,8 @@
 """Exit strategy plugins for orderbook_dca_grid.py --supervise.
 
 Composition model:
-  --exit <eql|trailing|ob|…>   primary close method (independent)
-  --protect-be / --no-protect-be   optional BE SL addon (orthogonal)
+  --exit <eql|trailing|ob|pullback|ratchet|…>   primary close method (independent)
+  --protect-be / --no-protect-be   optional BE SL addon (orthogonal; not for ratchet)
   --post-be trail                  optional trail *after* BE (structure/be only)
 
 Add new strategies here; the main bot only dispatches via run_exit_once().
@@ -22,6 +22,8 @@ EXIT_STAGED = "staged"
 EXIT_STRUCTURE = "structure"
 EXIT_BE = "be"
 EXIT_OB = "ob"
+EXIT_PULLBACK = "pullback"
+EXIT_RATCHET = "ratchet"
 EXIT_NONE = "none"
 
 # Backward-compat alias kept in normalize map
@@ -44,6 +46,14 @@ _EXIT_ALIASES = {
     "be-ob": EXIT_OB,  # legacy: use --exit ob --protect-be
     "be_ob": EXIT_OB,
     "beob": EXIT_OB,
+    "pb": EXIT_PULLBACK,
+    "pull": EXIT_PULLBACK,
+    "giveback": EXIT_PULLBACK,
+    "support-be": EXIT_RATCHET,
+    "support_be": EXIT_RATCHET,
+    "ratchet-be": EXIT_RATCHET,
+    "ratchet_be": EXIT_RATCHET,
+    "levels": EXIT_RATCHET,
 }
 
 _LABELS = {
@@ -52,11 +62,21 @@ _LABELS = {
     EXIT_STRUCTURE: "structure TP (LONG→EQH · SHORT→EQL) + optional BE / post-BE trail",
     EXIT_BE: "BE protect only (+ optional post-BE trail)",
     EXIT_OB: "soft-close on OB flip (SHORT→OB Long) + optional BE",
+    EXIT_PULLBACK: "soft-close on adverse pullback from favorable extreme (+ optional BE)",
+    EXIT_RATCHET: "ratchet SL to previous support/resistance as walls break",
     EXIT_NONE: "none",
 }
 
-_VALID = {EXIT_TRAILING, EXIT_STAGED, EXIT_STRUCTURE, EXIT_BE, EXIT_OB, EXIT_NONE}
-
+_VALID = {
+    EXIT_TRAILING,
+    EXIT_STAGED,
+    EXIT_STRUCTURE,
+    EXIT_BE,
+    EXIT_OB,
+    EXIT_PULLBACK,
+    EXIT_RATCHET,
+    EXIT_NONE,
+}
 
 def normalize_exit_mode(raw: str | None) -> str | None:
     """Map aliases to canonical exit mode; None if empty/unknown."""
@@ -227,6 +247,24 @@ def run_exit_once(
         ob_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
         return
 
+    if mode == EXIT_PULLBACK:
+        refreshed = _run_optional_be(
+            symbol, side_is_long, qty, entry, args, hedge, api, sec, filt,
+            allow_post_be_trail=False,
+        )
+        if refreshed is None:
+            return
+        side_is_long, qty, entry = refreshed
+        from exits.pullback import run_once as pb_once
+        pb_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
+        return
+
+    if mode == EXIT_RATCHET:
+        # Owns the BE algo tag — do not stack classic protect-be
+        from exits.ratchet import run_once as ratchet_once
+        ratchet_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
+        return
+
     if mode == EXIT_STRUCTURE:
         # optional partial → optional BE (+ optional post-BE trail) → EQL/EQH
         from exits.partial_tp import run_once as partial_once
@@ -269,13 +307,15 @@ def run_exit_when_flat(
         from exits.staged import sync_flat
         sync_flat(symbol, args, hedge, api, sec, filt)
         return
-    if mode in (EXIT_BE, EXIT_OB, EXIT_STRUCTURE, EXIT_TRAILING):
-        # These modes may have armed BE via --protect-be (or BE-only).
+    if mode in (
+        EXIT_BE, EXIT_OB, EXIT_STRUCTURE, EXIT_TRAILING, EXIT_PULLBACK, EXIT_RATCHET,
+    ):
+        # These modes may have armed BE via --protect-be (or ratchet owns BE).
         from exits.be import sync_flat
         sync_flat(symbol, args, hedge, api, sec, filt)
-        if mode != EXIT_STRUCTURE:
+        if mode not in (EXIT_STRUCTURE, EXIT_PULLBACK, EXIT_RATCHET):
             return
-        # structure: also wipe any leftover staged tags beyond BE
+        # also wipe leftover staged tags / pullback extreme / ratchet state
     try:
         import orderbook_staged_exit as staged
 
@@ -289,6 +329,8 @@ def run_exit_when_flat(
                 "remain_qty": 0.0,
                 "algo_ids": {},
                 "be_protect_armed": False,
+                "pullback_extreme": None,
+                "ratchet_sl": None,
             },
         )
         if n:

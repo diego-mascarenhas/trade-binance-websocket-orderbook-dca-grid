@@ -1138,9 +1138,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--exit",
         dest="exit_mode",
-        choices=["trailing", "staged", "structure", "none"],
+        choices=[
+            "trailing", "staged", "structure", "be", "ob",
+            "pullback", "ratchet", "none",
+        ],
         default=None,
-        help="For start: exit strategy (structure = LONG→EQH / SHORT→EQL TP)",
+        help="For start: exit strategy (structure|ob|pullback|ratchet|…)",
     )
     p.add_argument(
         "--tp-mode",

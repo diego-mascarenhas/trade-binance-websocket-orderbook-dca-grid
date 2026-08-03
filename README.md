@@ -205,11 +205,14 @@ python3 orderbook_staged_exit.py LINKUSDT
 
 | Flag / env | Default | Description |
 |------------|---------|-------------|
-| `EXIT_MODE` | `staged` | `staged` \| `trailing` \| `structure` \| `be` \| `none` |
+| `EXIT_MODE` | `staged` | `staged` \| `trailing` \| `structure` \| `ob` \| `pullback` \| `ratchet` \| `be` \| `none` |
 | `--exit staged` | *(env default)* | Staged exit plugin |
 | `--exit trailing` | — | Trailing TP @ OB wall |
 | `--exit structure` | — | Soft-close LONG→EQH / SHORT→EQL once already green; **BE protect on by default** |
-| `--protect-be` / `--no-protect-be` | on | With `--exit structure`: arm BE SL when profit ≥ `--be-arm-pct` |
+| `--exit ob` | — | Soft-close on order-book flip (SHORT→OB Long) |
+| `--exit pullback` | — | Soft-close after adverse giveback from favorable extreme |
+| `--exit ratchet` | — | Ratchet SL to previous support/resistance as walls break |
+| `--protect-be` / `--no-protect-be` | on | BE SL addon for structure/ob/trailing/pullback (not stacked with ratchet) |
 | `--be-arm-pct` / `BE_ARM_PCT` | `1.0` | Arm BE when unrealized profit % ≥ this |
 | `--be-profit-pct` / `BE_PROFIT_PCT` | `0.3` (structure/be) / `0.1` (staged) | SL lock % from entry (no fee buffer) |
 | `--exit be` | — | BE protect only (no TP) |

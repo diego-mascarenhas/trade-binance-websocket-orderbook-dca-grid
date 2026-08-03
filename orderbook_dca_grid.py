@@ -1425,6 +1425,8 @@ def supervise_loop(args: argparse.Namespace) -> None:
         return
     from exits import (
         EXIT_OB,
+        EXIT_PULLBACK,
+        EXIT_RATCHET,
         EXIT_STAGED,
         EXIT_STRUCTURE,
         clear_exit_presets,
@@ -1631,6 +1633,12 @@ def supervise_loop(args: argparse.Namespace) -> None:
                         elif exit_mode == EXIT_OB:
                             from exits.ob_long import pop_close_reason as pop_ob_reason
                             close_reason = pop_ob_reason(sym)
+                        elif exit_mode == EXIT_PULLBACK:
+                            from exits.pullback import pop_close_reason as pop_pb_reason
+                            close_reason = pop_pb_reason(sym)
+                        elif exit_mode == EXIT_RATCHET:
+                            from exits.ratchet import pop_close_reason as pop_rt_reason
+                            close_reason = pop_rt_reason(sym) or "ratchet SL"
                         elif after_runner:
                             close_reason = "runner / trail"
                         close_pnl = float(last_pos_meta.get("unrealized_pnl", 0) or 0)
@@ -1665,6 +1673,12 @@ def supervise_loop(args: argparse.Namespace) -> None:
                     elif exit_mode == EXIT_OB:
                         from exits.ob_long import pop_close_reason as pop_ob_reason
                         pop_ob_reason(sym)
+                    elif exit_mode == EXIT_PULLBACK:
+                        from exits.pullback import pop_close_reason as pop_pb_reason
+                        pop_pb_reason(sym)
+                    elif exit_mode == EXIT_RATCHET:
+                        from exits.ratchet import pop_close_reason as pop_rt_reason
+                        pop_rt_reason(sym)
                     last_position_qty = 0.0
                     last_direction = None
                     last_pos_meta = {}
@@ -2025,10 +2039,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Exit strategy (plugins in exits/ — default staged TP1 + trail)
     p.add_argument(
         "--exit", dest="exit_mode",
-        choices=["trailing", "staged", "structure", "be", "ob", "none"],
+        choices=[
+            "trailing", "staged", "structure", "be", "ob",
+            "pullback", "ratchet", "none",
+        ],
         default=None,
-        help="Primary exit: trailing | staged | structure (EQL/EQH) | ob (OB flip close) "
-             "| be (BE only) | none. BE is separate via --protect-be / --no-protect-be. "
+        help="Primary exit: trailing | staged | structure (EQL/EQH) | ob (OB flip) "
+             "| pullback (giveback from extreme) | ratchet (SL→prev wall) "
+             "| be (BE only) | none. BE addon via --protect-be (not stacked with ratchet). "
              "Default: staged (EXIT_MODE env)",
     )
     p.add_argument("--no-tp", action="store_true",
@@ -2064,8 +2082,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--protect-be",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Optional BE protect SL addon for --exit structure|ob|trailing "
-             "(default on). Use --no-protect-be to wait only for the primary exit",
+        help="Optional BE protect SL addon for --exit structure|ob|trailing|pullback "
+             "(default on; ignored by --exit ratchet which owns the SL). "
+             "Use --no-protect-be to wait only for the primary exit",
     )
     p.add_argument("--be-arm-pct", type=float, default=None,
                    help="[--protect-be] Arm BE SL when unrealized profit %% ≥ this "
@@ -2106,6 +2125,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="[--exit ob] Min gross profit %% before OB-flip close (default 0.3). "
              "Also requires net>0 after --tp-fee-buffer. Env: OB_MIN_PROFIT_PCT",
+    )
+    p.add_argument(
+        "--pullback-pct",
+        type=float,
+        default=None,
+        help="[--exit pullback] Adverse giveback %% from favorable extreme to close "
+             "(default 0.4). Env: PULLBACK_PCT",
+    )
+    p.add_argument(
+        "--pullback-min-profit-pct",
+        type=float,
+        default=None,
+        help="[--exit pullback] Min gross profit %% before pullback close "
+             "(default 0.3). Env: PULLBACK_MIN_PROFIT_PCT",
+    )
+    p.add_argument(
+        "--ratchet-break-pct",
+        type=float,
+        default=None,
+        help="[--exit ratchet] How far %% beyond a wall counts as a break "
+             "(default 0.15). Env: RATCHET_BREAK_PCT",
+    )
+    p.add_argument(
+        "--ratchet-min-profit-pct",
+        type=float,
+        default=None,
+        help="[--exit ratchet] Min gross profit %% before arming entry-floor SL "
+             "(default 0.3). Env: RATCHET_MIN_PROFIT_PCT",
+    )
+    p.add_argument(
+        "--ratchet-wall-min-mult",
+        type=float,
+        default=None,
+        help="[--exit ratchet] Min wall size as multiple of median book qty "
+             "(default 1.0). Env: RATCHET_WALL_MIN_MULT",
     )
     p.add_argument(
         "--post-be-arm-pct",
