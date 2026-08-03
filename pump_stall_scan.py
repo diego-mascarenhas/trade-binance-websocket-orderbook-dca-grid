@@ -511,6 +511,9 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "wallet_pct": wallet_pct,
         "min_gap": float(g("min_gap", 0.8) or 0.8),
         "so_count": int(g("so_count", 8) or 8),
+        "max_trades": _max_trades(
+            args if args is not None else argparse.Namespace(max_trades=3),
+        ),
     }
 
 
@@ -948,6 +951,23 @@ def _protect_be_for_trade(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "protect_be", True))
 
 
+def _max_trades(args: argparse.Namespace) -> int:
+    """Concurrent ★ slots for auto-trade.
+
+    Preference: MAX_TRADES in .env → --max-trades → 3.
+    """
+    raw = os.getenv("MAX_TRADES")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1, int(float(raw)))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, int(getattr(args, "max_trades", 3) or 3))
+    except (TypeError, ValueError):
+        return 3
+
+
 def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.Popen | None:
     """Start `dca SYMBOL short` with the configured trade exit --once."""
     root = _repo_root()
@@ -1069,7 +1089,7 @@ def _maybe_auto_trade(
     We never launch outside the current top-N ★ list.
     """
     active = _reap_active(active)
-    max_trades = max(1, int(getattr(args, "max_trades", 3) or 3))
+    max_trades = _max_trades(args)
 
     if _weekend_block_active():
         print(
@@ -1155,7 +1175,7 @@ def watch_loop(args: argparse.Namespace) -> int:
     round_n = 0
     active: dict[str, subprocess.Popen] = {}
     auto = bool(getattr(args, "auto_trade", False))
-    max_trades = max(1, int(getattr(args, "max_trades", 3) or 3))
+    max_trades = _max_trades(args)
     mode = (
         f"AUTO-TRADE · --once · top {max_trades} ★"
         if auto else "display only"
@@ -1343,7 +1363,8 @@ Production (VPS):
         type=int,
         default=3,
         help="With --auto-trade: how many top ★ from this scan to run "
-             "(this bot only; other account pairs do not count; default 3)",
+             "(this bot only; other account pairs do not count; default 3). "
+             ".env MAX_TRADES overrides after restart",
     )
     p.add_argument(
         "--loss-cooldown-min",

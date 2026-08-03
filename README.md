@@ -284,7 +284,7 @@ python3 pump_stall_scan.py --help
 | `--auto-trade` | off | Launch trades (requires `--watch`) |
 | `--trade-exit` | `structure` | Primary exit: `structure` (EQL) · `ob` · `trailing` |
 | `--protect-be` | on | Optional BE SL addon (`--no-protect-be` to skip) |
-| `--max-trades` | `3` | How many top ★ to run |
+| `--max-trades` / `MAX_TRADES` | `3` | How many top ★ to run (`.env` wins after restart) |
 | `--interval` | `60` | Refresh seconds (min 15) |
 | `--ideal-near` | `92` | near% ≥ this → ★ (early profile: 90) |
 | `--loss-cooldown-min` | `1440` | Skip symbol after loss (minutes) |
