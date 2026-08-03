@@ -1651,6 +1651,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             entry=float(last_pos_meta.get("entry", 0) or 0),
                             mark=float(last_pos_meta.get("mark", 0) or 0),
                             reason=close_reason,
+                            exit_mode=exit_mode,
                         )
                         trade_sounds.play_close_sound(close_pnl)
                         cd_min = float(getattr(args, "loss_cooldown_min", 0) or 0)

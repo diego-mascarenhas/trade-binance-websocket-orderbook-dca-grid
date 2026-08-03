@@ -529,6 +529,7 @@ def notify_position_closed(
     entry: float | None = None,
     mark: float | None = None,
     reason: str | None = None,
+    exit_mode: str | None = None,
 ) -> None:
     why = (reason or "").strip()
     if not why and after_runner:
@@ -578,6 +579,7 @@ def notify_position_closed(
                 entry=entry,
                 mark=mark,
                 reason=why or None,
+                exit_mode=exit_mode,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Pumpstall channel close notify failed: %s", exc)

@@ -32,8 +32,10 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / ".state"
 TRADES_FILE = STATE_DIR / "pumpstall_trades.jsonl"
+STATS_FILE = STATE_DIR / "pumpstall_stats.json"
 SUMMARY_STAMP = STATE_DIR / "pumpstall_summary_sent_date.txt"
 EQUITY_LOG = STATE_DIR / "pumpstall_equity.jsonl"
+STATS_TRADE_LIMIT = 200
 
 
 def _load_dotenv() -> None:
@@ -329,6 +331,7 @@ def notify_close(
     mark: float | None = None,
     pnl_pct: float | None = None,
     reason: str | None = None,
+    exit_mode: str | None = None,
 ) -> bool:
     """Public close: %% from avg entry only — never volume / USDT size."""
     if not is_configured():
@@ -351,9 +354,44 @@ def notify_close(
     )
     ok = _send_html(text)
     if ok:
-        record_trade(symbol, direction, pct, reason=reason)
+        record_trade(
+            symbol, direction, pct, reason=reason, exit_mode=exit_mode,
+        )
         logger.info("Pumpstall CLOSE sent %s pnl=%+.2f%%", symbol.upper(), pct)
     return ok
+
+
+def infer_exit_mode(reason: str | None, exit_mode: str | None = None) -> str:
+    """Normalize exit mode; fall back to parsing close reason for older rows."""
+    raw = (exit_mode or "").strip().lower()
+    if raw and raw not in ("none", "unknown", "?"):
+        if raw in ("eql", "eq", "eqh", "structure_tp"):
+            return "structure"
+        if raw in ("trail",):
+            return "trailing"
+        if raw in ("pb", "pull", "giveback"):
+            return "pullback"
+        if raw in ("support-be", "support_be", "ratchet-be", "ratchet_be", "levels"):
+            return "ratchet"
+        if raw in ("ob-long", "ob_long", "be-ob", "be_ob"):
+            return "ob"
+        return raw
+    r = (reason or "").strip().lower()
+    if not r:
+        return "unknown"
+    if "pullback" in r:
+        return "pullback"
+    if "ratchet" in r:
+        return "ratchet"
+    if "ob-flip" in r or "ob long" in r or "ob short" in r:
+        return "ob"
+    if "eql" in r or "eqh" in r or "structure" in r:
+        return "structure"
+    if "trail" in r or "runner" in r:
+        return "trailing"
+    if r.startswith("be") or "break-even" in r or "breakeven" in r:
+        return "be"
+    return "unknown"
 
 
 def record_trade(
@@ -362,19 +400,26 @@ def record_trade(
     pnl_pct: float,
     *,
     reason: str | None = None,
+    exit_mode: str | None = None,
     when: datetime | None = None,
 ) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     ts = when or datetime.now(timezone.utc)
+    mode = infer_exit_mode(reason, exit_mode)
     row = {
         "ts": ts.astimezone(timezone.utc).isoformat(),
         "symbol": symbol.upper(),
         "direction": (direction or "SHORT").upper(),
         "pnl_pct": float(pnl_pct),
         "reason": (reason or "").strip() or None,
+        "exit_mode": mode,
     }
     with TRADES_FILE.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    try:
+        write_stats_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Pumpstall stats snapshot skipped: %s", exc)
 
 
 def _load_trades() -> list[dict[str, Any]]:
@@ -470,19 +515,60 @@ def _wallet_roi_pct(net_usdt: float, start_equity: float) -> float | None:
     return net_usdt / start_equity * 100.0
 
 
-def format_daily_summary(
-    *,
-    as_of: date | None = None,
-    private: bool = False,
-) -> str:
-    """Yesterday + week/month-to-yesterday as futures wallet ROI.
+def _normalize_trade_row(row: dict[str, Any]) -> dict[str, Any]:
+    reason = row.get("reason")
+    mode = infer_exit_mode(
+        str(reason) if reason else None,
+        str(row.get("exit_mode") or "") or None,
+    )
+    try:
+        pnl = float(row.get("pnl_pct", 0) or 0)
+    except (TypeError, ValueError):
+        pnl = 0.0
+    return {
+        "ts": row.get("ts"),
+        "symbol": str(row.get("symbol") or "").upper(),
+        "direction": str(row.get("direction") or "SHORT").upper(),
+        "pnl_pct": pnl,
+        "reason": (str(reason).strip() if reason else None) or None,
+        "exit_mode": mode,
+    }
 
-    % = Binance income (REALIZED_PNL + COMMISSION) ÷ starting futures equity
-    for that window. Close count still comes from local trade log.
 
-    Public (``private=False``): percentages + closes only.
-    Private ops (``private=True``): also includes USDT net PnL.
-    """
+def _exit_mode_stats(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Win-rate and avg PnL+ by exit mode (for private stats UI)."""
+    buckets: dict[str, dict[str, Any]] = {}
+    for raw in rows:
+        t = _normalize_trade_row(raw)
+        mode = t["exit_mode"]
+        b = buckets.setdefault(
+            mode,
+            {"exit_mode": mode, "n": 0, "wins": 0, "sum_pnl": 0.0, "sum_win": 0.0},
+        )
+        pnl = float(t["pnl_pct"])
+        b["n"] += 1
+        b["sum_pnl"] += pnl
+        if pnl > 0:
+            b["wins"] += 1
+            b["sum_win"] += pnl
+    out: list[dict[str, Any]] = []
+    for mode, b in buckets.items():
+        n = int(b["n"])
+        wins = int(b["wins"])
+        out.append({
+            "exit_mode": mode,
+            "n": n,
+            "wins": wins,
+            "win_rate_pct": (wins / n * 100.0) if n else 0.0,
+            "avg_pnl_pct": (float(b["sum_pnl"]) / n) if n else 0.0,
+            "avg_win_pct": (float(b["sum_win"]) / wins) if wins else 0.0,
+        })
+    out.sort(key=lambda x: (-x["win_rate_pct"], -x["avg_win_pct"], -x["n"]))
+    return out
+
+
+def build_report_payload(*, as_of: date | None = None) -> dict[str, Any]:
+    """Structured Day/Week/Month wallet ROI (same windows as #REPORT)."""
     _load_dotenv()
     tz = _tz()
     today = as_of or datetime.now(tz).date()
@@ -490,7 +576,6 @@ def format_daily_summary(
 
     day_start = datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=tz)
     day_end = day_start + timedelta(days=1)
-
     week_start_date = yesterday - timedelta(days=yesterday.weekday())  # Monday
     week_start = datetime(
         week_start_date.year, week_start_date.month, week_start_date.day, tzinfo=tz,
@@ -523,7 +608,6 @@ def format_daily_summary(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Pumpstall #REPORT wallet ROI fetch failed: %s", exc)
 
-    # Start equity: snapshot on/before period start; else estimate from now − net.
     def start_eq(period_start_date: date, net: float) -> float:
         snap = _equity_on_or_before(snaps, period_start_date)
         if snap is not None and snap > 0:
@@ -532,15 +616,120 @@ def format_daily_summary(
             return max(wallet_now - net, wallet_now * 0.25, 1.0)
         return 0.0
 
-    day_base = start_eq(yesterday, day_net)
-    week_base = start_eq(week_start_date, week_net)
-    month_base = start_eq(month_start.date(), month_net)
+    day_pct = _wallet_roi_pct(day_net, start_eq(yesterday, day_net))
+    week_pct = _wallet_roi_pct(week_net, start_eq(week_start_date, week_net))
+    month_pct = _wallet_roi_pct(month_net, start_eq(month_start.date(), month_net))
 
-    day_pct = _wallet_roi_pct(day_net, day_base)
-    week_pct = _wallet_roi_pct(week_net, week_base)
-    month_pct = _wallet_roi_pct(month_net, month_base)
+    def period(pct: float | None, net: float, n: int) -> dict[str, Any]:
+        return {"pct": pct, "closes": n, "net_usdt": round(net, 4) if api_ok else None}
 
-    def line(label: str, pct: float | None, net: float, n: int) -> str:
+    return {
+        "as_of": yesterday.isoformat(),
+        "as_of_label": yesterday.strftime("%d %b %Y"),
+        "api_ok": api_ok,
+        "day": period(day_pct, day_net, day_n),
+        "week": period(week_pct, week_net, week_n),
+        "month": period(month_pct, month_net, month_n),
+    }
+
+
+def build_stats_payload(
+    *,
+    as_of: date | None = None,
+    trade_limit: int = STATS_TRADE_LIMIT,
+    include_wallet_report: bool = False,
+) -> dict[str, Any]:
+    """Private stats for the unlisted web page (no Binance keys on the site)."""
+    rows = _load_trades()
+    normalized = [_normalize_trade_row(r) for r in rows]
+    # Newest first for the UI
+    normalized.sort(key=lambda t: str(t.get("ts") or ""), reverse=True)
+    limit = max(1, int(trade_limit))
+    trades = normalized[:limit]
+    payload: dict[str, Any] = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "trades": trades,
+        "trade_count": len(normalized),
+        "by_exit": _exit_mode_stats(normalized),
+    }
+    if include_wallet_report:
+        try:
+            payload["report"] = build_report_payload(as_of=as_of)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Stats report block skipped: %s", exc)
+            payload["report"] = None
+    else:
+        # Lightweight: closes-only windows from the local log (no Binance call)
+        try:
+            tz = _tz()
+            today = as_of or datetime.now(tz).date()
+            yesterday = today - timedelta(days=1)
+            day_start = datetime(
+                yesterday.year, yesterday.month, yesterday.day, tzinfo=tz,
+            )
+            day_end = day_start + timedelta(days=1)
+            week_start_date = yesterday - timedelta(days=yesterday.weekday())
+            week_start = datetime(
+                week_start_date.year, week_start_date.month, week_start_date.day,
+                tzinfo=tz,
+            )
+            month_start = datetime(yesterday.year, yesterday.month, 1, tzinfo=tz)
+            payload["report"] = {
+                "as_of": yesterday.isoformat(),
+                "as_of_label": yesterday.strftime("%d %b %Y"),
+                "api_ok": False,
+                "day": {"pct": None, "closes": len(_trades_between(rows, day_start, day_end))},
+                "week": {"pct": None, "closes": len(_trades_between(rows, week_start, day_end))},
+                "month": {
+                    "pct": None,
+                    "closes": len(_trades_between(rows, month_start, day_end)),
+                },
+            }
+        except Exception:
+            payload["report"] = None
+    return payload
+
+
+def write_stats_snapshot(
+    *,
+    path: Path | None = None,
+    include_wallet_report: bool = False,
+) -> Path:
+    """Write `.state/pumpstall_stats.json` for the Pumpstall private stats page."""
+    _load_dotenv()
+    out = path or Path(
+        os.getenv("PUMPSTALL_STATS_PATH", "").strip() or str(STATS_FILE),
+    )
+    if not out.is_absolute():
+        out = ROOT / out
+    payload = build_stats_payload(include_wallet_report=include_wallet_report)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(out)
+    return out
+
+
+def format_daily_summary(
+    *,
+    as_of: date | None = None,
+    private: bool = False,
+) -> str:
+    """Yesterday + week/month-to-yesterday as futures wallet ROI.
+
+    % = Binance income (REALIZED_PNL + COMMISSION) ÷ starting futures equity
+    for that window. Close count still comes from local trade log.
+
+    Public (``private=False``): percentages + closes only.
+    Private ops (``private=True``): also includes USDT net PnL.
+    """
+    data = build_report_payload(as_of=as_of)
+    api_ok = bool(data.get("api_ok"))
+
+    def line(label: str, block: dict[str, Any]) -> str:
+        pct = block.get("pct")
+        n = int(block.get("closes") or 0)
+        net = float(block.get("net_usdt") or 0)
         closes = f"{n} close{'s' if n != 1 else ''}"
         if pct is None:
             if private and api_ok:
@@ -548,24 +737,23 @@ def format_daily_summary(
             return f"{label:<5} · <i>n/a</i>  <i>({closes})</i>"
         if private:
             return (
-                f"{label:<5} · <b>{pct:+.2f}%</b>  "
+                f"{label:<5} · <b>{float(pct):+.2f}%</b>  "
                 f"<i>({net:+.2f} USDT · {closes})</i>"
             )
-        return f"{label:<5} · <b>{pct:+.2f}%</b>  <i>({closes})</i>"
+        return f"{label:<5} · <b>{float(pct):+.2f}%</b>  <i>({closes})</i>"
 
-    title = yesterday.strftime("%d %b %Y")
+    title = str(data.get("as_of_label") or "")
     foot = (
         "\n\n<i>wallet ROI · futures net PnL ÷ equity</i>"
         if api_ok
         else "\n\n<i>wallet ROI unavailable — check API keys</i>"
     )
-
     return (
         f"📊 <b>#REPORT</b> · {_html_escape(title)}\n"
         f"\n"
-        f"{line('Day', day_pct, day_net, day_n)}\n"
-        f"{line('Week', week_pct, week_net, week_n)}\n"
-        f"{line('Month', month_pct, month_net, month_n)}"
+        f"{line('Day', data['day'])}\n"
+        f"{line('Week', data['week'])}\n"
+        f"{line('Month', data['month'])}"
         f"{foot}"
     )
 
@@ -614,6 +802,10 @@ def maybe_send_daily_summary(*, force: bool = False) -> bool:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Pumpstall equity snapshot skipped: %s", exc)
             logger.info("Pumpstall daily summary sent for %s", today_s)
+            try:
+                write_stats_snapshot(include_wallet_report=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Pumpstall stats after report skipped: %s", exc)
         else:
             logger.warning("Pumpstall summary send failed — %s", config_status())
             if not already:
