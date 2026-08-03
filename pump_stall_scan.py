@@ -10,7 +10,8 @@
 
 Display-only by default. With --watch --auto-trade: run the top
 `--max-trades` ★ from this list (default 3) via `dca SYMBOL short --once`.
-Primary exit via `--trade-exit structure|ob|trailing`; BE is optional
+Primary exit via `--trade-exit` / .env TRADE_EXIT|EXIT_MODE
+  (structure|ob|trailing|pullback|ratchet…); BE is optional
 via `--protect-be` / `--no-protect-be` (orthogonal).
 Early profile: `--trade-exit ob --protect-be`.
 Other open pairs on the account do not consume these slots.
@@ -529,6 +530,16 @@ def format_dca_hint(args: argparse.Namespace | None = None) -> str:
             f"Hint: dca SYMBOL short --exit trailing{be} "
             f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
         )
+    if exit_mode == "pullback":
+        return (
+            f"Hint: dca SYMBOL short --exit pullback{be} "
+            f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
+        )
+    if exit_mode == "ratchet":
+        return (
+            f"Hint: dca SYMBOL short --exit ratchet "
+            f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
+        )
     return (
         f"Hint: dca SYMBOL short --exit structure{be} "
         f"--post-be trail --post-be-arm-pct {s['post_be_arm_pct']:g} "
@@ -905,14 +916,30 @@ def _weekend_block_active() -> bool:
 
 
 def _trade_exit_mode(args: argparse.Namespace) -> str:
-    """Primary exit for auto-trade children: structure | ob | trailing."""
-    raw = str(getattr(args, "trade_exit", None) or "structure").strip().lower()
+    """Primary exit for auto-trade children.
+
+    Preference: TRADE_EXIT / EXIT_MODE in .env (EnvironmentFile) → --trade-exit → structure.
+    So a VPS .env change wins over a hardcoded unit flag after restart.
+    """
+    raw = (
+        os.getenv("TRADE_EXIT")
+        or os.getenv("EXIT_MODE")
+        or getattr(args, "trade_exit", None)
+        or "structure"
+    )
+    raw = str(raw).strip().lower()
     if raw in ("be-ob", "be_ob", "beob", "ob-long", "ob_long", "oblong", "ob"):
         return "ob"
     if raw in ("trailing", "trail"):
         return "trailing"
+    if raw in ("pullback", "pb", "pull", "giveback"):
+        return "pullback"
+    if raw in ("ratchet", "support-be", "support_be", "ratchet-be", "ratchet_be", "levels"):
+        return "ratchet"
     if raw in ("eql", "eq", "structure"):
         return "structure"
+    if raw in ("be", "staged", "none"):
+        return raw
     return "structure"
 
 
@@ -978,7 +1005,21 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         )
     elif exit_mode == "trailing":
         launch_note = f"dca short --exit trailing{be_note} --once"
-    else:
+    elif exit_mode == "pullback":
+        launch_note = f"dca short --exit pullback{be_note} --once"
+    elif exit_mode == "ratchet":
+        # Ratchet owns the BE algo tag — do not stack classic protect-be
+        if "--protect-be" in cmd:
+            cmd[cmd.index("--protect-be")] = "--no-protect-be"
+        elif "--no-protect-be" not in cmd:
+            cmd.append("--no-protect-be")
+        # Drop BE arm flags if we already appended them
+        for flag in ("--be-arm-pct", "--be-profit-pct"):
+            if flag in cmd:
+                i = cmd.index(flag)
+                del cmd[i:i + 2]
+        launch_note = "dca short --exit ratchet --once"
+    elif exit_mode == "ob":
         imb = getattr(args, "imb_long", None)
         if imb is not None:
             cmd.extend(["--imb-long", str(imb)])
@@ -989,6 +1030,8 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
             f"dca short --exit ob{be_note} · OB Long "
             f"(imb≥{float(imb if imb is not None else 0.55):g}) --once"
         )
+    else:
+        launch_note = f"dca short --exit {exit_mode}{be_note} --once"
     try:
         log_f = open(log_path, "a", encoding="utf-8")
         log_f.write(
@@ -1271,10 +1314,10 @@ Production (VPS):
     )
     p.add_argument(
         "--trade-exit",
-        choices=["structure", "ob", "trailing"],
+        choices=["structure", "ob", "trailing", "pullback", "ratchet", "be", "staged", "none"],
         default="structure",
-        help="Primary exit for auto-trade children: structure (EQL) | ob (OB Long) "
-             "| trailing. BE is separate (--protect-be). Default: structure",
+        help="Primary exit for auto-trade children. .env TRADE_EXIT / EXIT_MODE "
+             "overrides unit flags after restart. Default: structure",
     )
     p.add_argument(
         "--protect-be",
