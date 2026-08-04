@@ -6,8 +6,9 @@ STOP up to the *previous* (higher) support. LONG — mirror on ask walls.
 Primary exit via ``--exit ratchet``. The stop itself is the exit; classic
 ``--protect-be`` is not stacked (this mode owns the BE algo tag).
 
-Initial floor (before any break): entry ± ``--be-profit-pct`` once
-``--ratchet-min-profit-pct`` is reached (same idea as BE protect arm).
+Initial floor (before any break): entry ± ``--be-profit-pct`` (default +0.3%
+profit lock) once ``--ratchet-min-profit-pct`` is reached (default 1.0%, same
+as classic ``--be-arm-pct``).
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ def min_profit_pct(args: argparse.Namespace) -> float:
     v = getattr(args, "ratchet_min_profit_pct", None)
     if v is not None:
         return float(v)
-    return _env_float("RATCHET_MIN_PROFIT_PCT", 0.3)
+    return _env_float("RATCHET_MIN_PROFIT_PCT", 1.0)
 
 
 def wall_min_mult(args: argparse.Namespace) -> float:
@@ -132,10 +133,11 @@ def _previous_level(
     lock_pct: float,
 ) -> tuple[float, str]:
     """SL at the level before the deepest break; else entry±lock."""
+    # Same side as classic BE / runner_sl_price: lock profit_pct in our favor.
     if is_long:
-        entry_floor = entry * (1 - lock_pct / 100) if lock_pct > 0 else entry
-    else:
         entry_floor = entry * (1 + lock_pct / 100) if lock_pct > 0 else entry
+    else:
+        entry_floor = entry * (1 - lock_pct / 100) if lock_pct > 0 else entry
 
     if not broken:
         label = f"entry+{lock_pct:g}%" if lock_pct > 0 else "entry"

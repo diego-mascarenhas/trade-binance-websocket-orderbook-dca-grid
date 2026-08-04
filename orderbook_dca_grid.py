@@ -2153,7 +2153,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="[--exit ratchet] Min gross profit %% before arming entry-floor SL "
-             "(default 0.3). Env: RATCHET_MIN_PROFIT_PCT",
+             "(default 1.0, same as --be-arm-pct). Env: RATCHET_MIN_PROFIT_PCT",
     )
     p.add_argument(
         "--ratchet-wall-min-mult",
