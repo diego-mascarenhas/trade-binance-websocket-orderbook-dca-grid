@@ -4,6 +4,7 @@ Composition model:
   --exit <eql|trailing|ob|pullback|ratchet|…>   primary close method (independent)
   --protect-be / --no-protect-be   optional BE SL addon (orthogonal; not for ratchet)
   --post-be trail                  optional trail *after* BE (structure/be only)
+  --risk-reduce / --no-risk-reduce optional SHORT cut above impulse high + far full SL
 
 Add new strategies here; the main bot only dispatches via run_exit_once().
 """
@@ -198,6 +199,29 @@ def _run_optional_be(
     return _refresh_side(symbol, side_is_long, hedge, api, sec, recv)
 
 
+def _run_optional_risk_reduce(
+    symbol: str,
+    side_is_long: bool,
+    qty: float,
+    entry: float,
+    args: argparse.Namespace,
+    hedge: bool,
+    api: str,
+    sec: str,
+    filt: dict[str, Decimal],
+) -> tuple[bool, float, float] | None:
+    """Partial cut + far full SL above impulse high (SHORT). Refresh side after."""
+    recv = int(getattr(args, "recv_window", 15000) or 15000)
+    try:
+        from exits.risk_reduce import enabled, run_once as risk_once
+
+        if enabled(args):
+            risk_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Risk-reduce skip: {exc}")
+    return _refresh_side(symbol, side_is_long, hedge, api, sec, recv)
+
+
 def run_exit_once(
     mode: str,
     symbol: str,
@@ -212,6 +236,15 @@ def run_exit_once(
 ) -> None:
     if mode == EXIT_NONE:
         return
+
+    # Orthogonal: impulse-high risk cut (SHORT) — before primary exit / BE
+    refreshed = _run_optional_risk_reduce(
+        symbol, side_is_long, qty, entry, args, hedge, api, sec, filt,
+    )
+    if refreshed is None:
+        return
+    side_is_long, qty, entry = refreshed
+
     if mode == EXIT_STAGED:
         from exits.staged import run_once
         run_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
@@ -303,6 +336,13 @@ def run_exit_when_flat(
 
     Staged/BE: full sync_flat. Other modes: still drop stray staged algos/state.
     """
+    try:
+        from exits.risk_reduce import sync_flat as risk_flat
+
+        risk_flat(symbol, args, hedge, api, sec, filt)
+    except Exception:
+        pass
+
     if mode == EXIT_STAGED:
         from exits.staged import sync_flat
         sync_flat(symbol, args, hedge, api, sec, filt)

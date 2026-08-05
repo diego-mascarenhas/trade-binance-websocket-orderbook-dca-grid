@@ -1604,11 +1604,19 @@ def supervise_loop(args: argparse.Namespace) -> None:
                     dca_blocked = margin_dca_frozen or (
                         hard_mr > 0 and ratio_now is not None and ratio_now >= hard_mr
                     )
+                    risk_rearm_ok = True
+                    try:
+                        from exits.risk_reduce import allow_dca_rearm as _risk_rearm_ok
+
+                        risk_rearm_ok = _risk_rearm_ok(sym)
+                    except Exception:
+                        risk_rearm_ok = True
                     if (
                         not dca_blocked
                         and count_dca_orders(oo_pos, sym) == 0
                         and time.time() >= dca_missing_retry_at
                         and (exit_mode != EXIT_STAGED or dca_rearm_allowed(sym))
+                        and risk_rearm_ok
                     ):
                         print(f"{YELLOW}Position open, no DCA grid → DCA-only re-arm…{RESET}")
                         placed = build_and_place_grid(
@@ -2099,6 +2107,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional BE protect SL addon for --exit structure|ob|trailing|pullback "
              "(default on; ignored by --exit ratchet which owns the SL). "
              "Use --no-protect-be to wait only for the primary exit",
+    )
+    p.add_argument(
+        "--risk-reduce",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="SHORT: partial STOP above 1D impulse high + far full SL "
+             "(default on via RISK_REDUCE=1). After partial fill, re-arm DCA if still ★. "
+             "Env: RISK_REDUCE",
+    )
+    p.add_argument(
+        "--risk-reduce-pct",
+        type=float,
+        default=None,
+        help="%% of position to cut on the partial risk stop (default 50). "
+             "Env: RISK_REDUCE_PCT",
+    )
+    p.add_argument(
+        "--risk-reduce-buffer-pct",
+        type=float,
+        default=None,
+        help="%% above impulse high for the partial cut (default 0.8). "
+             "Env: RISK_REDUCE_BUFFER_PCT",
+    )
+    p.add_argument(
+        "--risk-full-buffer-pct",
+        type=float,
+        default=None,
+        help="%% above impulse high for the full SL (default 4; 0=off). "
+             "Telegram suggests this level when armed. Env: RISK_FULL_BUFFER_PCT",
     )
     p.add_argument("--be-arm-pct", type=float, default=None,
                    help="[--protect-be] Arm BE SL when unrealized profit %% ≥ this "

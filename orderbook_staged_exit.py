@@ -44,11 +44,11 @@ PHASE_TP1 = "tp1_armed"
 PHASE_PARTIAL = "staged_partial"
 PHASE_TRAIL = "staged_trail"
 
-STAGED_TAGS = ("TP1", "BE", "TR", "SL")
+STAGED_TAGS = ("TP1", "BE", "TR", "SL", "RR", "RF")
 ALLOWED_ALGOS_BY_PHASE: dict[str, set[str]] = {
-    PHASE_TP1: {"TP1"},
-    PHASE_PARTIAL: {"BE"},
-    PHASE_TRAIL: {"BE", "TR"},
+    PHASE_TP1: {"TP1", "RR", "RF"},
+    PHASE_PARTIAL: {"BE", "RR", "RF"},
+    PHASE_TRAIL: {"BE", "TR", "RR", "RF"},
 }
 # legacy alias
 PHASE_FULL = PHASE_WAITING
@@ -508,7 +508,8 @@ def reconcile_staged_algos(
     recv: int,
 ) -> int:
     """Drop stray/duplicate staged algos that do not match the current phase."""
-    allowed = ALLOWED_ALGOS_BY_PHASE.get(phase, set())
+    # RR/RF (risk-reduce addon) are orthogonal — never treat as staged strays.
+    allowed = set(ALLOWED_ALGOS_BY_PHASE.get(phase, set())) | {"RR", "RF"}
     by_tag: dict[str, list[dict]] = {}
     for o in list_open_algo_orders(symbol, api, sec, recv):
         tag = _staged_tag_from_cid(_algo_client_id(o), symbol)

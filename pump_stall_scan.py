@@ -541,6 +541,17 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "boost_strict_stall": boost_strict_stall,
         "boost_strict_near": boost_strict_near,
         "boost_strict_ideal": boost_strict_ideal,
+        # Risk-reduce addon (SHORT) — Help page
+        "risk_reduce": (
+            0
+            if (os.getenv("RISK_REDUCE", "1") or "1").strip().lower()
+            in ("0", "false", "off", "no")
+            else 1
+        ),
+        "risk_reduce_pct": float(os.getenv("RISK_REDUCE_PCT", "50") or 50),
+        "risk_reduce_buffer_pct": float(os.getenv("RISK_REDUCE_BUFFER_PCT", "0.8") or 0.8),
+        "risk_full_buffer_pct": float(os.getenv("RISK_FULL_BUFFER_PCT", "4") or 4),
+        "risk_reduce_ideal_near": float(os.getenv("RISK_REDUCE_IDEAL_NEAR", "90") or 90),
     }
 
 

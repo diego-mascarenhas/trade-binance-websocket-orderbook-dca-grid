@@ -469,6 +469,94 @@ def notify_tp1_filled(
     )
 
 
+def notify_risk_reduce_armed(
+    symbol: str,
+    direction: str,
+    qty: float,
+    entry: float,
+    *,
+    impulse_high: float,
+    partial_sl: float,
+    full_sl: float | None,
+    reduce_pct: float,
+    reduce_buffer_pct: float,
+    full_buffer_pct: float,
+    leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
+) -> None:
+    """Announce partial cut + suggested full SL (Telegram suggests the far stop)."""
+    notional = abs(qty) * abs(entry)
+    full_line = (
+        f"Suggested full SL → {full_sl:g} (+{full_buffer_pct:g}% over high {impulse_high:g})"
+        if full_sl and full_sl > 0
+        else "Full SL: off"
+    )
+    try:
+        if _public_chat_id():
+            _post_public_tag(
+                "RISK", symbol, direction,
+                pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
+                entry=entry, mark=full_sl if full_sl else partial_sl,
+            )
+    except Exception:
+        pass
+    # Always suggest levels on the private botctl chat (even if trade-size alerts are off)
+    if not is_configured() or _ops_is_public_channel():
+        return
+    detail = ""
+    if not _skip_ops_trade():
+        detail = (
+            f" · {fmt_vol(qty, entry, leverage)}"
+            f"{pnl_suffix(pnl_usdt, notional, leverage)}"
+        )
+    send_shield(
+        f"{symbol.upper()} futures #RISK {direction.upper()}\n"
+        f"Risk-reduce armed\n"
+        f"Impulse high {impulse_high:g}\n"
+        f"Cut ~{reduce_pct:.0f}% @ {partial_sl:g} (+{reduce_buffer_pct:g}%){detail}\n"
+        f"{full_line}"
+    )
+
+
+def notify_risk_reduce_filled(
+    symbol: str,
+    direction: str,
+    *,
+    closed_qty: float,
+    remain_qty: float,
+    entry: float,
+    trigger: float,
+    impulse_high: float,
+    full_sl: float | None,
+    rearm: bool,
+    leverage: float | int | None = None,
+    pnl_usdt: float | None = None,
+) -> None:
+    notional = abs(remain_qty) * abs(entry)
+    try:
+        _post_public_tag(
+            "RR", symbol, direction,
+            pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
+            entry=entry, mark=trigger if trigger > 0 else entry,
+        )
+    except Exception:
+        pass
+    rearm_txt = "re-arm DCA (still ★)" if rearm else "no DCA re-arm (not ★)"
+    full_txt = f"\nFull SL still @ {full_sl:g}" if full_sl and full_sl > 0 else ""
+    body = (
+        f"{symbol.upper()} futures #RR {direction.upper()}\n"
+        f"Risk-reduce filled @ {trigger:g}\n"
+        f"Closed {closed_qty:g} · runner {remain_qty:g} · "
+        f"{fmt_vol(remain_qty, entry, leverage)}"
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}\n"
+        f"High was {impulse_high:g} · {rearm_txt}{full_txt}"
+    )
+    if _skip_ops_trade():
+        send_tp(body)
+        return
+    send_tp(body)
+
+
 def notify_profit_lock_sl(
     symbol: str,
     direction: str,
