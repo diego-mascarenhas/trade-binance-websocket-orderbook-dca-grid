@@ -1274,6 +1274,19 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
             print(f"{RED}Wallet balance read failed: {exc}{RESET}")
             return False
 
+    try:
+        from size_boost import apply_boost
+
+        base_size, boost_mult = apply_boost(args.symbol, base_size)
+        if boost_mult is not None and verbose:
+            print(
+                f"{BOLD}{CYAN}Size boost {boost_mult:g}×{RESET} "
+                f"{DIM}→ entry {base_size:,.2f} USDT "
+                f"(.state/boost/{args.symbol.upper()}.json){RESET}"
+            )
+    except Exception:
+        pass
+
     prev_force = args.force
     if force:
         args.force = True
@@ -2294,6 +2307,13 @@ def preview_grid_payload(
         except Exception as exc:
             return {"ok": False, "error": f"Wallet balance failed: {exc}", "levels": []}
 
+    try:
+        from size_boost import apply_boost
+
+        args.base_size, _boost_mult = apply_boost(args.symbol, args.base_size)
+    except Exception:
+        pass
+
     if not args.no_max_leverage and args.set_leverage <= 0 and api and sec:
         try:
             args.leverage = get_max_leverage(args.symbol, api, sec, args.recv_window)
@@ -2630,6 +2650,20 @@ def main() -> None:
                 args.leverage = get_max_leverage(args.symbol, api, sec, args.recv_window)
             except Exception:
                 pass
+
+    try:
+        from size_boost import apply_boost
+
+        sized, boost_mult = apply_boost(args.symbol, args.base_size)
+        if boost_mult is not None:
+            args.base_size = sized
+            print(
+                f"{BOLD}{CYAN}Size boost {boost_mult:g}×{RESET} "
+                f"{DIM}→ entry {args.base_size:,.2f} USDT "
+                f"(.state/boost/{args.symbol.upper()}.json){RESET}"
+            )
+    except Exception:
+        pass
 
     levels = bids if is_long else asks
     walls = select_walls(

@@ -196,6 +196,69 @@ def _parse_message(text: str) -> tuple[str, list[str]]:
     return cmd, args
 
 
+def _handle_boost(args: list[str]) -> str:
+    """Manage per-symbol size boost files under .state/boost/."""
+    try:
+        import size_boost as sb
+    except ImportError as exc:
+        return f"❌ size_boost unavailable: {exc}"
+
+    if not args or args[0].lower() in ("list", "ls", "all"):
+        rows = sb.list_boosts()
+        if not rows:
+            return (
+                "No size boosts active.\n"
+                f"Usage: /boost SYMBOL [{sb.default_mult():g}|off]\n"
+                "e.g. /boost UBUSDT  → 1.5×  ·  /boost UBUSDT off"
+            )
+        lines = ["Size boosts (.state/boost/):"]
+        for r in rows:
+            lines.append(f"  {r['symbol']}  {sb.fmt_mult(r['mult'])}")
+        return "\n".join(lines)
+
+    sym = args[0].upper()
+    if not sb.normalize_symbol(sym):
+        return "Invalid symbol (e.g. UBUSDT)"
+
+    if len(args) == 1:
+        try:
+            row = sb.set_boost(sym, None)
+        except ValueError as exc:
+            return f"❌ {exc}"
+        return (
+            f"✅ Boost {sym} → {sb.fmt_mult(row['mult'])}\n"
+            f"File: .state/boost/{sym}.json\n"
+            "Applies on next arm (entry + DCA)."
+        )
+
+    tok = args[1].lower()
+    if tok in ("off", "clear", "del", "delete", "0", "none"):
+        if sb.clear(sym):
+            return f"✅ Boost cleared for {sym}"
+        return f"No boost file for {sym}"
+
+    try:
+        mult = float(tok)
+    except ValueError:
+        return (
+            f"Usage: /boost {sym} [{sb.default_mult():g}|off]\n"
+            "e.g. /boost UBUSDT 2  ·  /boost UBUSDT off"
+        )
+    if mult < sb.MIN_MULT:
+        if sb.clear(sym):
+            return f"✅ Boost cleared for {sym} (mult < {sb.MIN_MULT:g})"
+        return f"No boost file for {sym}"
+    try:
+        row = sb.set_boost(sym, mult)
+    except ValueError as exc:
+        return f"❌ {exc}"
+    return (
+        f"✅ Boost {sym} → {sb.fmt_mult(row['mult'])}\n"
+        f"File: .state/boost/{sym}.json\n"
+        "Applies on next arm (entry + DCA)."
+    )
+
+
 def handle_command(cmd: str, args: list[str]) -> str:
     backend = botctl.detect_backend()
 
@@ -206,6 +269,7 @@ def handle_command(cmd: str, args: list[str]) -> str:
             "/fib SYMBOL [long|short|auto] — start FIB micro-grid\n"
             "/stop SYMBOL — stop DCA and/or FIB (orders & position stay)\n"
             "/status SYMBOL — process + trading state\n"
+            "/boost [SYMBOL [mult|off]] — size boost (.state/boost/SYMBOL.json)\n"
             "/cleanup SYMBOL — cancel obstage* Stop/TP algos\n"
             "/sweep [SYMBOL] — cancel orphan bot limits/algos when flat\n"
             "/review SYMBOL — DeepSeek situational review\n"
@@ -273,6 +337,9 @@ def handle_command(cmd: str, args: list[str]) -> str:
 
     if cmd == "/report":
         return _report_private()
+
+    if cmd == "/boost":
+        return _handle_boost(args)
 
     if cmd == "/pump":
         action = (args[0].lower() if args else "status").strip()
