@@ -213,7 +213,11 @@ def _handle_boost(args: list[str]) -> str:
             )
         lines = ["Size boosts (.state/boost/):"]
         for r in rows:
-            lines.append(f"  {r['symbol']}  {sb.fmt_mult(r['mult'])}")
+            src = r.get("source") or "manual"
+            extra = f"  [{src}]"
+            if r.get("reason"):
+                extra += f"  {r['reason']}"
+            lines.append(f"  {r['symbol']}  {sb.fmt_mult(r['mult'])}{extra}")
         return "\n".join(lines)
 
     sym = args[0].upper()
@@ -222,13 +226,13 @@ def _handle_boost(args: list[str]) -> str:
 
     if len(args) == 1:
         try:
-            row = sb.set_boost(sym, None)
+            row = sb.set_boost(sym, None, source="manual")
         except ValueError as exc:
             return f"❌ {exc}"
         return (
-            f"✅ Boost {sym} → {sb.fmt_mult(row['mult'])}\n"
+            f"✅ Boost {sym} → {sb.fmt_mult(row['mult'])} [manual]\n"
             f"File: .state/boost/{sym}.json\n"
-            "Applies on next arm (entry + DCA)."
+            "Applies on next arm (entry + DCA). Auto will not override."
         )
 
     tok = args[1].lower()
@@ -249,13 +253,13 @@ def _handle_boost(args: list[str]) -> str:
             return f"✅ Boost cleared for {sym} (mult < {sb.MIN_MULT:g})"
         return f"No boost file for {sym}"
     try:
-        row = sb.set_boost(sym, mult)
+        row = sb.set_boost(sym, mult, source="manual")
     except ValueError as exc:
         return f"❌ {exc}"
     return (
-        f"✅ Boost {sym} → {sb.fmt_mult(row['mult'])}\n"
+        f"✅ Boost {sym} → {sb.fmt_mult(row['mult'])} [manual]\n"
         f"File: .state/boost/{sym}.json\n"
-        "Applies on next arm (entry + DCA)."
+        "Applies on next arm (entry + DCA). Auto will not override."
     )
 
 
@@ -269,7 +273,7 @@ def handle_command(cmd: str, args: list[str]) -> str:
             "/fib SYMBOL [long|short|auto] — start FIB micro-grid\n"
             "/stop SYMBOL — stop DCA and/or FIB (orders & position stay)\n"
             "/status SYMBOL — process + trading state\n"
-            "/boost [SYMBOL [mult|off]] — size boost (.state/boost/SYMBOL.json)\n"
+            "/boost [SYMBOL [mult|off]] — size boost (manual wins over auto)\n"
             "/cleanup SYMBOL — cancel obstage* Stop/TP algos\n"
             "/sweep [SYMBOL] — cancel orphan bot limits/algos when flat\n"
             "/review SYMBOL — DeepSeek situational review\n"

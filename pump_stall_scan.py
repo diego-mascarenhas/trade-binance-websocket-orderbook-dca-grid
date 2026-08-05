@@ -494,6 +494,26 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
     if args is not None:
         trade_exit = _trade_exit_mode(args)
         protect_be = _protect_be_for_trade(args)
+    # Size-boost auto knobs (see size_boost.py) — for Help page
+    try:
+        import size_boost as sb
+
+        boost_mult = float(sb.default_mult())
+        boost_dwell = int(sb.auto_dwell_cycles())
+        boost_ttl_h = float(sb.auto_ttl_hours())
+        boost_auto = bool(sb.auto_enabled())
+        boost_strict_stall = float(sb.STRICT_MIN_STALL)
+        boost_strict_near = float(sb.STRICT_MIN_NEAR)
+        boost_strict_ideal = float(sb.STRICT_IDEAL_NEAR)
+    except Exception:  # noqa: BLE001
+        boost_mult = 1.5
+        boost_dwell = 2
+        boost_ttl_h = 5.0
+        boost_auto = True
+        boost_strict_stall = 35.0
+        boost_strict_near = 85.0
+        boost_strict_ideal = 92.0
+
     return {
         "trade_exit": trade_exit,
         "protect_be": protect_be,
@@ -514,6 +534,13 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "max_trades": _max_trades(
             args if args is not None else argparse.Namespace(max_trades=3),
         ),
+        "boost_mult": boost_mult,
+        "boost_dwell": boost_dwell,
+        "boost_ttl_h": boost_ttl_h,
+        "boost_auto": 1 if boost_auto else 0,
+        "boost_strict_stall": boost_strict_stall,
+        "boost_strict_near": boost_strict_near,
+        "boost_strict_ideal": boost_strict_ideal,
     }
 
 
@@ -1090,6 +1117,16 @@ def _maybe_auto_trade(
     """
     active = _reap_active(active)
     max_trades = _max_trades(args)
+
+    # Size boost each cycle (even if weekend/margin blocks new ★ launches)
+    try:
+        import size_boost as sb
+
+        boost_note = sb.sync_auto_boost(hits, ideal_near=float(args.ideal_near))
+        if boost_note:
+            print(f"{BOLD}{CYAN}{boost_note}{RESET}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"{DIM}AUTO boost skipped: {exc}{RESET}")
 
     if _weekend_block_active():
         print(
