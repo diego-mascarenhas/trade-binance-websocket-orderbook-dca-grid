@@ -2,7 +2,8 @@
 
 SHORT: STOP_MARKET BUY reduce-only
   · Partial (tag RR): impulse_high × (1 + RISK_REDUCE_BUFFER_PCT), qty = RISK_REDUCE_PCT%%
-  · Full    (tag RF): impulse_high × (1 + RISK_FULL_BUFFER_PCT), remaining qty
+  · Full    (tag RF): first-entry-style catastrophe — impulse_high × (1 + RISK_FULL_BUFFER_PCT)
+    Default buffer matches the worst observed MAE from first entry (~48%), not a tight % .
 
 After the partial fills: cancel DCA so supervise can re-arm **above** (ask walls)
 only if the setup is still ★-like (near the 1D high). Telegram suggests the full SL
@@ -12,7 +13,7 @@ Env / CLI:
   RISK_REDUCE=1
   RISK_REDUCE_PCT=50
   RISK_REDUCE_BUFFER_PCT=0.8
-  RISK_FULL_BUFFER_PCT=4
+  RISK_FULL_BUFFER_PCT=48
   RISK_REDUCE_IDEAL_NEAR=90   # re-arm after cut only if near_high ≥ this
 """
 
@@ -69,7 +70,8 @@ def full_buffer_pct(args: argparse.Namespace) -> float:
     v = getattr(args, "risk_full_buffer_pct", None)
     if v is not None:
         return max(0.0, float(v))
-    return max(0.0, _env_float("RISK_FULL_BUFFER_PCT", 4.0))
+    # Default ~ worst observed MAE from first entry (BEAT ~47.9%); far catastrophe only.
+    return max(0.0, _env_float("RISK_FULL_BUFFER_PCT", 48.0))
 
 
 def ideal_near_for_rearm(args: argparse.Namespace | None = None) -> float:

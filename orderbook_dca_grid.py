@@ -2134,8 +2134,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--risk-full-buffer-pct",
         type=float,
         default=None,
-        help="%% above impulse high for the full SL (default 4; 0=off). "
-             "Telegram suggests this level when armed. Env: RISK_FULL_BUFFER_PCT",
+        help="%% above impulse high for the full SL (default 48 ≈ worst MAE from "
+             "first entry; 0=off). Telegram suggests this level when armed. "
+             "Env: RISK_FULL_BUFFER_PCT",
     )
     p.add_argument("--be-arm-pct", type=float, default=None,
                    help="[--protect-be] Arm BE SL when unrealized profit %% ≥ this "
