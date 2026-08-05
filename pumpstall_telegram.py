@@ -417,7 +417,7 @@ def record_trade(
     with TRADES_FILE.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     try:
-        write_stats_snapshot()
+        push_stats_snapshot()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Pumpstall stats snapshot skipped: %s", exc)
 
@@ -710,6 +710,58 @@ def write_stats_snapshot(
     return out
 
 
+def push_stats_snapshot(
+    *,
+    include_wallet_report: bool = False,
+) -> bool:
+    """Write local stats JSON and POST it to the Pumpstall site (HTTPS ingest).
+
+    Needed when VPS :8787 is firewalled from the web host.
+    Env:
+      PUMPSTALL_STATS_PUSH_URL=https://pumpstall.com/api/pumpstall-stats
+      PUMPSTALL_STATS_PUSH_TOKEN=…  (or API_TOKEN / same as site PUMPSTALL_SCAN_TOKEN)
+    """
+    _load_dotenv()
+    path = write_stats_snapshot(include_wallet_report=include_wallet_report)
+    url = (os.getenv("PUMPSTALL_STATS_PUSH_URL") or "").strip()
+    if not url:
+        return True  # local snapshot only
+    token = (
+        (os.getenv("PUMPSTALL_STATS_PUSH_TOKEN") or "").strip()
+        or (os.getenv("API_TOKEN") or "").strip()
+    )
+    if not token:
+        logger.warning("Pumpstall stats push skipped: no PUMPSTALL_STATS_PUSH_TOKEN/API_TOKEN")
+        return False
+    try:
+        body = path.read_bytes()
+    except OSError as exc:
+        logger.warning("Pumpstall stats push read failed: %s", exc)
+        return False
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "pumpstall-bot/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            ok = 200 <= int(getattr(resp, "status", 200) or 200) < 300
+            if not ok:
+                logger.warning("Pumpstall stats push HTTP %s", getattr(resp, "status", "?"))
+            return ok
+    except urllib.error.HTTPError as exc:
+        logger.warning("Pumpstall stats push HTTP %s: %s", exc.code, exc.reason)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Pumpstall stats push failed: %s", exc)
+        return False
+
+
 def format_daily_summary(
     *,
     as_of: date | None = None,
@@ -803,7 +855,7 @@ def maybe_send_daily_summary(*, force: bool = False) -> bool:
                 logger.warning("Pumpstall equity snapshot skipped: %s", exc)
             logger.info("Pumpstall daily summary sent for %s", today_s)
             try:
-                write_stats_snapshot(include_wallet_report=True)
+                push_stats_snapshot(include_wallet_report=True)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Pumpstall stats after report skipped: %s", exc)
         else:
