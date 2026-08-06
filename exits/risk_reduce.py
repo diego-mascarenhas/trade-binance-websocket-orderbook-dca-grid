@@ -392,6 +392,7 @@ def run_once(
 
     # Freeze HTF swing on first arm; upgrade if frozen high is below grid or below live {bars}d peak
     impulse = float(state.get("risk_impulse_high", 0) or 0)
+    prev_impulse = impulse
     need_refresh = impulse <= 0
     if impulse > 0 and grid_top > 0 and impulse < grid_top:
         need_refresh = True
@@ -420,6 +421,17 @@ def run_once(
     partial_trig, full_trig = _triggers(
         impulse, side_is_long, args, rr_floor=rr_floor,
     )
+    # Re-announce on Telegram if swing/trigger moved after first suggest (migration / grid floor)
+    prev_partial = float(state.get("risk_partial_trig", 0) or 0)
+    if (
+        bool(state.get("risk_tg_suggested"))
+        and (
+            (prev_impulse > 0 and impulse > prev_impulse * 1.0001)
+            or (prev_partial > 0 and partial_trig > prev_partial * 1.0001)
+        )
+    ):
+        state.pop("risk_tg_suggested", None)
+        staged.save_state(sym, state)
     pct = reduce_pct(args)
     qty_d = grid._round_to(qty, step, ROUND_DOWN)
     if qty_d <= 0:
@@ -473,7 +485,11 @@ def run_once(
     })
     staged.save_state(sym, state)
 
-    if first_arm and rr is not None:
+    # First arm, or re-suggest after swing/trigger upgrade (risk_tg_suggested cleared above)
+    should_announce = rr is not None and (
+        first_arm or not bool(state.get("risk_tg_suggested"))
+    )
+    if should_announce:
         print(
             f"{grid.BOLD}{grid.CYAN}✓ Risk-reduce · {side} cut {pct:g}% @ "
             f"{grid.price_fmt(partial_trig)} "
@@ -495,7 +511,7 @@ def run_once(
         )
         _telegram_suggest(
             sym, side, float(qty_d), entry, impulse, partial_trig, full_trig, pct, args,
-            hedge, api, sec, recv,
+            hedge, api, sec, recv, grid_top=grid_top,
         )
     else:
         print(
@@ -618,6 +634,8 @@ def _telegram_suggest(
     api: str,
     sec: str,
     recv: int,
+    *,
+    grid_top: float = 0.0,
 ) -> None:
     import orderbook_staged_exit as staged
 
@@ -640,6 +658,8 @@ def _telegram_suggest(
             full_buffer_pct=full_buffer_pct(args),
             leverage=lev,
             pnl_usdt=upnl,
+            swing_bars=swing_bars(args),
+            grid_top=grid_top if grid_top > 0 else None,
         )
         st["risk_tg_suggested"] = True
         staged.save_state(symbol, st)

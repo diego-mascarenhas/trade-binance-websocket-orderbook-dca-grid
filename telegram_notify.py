@@ -483,11 +483,13 @@ def notify_risk_reduce_armed(
     full_buffer_pct: float,
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
+    swing_bars: int = 120,
+    grid_top: float | None = None,
 ) -> None:
     """Announce partial cut + suggested full SL (Telegram suggests the far stop)."""
     notional = abs(qty) * abs(entry)
     full_line = (
-        f"Suggested full SL → {full_sl:g} (+{full_buffer_pct:g}% over high {impulse_high:g})"
+        f"Suggested full SL → {full_sl:g} (+{full_buffer_pct:g}% over swing {impulse_high:g})"
         if full_sl and full_sl > 0
         else "Full SL: off"
     )
@@ -509,11 +511,17 @@ def notify_risk_reduce_armed(
             f" · {fmt_vol(qty, entry, leverage)}"
             f"{pnl_suffix(pnl_usdt, notional, leverage)}"
         )
+    grid_note = ""
+    if grid_top and grid_top > 0:
+        floor = grid_top * (1.0 + reduce_buffer_pct / 100.0)
+        if partial_sl + 1e-12 >= floor:
+            grid_note = f"\nAbove DCA grid top {grid_top:g}"
     send_shield(
         f"{symbol.upper()} futures #RISK {direction.upper()}\n"
         f"Risk-reduce armed\n"
-        f"Impulse high {impulse_high:g}\n"
-        f"Cut ~{reduce_pct:.0f}% @ {partial_sl:g} (+{reduce_buffer_pct:g}%){detail}\n"
+        f"HTF swing ({swing_bars:d}d) {impulse_high:g}\n"
+        f"Cut ~{reduce_pct:.0f}% @ {partial_sl:g} (+{reduce_buffer_pct:g}%){detail}"
+        f"{grid_note}\n"
         f"{full_line}"
     )
 
@@ -549,7 +557,7 @@ def notify_risk_reduce_filled(
         f"Closed {closed_qty:g} · runner {remain_qty:g} · "
         f"{fmt_vol(remain_qty, entry, leverage)}"
         f"{pnl_suffix(pnl_usdt, notional, leverage)}\n"
-        f"High was {impulse_high:g} · {rearm_txt}{full_txt}"
+        f"HTF swing was {impulse_high:g} · {rearm_txt}{full_txt}"
     )
     if _skip_ops_trade():
         send_tp(body)
