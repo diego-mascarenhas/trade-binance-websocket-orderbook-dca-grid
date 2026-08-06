@@ -1,20 +1,24 @@
-"""Orthogonal risk-reduce addon: partial cut above impulse high + far full SL.
+"""Orthogonal risk-reduce addon: partial cut above HTF swing high + far full SL.
 
 SHORT: STOP_MARKET BUY reduce-only
-  · Partial (tag RR): impulse_high × (1 + RISK_REDUCE_BUFFER_PCT), qty = RISK_REDUCE_PCT%%
-  · Full    (tag RF): first-entry-style catastrophe — impulse_high × (1 + RISK_FULL_BUFFER_PCT)
-    Default buffer matches the worst observed MAE from first entry (~48%), not a tight % .
+  · Partial (tag RR): max(swing_high × (1 + buffer), above DCA grid top)
+  · Full    (tag RF): swing_high × (1 + RISK_FULL_BUFFER_PCT) — catastrophe
 
-After the partial fills: cancel DCA so supervise can re-arm **above** (ask walls)
-only if the setup is still ★-like (near the 1D high). Telegram suggests the full SL
-when the pair of stops is first armed.
+Swing high = max high of the last RISK_REDUCE_SWING_BARS daily candles (default 120).
+RR is never placed inside the open ask DCA ladder.
+
+After the partial fills:
+  · cancel DCA (re-arm above only if still ★-like)
+  · store recovery_pct so structure/BE require the runner to cover RR loss
+  · full SL stays synced to remaining size
 
 Env / CLI:
   RISK_REDUCE=1
   RISK_REDUCE_PCT=50
   RISK_REDUCE_BUFFER_PCT=0.8
   RISK_FULL_BUFFER_PCT=48
-  RISK_REDUCE_IDEAL_NEAR=90   # re-arm after cut only if near_high ≥ this
+  RISK_REDUCE_SWING_BARS=120
+  RISK_REDUCE_IDEAL_NEAR=90
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from typing import Any
 
 TAG_PARTIAL = "RR"
 TAG_FULL = "RF"
+DEFAULT_SWING_BARS = 120
 
 
 def _env_float(name: str, default: float) -> float:
@@ -34,6 +39,16 @@ def _env_float(name: str, default: float) -> float:
         return default
     try:
         return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(float(raw))
     except (TypeError, ValueError):
         return default
 
@@ -70,8 +85,16 @@ def full_buffer_pct(args: argparse.Namespace) -> float:
     v = getattr(args, "risk_full_buffer_pct", None)
     if v is not None:
         return max(0.0, float(v))
-    # Default ~ worst observed MAE from first entry (BEAT ~47.9%); far catastrophe only.
     return max(0.0, _env_float("RISK_FULL_BUFFER_PCT", 48.0))
+
+
+def swing_bars(args: argparse.Namespace | None = None) -> int:
+    """Daily bars for HTF swing high (default 120 ≈ 4 months)."""
+    if args is not None:
+        v = getattr(args, "risk_reduce_swing_bars", None)
+        if v is not None:
+            return max(14, int(v))
+    return max(14, _env_int("RISK_REDUCE_SWING_BARS", DEFAULT_SWING_BARS))
 
 
 def ideal_near_for_rearm(args: argparse.Namespace | None = None) -> float:
@@ -93,12 +116,26 @@ def allow_dca_rearm(symbol: str) -> bool:
         return True
 
 
-def fetch_impulse_high(symbol: str, *, bars: int = 14) -> float | None:
-    """Max high of the last ``bars`` daily candles (same window as pump_stall)."""
+def recovery_pct_for(symbol: str) -> float:
+    """Min runner profit %% required to cover RR loss (0 if inactive)."""
+    try:
+        import orderbook_staged_exit as staged
+
+        st = staged.load_state(symbol.upper())
+        if not bool(st.get("risk_recovery_active")):
+            return 0.0
+        return max(0.0, float(st.get("risk_recovery_pct") or 0))
+    except Exception:
+        return 0.0
+
+
+def fetch_impulse_high(symbol: str, *, bars: int = DEFAULT_SWING_BARS) -> float | None:
+    """Max high of the last ``bars`` daily candles (HTF swing)."""
+    bars = max(14, int(bars))
     try:
         from futures_scan import FAPI_BASE, fetch_klines
 
-        kl = fetch_klines(FAPI_BASE, symbol.upper(), "1d", max(bars + 2, 20))
+        kl = fetch_klines(FAPI_BASE, symbol.upper(), "1d", max(bars + 2, 130))
     except Exception:
         return None
     if not kl:
@@ -112,12 +149,20 @@ def fetch_impulse_high(symbol: str, *, bars: int = 14) -> float | None:
     return max(highs) if highs else None
 
 
-def near_high_pct(symbol: str, *, bars: int = 14) -> float | None:
-    """last / impulse_high × 100 (scanner ★ metric)."""
+def near_high_pct(
+    symbol: str,
+    *,
+    bars: int = DEFAULT_SWING_BARS,
+    args: argparse.Namespace | None = None,
+) -> float | None:
+    """last / impulse_high × 100 (vs HTF swing)."""
+    if args is not None:
+        bars = swing_bars(args)
+    bars = max(14, int(bars))
     try:
         from futures_scan import FAPI_BASE, fetch_klines
 
-        kl = fetch_klines(FAPI_BASE, symbol.upper(), "1d", max(bars + 2, 20))
+        kl = fetch_klines(FAPI_BASE, symbol.upper(), "1d", max(bars + 2, 130))
     except Exception:
         return None
     if not kl:
@@ -133,30 +178,64 @@ def near_high_pct(symbol: str, *, bars: int = 14) -> float | None:
 
 
 def still_suggested(symbol: str, args: argparse.Namespace | None = None) -> bool:
-    near = near_high_pct(symbol)
+    near = near_high_pct(symbol, args=args)
     if near is None:
         return False
     return near >= ideal_near_for_rearm(args)
+
+
+def dca_grid_top(
+    symbol: str,
+    api: str,
+    sec: str,
+    recv: int,
+    *,
+    entry: float = 0.0,
+) -> float:
+    """Highest open obdca* limit price (SHORT ask ladder), else entry."""
+    import orderbook_dca_grid as grid
+
+    top = float(entry or 0)
+    try:
+        oo = grid._signed_request(
+            "GET", "/fapi/v1/openOrders", {"symbol": symbol.upper()}, api, sec, recv,
+        ) or []
+    except Exception:
+        return top
+    for o in oo if isinstance(oo, list) else []:
+        cid = grid._order_client_id(o)
+        if not cid.startswith("obdca"):
+            continue
+        try:
+            px = float(o.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if px > top:
+            top = px
+    return top
 
 
 def _triggers(
     impulse_high: float,
     is_long: bool,
     args: argparse.Namespace,
+    *,
+    rr_floor: float = 0.0,
 ) -> tuple[float, float | None]:
     """Return (partial_trigger, full_trigger_or_None)."""
     rb = reduce_buffer_pct(args) / 100.0
     fb = full_buffer_pct(args) / 100.0
     if is_long:
-        # Invalidation below impulse low is not this addon's focus; mirror for safety
-        # using the same high as a symmetric buffer under entry is wrong — skip long
-        # full/partial on "high". For longs use low of window if we ever need it.
-        # Pumpstall is SHORT-first: place stops above high for shorts only.
         partial = impulse_high * (1.0 - rb)
         full = impulse_high * (1.0 - fb) if fb > 0 else None
     else:
         partial = impulse_high * (1.0 + rb)
+        if rr_floor > 0:
+            partial = max(partial, rr_floor)
         full = impulse_high * (1.0 + fb) if fb > 0 else None
+        if full is not None and full <= partial:
+            # Keep catastrophe SL strictly above the partial cut
+            full = partial * (1.0 + max(fb, 0.05))
     return partial, full
 
 
@@ -254,6 +333,10 @@ def sync_flat(
         "risk_armed_qty",
         "risk_block_rearm",
         "risk_tg_suggested",
+        "risk_partial_loss_usdt",
+        "risk_recovery_pct",
+        "risk_recovery_active",
+        "risk_reduce_pct",
     ):
         st.pop(k, None)
     staged.save_state(symbol.upper(), st)
@@ -287,6 +370,7 @@ def run_once(
     step = filt["step_size"]
     state = staged.load_state(sym)
     side = "SHORT"
+    bars = swing_bars(args)
 
     # Detect partial fill: we had RR armed, RR gone, qty shrank vs armed
     rr_open = staged.find_our_algo(sym, TAG_PARTIAL, api, sec, recv)
@@ -302,17 +386,40 @@ def run_once(
             state = staged.load_state(sym)
             already_filled = True
 
-    # Freeze impulse high on first arm (do not chase a rising ATH mid-trade)
+    grid_top = dca_grid_top(sym, api, sec, recv, entry=entry)
+    rb = reduce_buffer_pct(args) / 100.0
+    rr_floor = grid_top * (1.0 + rb) if grid_top > 0 else 0.0
+
+    # Freeze HTF swing on first arm; upgrade if frozen high is below grid or below live {bars}d peak
     impulse = float(state.get("risk_impulse_high", 0) or 0)
-    if impulse <= 0:
-        fetched = fetch_impulse_high(sym)
-        if not fetched or fetched <= 0:
+    need_refresh = impulse <= 0
+    if impulse > 0 and grid_top > 0 and impulse < grid_top:
+        need_refresh = True
+        print(
+            f"{grid.YELLOW}Risk-reduce: frozen high {grid.price_fmt(impulse)} "
+            f"< grid top {grid.price_fmt(grid_top)} — re-fetch {bars}d swing{grid.RESET}"
+        )
+    fetched = fetch_impulse_high(sym, bars=bars)
+    if not fetched or fetched <= 0:
+        if need_refresh or impulse <= 0:
             print(f"{grid.DIM}Risk-reduce: no impulse high for {sym}{grid.RESET}")
             return
-        impulse = float(fetched)
+    else:
+        fetched_f = float(fetched)
+        if impulse <= 0 or need_refresh:
+            impulse = fetched_f
+        elif fetched_f > impulse * 1.0001:
+            # Live HTF peak higher than old freeze (e.g. migrate 14d → 120d)
+            print(
+                f"{grid.CYAN}Risk-reduce: upgrade swing {grid.price_fmt(impulse)} → "
+                f"{grid.price_fmt(fetched_f)} ({bars}d){grid.RESET}"
+            )
+            impulse = fetched_f
         state["risk_impulse_high"] = impulse
 
-    partial_trig, full_trig = _triggers(impulse, side_is_long, args)
+    partial_trig, full_trig = _triggers(
+        impulse, side_is_long, args, rr_floor=rr_floor,
+    )
     pct = reduce_pct(args)
     qty_d = grid._round_to(qty, step, ROUND_DOWN)
     if qty_d <= 0:
@@ -348,13 +455,13 @@ def run_once(
         sym, side_is_long, float(cut_d), partial_trig, TAG_PARTIAL,
         args, hedge, api, sec, filt, dry=dry,
     )
-    rf = None
     if full_trig is not None and full_trig > partial_trig:
-        rf = _ensure_stop(
+        _ensure_stop(
             sym, side_is_long, float(qty_d), full_trig, TAG_FULL,
             args, hedge, api, sec, filt, dry=dry,
         )
 
+    above_grid = rr_floor > 0 and partial_trig + 1e-12 >= rr_floor
     state.update({
         "risk_reduce_armed": True,
         "risk_reduce_filled": False,
@@ -369,8 +476,15 @@ def run_once(
     if first_arm and rr is not None:
         print(
             f"{grid.BOLD}{grid.CYAN}✓ Risk-reduce · {side} cut {pct:g}% @ "
-            f"{grid.price_fmt(partial_trig)} (+{reduce_buffer_pct(args):g}% over "
-            f"high {grid.price_fmt(impulse)})"
+            f"{grid.price_fmt(partial_trig)} "
+            f"(swing {bars}d high {grid.price_fmt(impulse)} "
+            f"+{reduce_buffer_pct(args):g}%"
+            + (
+                f" · ≥ grid top {grid.price_fmt(grid_top)}"
+                if above_grid and grid_top > 0
+                else ""
+            )
+            + ")"
             + (
                 f" · full SL @ {grid.price_fmt(full_trig)} "
                 f"(+{full_buffer_pct(args):g}%)"
@@ -388,7 +502,7 @@ def run_once(
             f"{grid.DIM}Risk-reduce sync · {side} cut={float(cut_d):g} @ "
             f"{grid.price_fmt(partial_trig)}"
             + (f" · full @ {grid.price_fmt(full_trig)}" if full_trig else "")
-            + f"{grid.RESET}"
+            + f" · swing {bars}d{grid.RESET}"
         )
 
 
@@ -416,9 +530,24 @@ def _on_partial_filled(
     full_trig = state.get("risk_full_trig")
     pct = float(state.get("risk_reduce_pct", reduce_pct(args)) or reduce_pct(args))
 
+    # Runner must recover RR loss before structure/BE can flatten
+    fill = partial_trig if partial_trig > 0 else entry
+    if side_is_long:
+        loss_usdt = max(0.0, closed * (entry - fill))
+    else:
+        loss_usdt = max(0.0, closed * (fill - entry))
+    remain = max(float(qty), 0.0)
+    if remain > 0 and entry > 0 and loss_usdt > 0:
+        recovery_pct = loss_usdt / (remain * entry) * 100.0
+    else:
+        recovery_pct = 0.0
+
     suggested = still_suggested(sym, args)
     state["risk_reduce_filled"] = True
     state["risk_block_rearm"] = not suggested
+    state["risk_partial_loss_usdt"] = float(loss_usdt)
+    state["risk_recovery_pct"] = float(recovery_pct)
+    state["risk_recovery_active"] = recovery_pct > 0
     staged.save_state(sym, state)
 
     # Drop DCA so supervise can re-arm above (shorts) if still ★-like
@@ -429,15 +558,22 @@ def _on_partial_filled(
     except Exception as exc:
         print(f"{grid.YELLOW}Risk-reduce DCA cancel skipped: {exc}{grid.RESET}")
 
+    recover_note = (
+        f" · runner needs ≥+{recovery_pct:.2f}% to recover RR ({loss_usdt:.2f} USDT)"
+        if recovery_pct > 0
+        else ""
+    )
     if suggested:
         print(
             f"{grid.BOLD}{grid.GREEN}✓ Risk-reduce filled · closed ~{closed:g} "
-            f"({pct:g}%) · runner {qty:g} · setup still near high → re-arm DCA{grid.RESET}"
+            f"({pct:g}%) · runner {qty:g} · setup still near high → re-arm DCA"
+            f"{recover_note}{grid.RESET}"
         )
     else:
         print(
             f"{grid.BOLD}{grid.YELLOW}✓ Risk-reduce filled · closed ~{closed:g} "
-            f"({pct:g}%) · runner {qty:g} · setup no longer ★ → no DCA re-arm{grid.RESET}"
+            f"({pct:g}%) · runner {qty:g} · setup no longer ★ → no DCA re-arm"
+            f"{recover_note}{grid.RESET}"
         )
 
     try:

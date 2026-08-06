@@ -134,6 +134,14 @@ def _maybe_post_be_trail(
 
     recv = int(getattr(args, "recv_window", 15000) or 15000)
     arm = post_be_arm_pct(args)
+    try:
+        from exits.risk_reduce import recovery_pct_for
+
+        rec = float(recovery_pct_for(symbol) or 0)
+        if rec > 0:
+            arm = max(arm, rec)
+    except Exception:
+        pass
     cb = post_be_callback(args)
     side = "LONG" if side_is_long else "SHORT"
     existing_tr = staged.find_our_algo(symbol, "TR", api, sec, recv)
@@ -237,6 +245,15 @@ def run_once(
     recv = int(getattr(args, "recv_window", 15000) or 15000)
     arm_pct = be_arm_pct(args)
     lock_pct = be_profit_pct(args)
+    try:
+        from exits.risk_reduce import recovery_pct_for
+
+        rec = float(recovery_pct_for(symbol) or 0)
+        if rec > 0:
+            arm_pct = max(arm_pct, rec)
+            lock_pct = max(lock_pct, rec)
+    except Exception:
+        pass
     side = "LONG" if side_is_long else "SHORT"
 
     try:

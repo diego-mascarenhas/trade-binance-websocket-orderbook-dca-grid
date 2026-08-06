@@ -2112,9 +2112,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--risk-reduce",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="SHORT: partial STOP above 1D impulse high + far full SL "
-             "(default on via RISK_REDUCE=1). After partial fill, re-arm DCA if still ★. "
-             "Env: RISK_REDUCE",
+        help="SHORT: partial STOP above HTF 1D swing high + far full SL "
+             "(default on via RISK_REDUCE=1). Always above the DCA grid top. "
+             "After partial fill, runner must recover RR loss before BE/structure; "
+             "re-arm DCA if still ★. Env: RISK_REDUCE",
     )
     p.add_argument(
         "--risk-reduce-pct",
@@ -2127,14 +2128,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--risk-reduce-buffer-pct",
         type=float,
         default=None,
-        help="%% above impulse high for the partial cut (default 0.8). "
+        help="%% above swing high for the partial cut (default 0.8). "
              "Env: RISK_REDUCE_BUFFER_PCT",
+    )
+    p.add_argument(
+        "--risk-reduce-swing-bars",
+        type=int,
+        default=None,
+        help="Daily bars for HTF swing high used by risk-reduce (default 120). "
+             "Env: RISK_REDUCE_SWING_BARS",
     )
     p.add_argument(
         "--risk-full-buffer-pct",
         type=float,
         default=None,
-        help="%% above impulse high for the full SL (default 48 ≈ worst MAE from "
+        help="%% above swing high for the full SL (default 48 ≈ worst MAE from "
              "first entry; 0=off). Telegram suggests this level when armed. "
              "Env: RISK_FULL_BUFFER_PCT",
     )
