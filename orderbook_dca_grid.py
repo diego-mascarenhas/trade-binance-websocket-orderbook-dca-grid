@@ -2142,9 +2142,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--risk-full-buffer-pct",
         type=float,
         default=None,
-        help="%% above swing high for the full SL (default 48 ≈ worst MAE from "
-             "first entry; 0=off). Telegram suggests this level when armed. "
+        help="Fallback %% above RR swing for the full SL when no prior HTF pivot "
+             "exists (default 48; 0=disable full SL). Prefer prior swing above RR. "
              "Env: RISK_FULL_BUFFER_PCT",
+    )
+    p.add_argument(
+        "--risk-full-swing-lookback",
+        type=int,
+        default=None,
+        help="Daily bars searched for the prior HTF pivot above the RR swing "
+             "(default 500). Env: RISK_FULL_SWING_LOOKBACK",
+    )
+    p.add_argument(
+        "--risk-full-swing-min-gap-pct",
+        type=float,
+        default=None,
+        help="Prior full-SL swing must clear the RR swing by at least this %% "
+             "(default 10; skips nearby noise). Env: RISK_FULL_SWING_MIN_GAP_PCT",
     )
     p.add_argument("--be-arm-pct", type=float, default=None,
                    help="[--protect-be] Arm BE SL when unrealized profit %% ≥ this "

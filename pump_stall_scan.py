@@ -551,6 +551,8 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "risk_reduce_pct": float(os.getenv("RISK_REDUCE_PCT", "50") or 50),
         "risk_reduce_buffer_pct": float(os.getenv("RISK_REDUCE_BUFFER_PCT", "0.8") or 0.8),
         "risk_full_buffer_pct": float(os.getenv("RISK_FULL_BUFFER_PCT", "48") or 48),
+        "risk_full_swing_lookback": int(float(os.getenv("RISK_FULL_SWING_LOOKBACK", "500") or 500)),
+        "risk_full_swing_min_gap_pct": float(os.getenv("RISK_FULL_SWING_MIN_GAP_PCT", "10") or 10),
         "risk_reduce_swing_bars": int(float(os.getenv("RISK_REDUCE_SWING_BARS", "120") or 120)),
         "risk_reduce_ideal_near": float(os.getenv("RISK_REDUCE_IDEAL_NEAR", "90") or 90),
     }

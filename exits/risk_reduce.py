@@ -2,7 +2,8 @@
 
 SHORT: STOP_MARKET BUY reduce-only
   · Partial (tag RR): max(swing_high × (1 + buffer), above DCA grid top)
-  · Full    (tag RF): swing_high × (1 + RISK_FULL_BUFFER_PCT) — catastrophe
+  · Full    (tag RF): prior HTF pivot high above the RR swing (+ small buffer)
+    Fallback: RR swing × (1 + RISK_FULL_BUFFER_PCT) if no higher pivot exists
 
 Swing high = max high of the last RISK_REDUCE_SWING_BARS daily candles (default 120).
 RR is never placed inside the open ask DCA ladder.
@@ -16,7 +17,9 @@ Env / CLI:
   RISK_REDUCE=1
   RISK_REDUCE_PCT=50
   RISK_REDUCE_BUFFER_PCT=0.8
-  RISK_FULL_BUFFER_PCT=48
+  RISK_FULL_BUFFER_PCT=48          # fallback %% if no prior swing; 0=disable full SL
+  RISK_FULL_SWING_LOOKBACK=500     # daily bars to search for prior HTF pivot
+  RISK_FULL_SWING_MIN_GAP_PCT=10   # prior swing must sit ≥ this %% above RR swing
   RISK_REDUCE_SWING_BARS=120
   RISK_REDUCE_IDEAL_NEAR=90
 """
@@ -31,6 +34,10 @@ from typing import Any
 TAG_PARTIAL = "RR"
 TAG_FULL = "RF"
 DEFAULT_SWING_BARS = 120
+DEFAULT_FULL_LOOKBACK = 500
+DEFAULT_FULL_MIN_GAP_PCT = 10.0
+PIVOT_LEFT = 5
+PIVOT_RIGHT = 5
 
 
 def _env_float(name: str, default: float) -> float:
@@ -81,11 +88,29 @@ def reduce_buffer_pct(args: argparse.Namespace) -> float:
 
 
 def full_buffer_pct(args: argparse.Namespace) -> float:
-    """0 = disable full SL (only partial)."""
+    """Fallback %% above RR swing when no prior HTF pivot exists. 0 = disable full SL."""
     v = getattr(args, "risk_full_buffer_pct", None)
     if v is not None:
         return max(0.0, float(v))
     return max(0.0, _env_float("RISK_FULL_BUFFER_PCT", 48.0))
+
+
+def full_swing_lookback(args: argparse.Namespace | None = None) -> int:
+    """Daily bars searched for the prior HTF pivot above the RR swing."""
+    if args is not None:
+        v = getattr(args, "risk_full_swing_lookback", None)
+        if v is not None:
+            return max(60, min(1500, int(v)))
+    return max(60, min(1500, _env_int("RISK_FULL_SWING_LOOKBACK", DEFAULT_FULL_LOOKBACK)))
+
+
+def full_swing_min_gap_pct(args: argparse.Namespace | None = None) -> float:
+    """Prior swing must clear the RR swing by at least this %% (skip nearby noise)."""
+    if args is not None:
+        v = getattr(args, "risk_full_swing_min_gap_pct", None)
+        if v is not None:
+            return max(1.0, float(v))
+    return max(1.0, _env_float("RISK_FULL_SWING_MIN_GAP_PCT", DEFAULT_FULL_MIN_GAP_PCT))
 
 
 def swing_bars(args: argparse.Namespace | None = None) -> int:
@@ -129,24 +154,83 @@ def recovery_pct_for(symbol: str) -> float:
         return 0.0
 
 
-def fetch_impulse_high(symbol: str, *, bars: int = DEFAULT_SWING_BARS) -> float | None:
-    """Max high of the last ``bars`` daily candles (HTF swing)."""
+def _daily_highs(symbol: str, bars: int) -> list[float]:
     bars = max(14, int(bars))
     try:
         from futures_scan import FAPI_BASE, fetch_klines
 
-        kl = fetch_klines(FAPI_BASE, symbol.upper(), "1d", max(bars + 2, 130))
+        kl = fetch_klines(FAPI_BASE, symbol.upper(), "1d", min(1500, max(bars + 2, 130)))
     except Exception:
-        return None
+        return []
     if not kl:
-        return None
+        return []
     highs: list[float] = []
     for row in kl[-bars:]:
         try:
             highs.append(float(row[2]))
         except (TypeError, ValueError, IndexError):
             continue
+    return highs
+
+
+def fetch_impulse_high(symbol: str, *, bars: int = DEFAULT_SWING_BARS) -> float | None:
+    """Max high of the last ``bars`` daily candles (HTF swing)."""
+    highs = _daily_highs(symbol, bars)
     return max(highs) if highs else None
+
+
+def _pivot_high_indices(
+    highs: list[float],
+    *,
+    left: int = PIVOT_LEFT,
+    right: int = PIVOT_RIGHT,
+) -> list[tuple[int, float]]:
+    """Fractal pivot highs as (index, price)."""
+    n = len(highs)
+    if n < left + right + 1:
+        return []
+    out: list[tuple[int, float]] = []
+    for i in range(left, n - right):
+        h = highs[i]
+        if h <= 0:
+            continue
+        if any(highs[j] > h for j in range(i - left, i)):
+            continue
+        if any(highs[j] >= h for j in range(i + 1, i + right + 1)):
+            continue
+        out.append((i, h))
+    return out
+
+
+def fetch_prior_swing_high(
+    symbol: str,
+    impulse_high: float,
+    *,
+    lookback: int = DEFAULT_FULL_LOOKBACK,
+    rr_bars: int = DEFAULT_SWING_BARS,
+    min_gap_pct: float = DEFAULT_FULL_MIN_GAP_PCT,
+) -> float | None:
+    """HTF pivot high immediately before the RR swing (prior structural resistance).
+
+    Walks daily pivots older than the RR peak bar and picks the most recent one that
+    clears the RR swing by at least ``min_gap_pct`` (avoids nearby noise just above
+    the cut). Falls back to None → caller uses %% buffer.
+    """
+    if impulse_high <= 0:
+        return None
+    highs = _daily_highs(symbol, lookback)
+    if len(highs) < 30:
+        return None
+    rr_bars = max(14, int(rr_bars))
+    start = max(0, len(highs) - rr_bars)
+    rr_idx = start + max(range(len(highs) - start), key=lambda i: highs[start + i])
+    floor = impulse_high * (1.0 + max(1.0, float(min_gap_pct)) / 100.0)
+    pivots = _pivot_high_indices(highs)
+    # Most recent pivot before the RR peak that clears the min gap
+    candidates = [(i, h) for i, h in pivots if i < rr_idx and h >= floor]
+    if not candidates:
+        return None
+    return float(max(candidates, key=lambda t: t[0])[1])
 
 
 def near_high_pct(
@@ -221,22 +305,42 @@ def _triggers(
     args: argparse.Namespace,
     *,
     rr_floor: float = 0.0,
-) -> tuple[float, float | None]:
-    """Return (partial_trigger, full_trigger_or_None)."""
+    prior_swing: float | None = None,
+) -> tuple[float, float | None, str | None]:
+    """Return (partial_trigger, full_trigger_or_None, full_source).
+
+    full_source: ``prior_swing`` | ``pct_fallback`` | None (disabled).
+    """
     rb = reduce_buffer_pct(args) / 100.0
     fb = full_buffer_pct(args) / 100.0
     if is_long:
         partial = impulse_high * (1.0 - rb)
         full = impulse_high * (1.0 - fb) if fb > 0 else None
+        source = "pct_fallback" if full is not None else None
+        return partial, full, source
+
+    partial = impulse_high * (1.0 + rb)
+    if rr_floor > 0:
+        partial = max(partial, rr_floor)
+
+    # RISK_FULL_BUFFER_PCT=0 disables the far full SL entirely.
+    if fb <= 0:
+        return partial, None, None
+
+    source: str | None
+    full: float | None
+    if prior_swing and prior_swing > impulse_high * 1.002:
+        # Structural: prior HTF pivot above RR swing + small buffer
+        full = float(prior_swing) * (1.0 + rb)
+        source = "prior_swing"
     else:
-        partial = impulse_high * (1.0 + rb)
-        if rr_floor > 0:
-            partial = max(partial, rr_floor)
-        full = impulse_high * (1.0 + fb) if fb > 0 else None
-        if full is not None and full <= partial:
-            # Keep catastrophe SL strictly above the partial cut
-            full = partial * (1.0 + max(fb, 0.05))
-    return partial, full
+        full = impulse_high * (1.0 + fb)
+        source = "pct_fallback"
+
+    if full is not None and full <= partial:
+        # Keep catastrophe SL strictly above the partial cut
+        full = partial * (1.0 + max(rb, 0.05))
+    return partial, full, source
 
 
 def _ensure_stop(
@@ -330,6 +434,8 @@ def sync_flat(
         "risk_impulse_high",
         "risk_partial_trig",
         "risk_full_trig",
+        "risk_full_swing_high",
+        "risk_full_source",
         "risk_armed_qty",
         "risk_block_rearm",
         "risk_tg_suggested",
@@ -418,16 +524,49 @@ def run_once(
             impulse = fetched_f
         state["risk_impulse_high"] = impulse
 
-    partial_trig, full_trig = _triggers(
+    lookback = full_swing_lookback(args)
+    min_gap = full_swing_min_gap_pct(args)
+    prior = float(state.get("risk_full_swing_high", 0) or 0)
+    # Resolve / refresh prior HTF pivot above the RR swing
+    need_prior = (
+        prior <= impulse * (1.0 + min_gap / 100.0) * 0.999
+        or (prev_impulse > 0 and impulse > prev_impulse * 1.0001)
+    )
+    if need_prior:
+        fetched_prior = fetch_prior_swing_high(
+            sym, impulse, lookback=lookback, rr_bars=bars, min_gap_pct=min_gap,
+        )
+        if fetched_prior and fetched_prior > impulse * 1.002:
+            if prior <= 0 or abs(fetched_prior - prior) / prior > 0.001:
+                print(
+                    f"{grid.CYAN}Risk-reduce: prior swing "
+                    f"{grid.price_fmt(fetched_prior)} "
+                    f"(lookback {lookback}d · min gap {min_gap:g}%)"
+                    f"{grid.RESET}"
+                )
+            prior = float(fetched_prior)
+            state["risk_full_swing_high"] = prior
+        else:
+            prior = 0.0
+            state.pop("risk_full_swing_high", None)
+
+    partial_trig, full_trig, full_source = _triggers(
         impulse, side_is_long, args, rr_floor=rr_floor,
+        prior_swing=prior if prior > 0 else None,
     )
     # Re-announce on Telegram if swing/trigger moved after first suggest (migration / grid floor)
     prev_partial = float(state.get("risk_partial_trig", 0) or 0)
+    prev_full = float(state.get("risk_full_trig", 0) or 0)
     if (
         bool(state.get("risk_tg_suggested"))
         and (
             (prev_impulse > 0 and impulse > prev_impulse * 1.0001)
             or (prev_partial > 0 and partial_trig > prev_partial * 1.0001)
+            or (
+                full_trig
+                and prev_full > 0
+                and abs(float(full_trig) - prev_full) / prev_full > 0.002
+            )
         )
     ):
         state.pop("risk_tg_suggested", None)
@@ -446,11 +585,17 @@ def run_once(
             )
             if resp is not None:
                 state["risk_full_trig"] = full_trig
+                state["risk_full_source"] = full_source
+                if prior > 0:
+                    state["risk_full_swing_high"] = prior
                 staged.save_state(sym, state)
+                if full_source == "prior_swing" and prior > 0:
+                    note = f"prior swing {grid.price_fmt(prior)} +{reduce_buffer_pct(args):g}%"
+                else:
+                    note = f"fallback +{full_buffer_pct(args):g}% over RR {grid.price_fmt(impulse)}"
                 print(
                     f"{grid.DIM}Risk full-SL sync · {side} qty={float(qty_d):g} @ "
-                    f"{grid.price_fmt(full_trig)} (+{full_buffer_pct(args):g}% "
-                    f"over high {grid.price_fmt(impulse)}){grid.RESET}"
+                    f"{grid.price_fmt(full_trig)} ({note}){grid.RESET}"
                 )
         return
 
@@ -480,9 +625,12 @@ def run_once(
         "risk_impulse_high": impulse,
         "risk_partial_trig": partial_trig,
         "risk_full_trig": full_trig,
+        "risk_full_source": full_source,
         "risk_armed_qty": float(qty_d),
         "risk_reduce_pct": pct,
     })
+    if prior > 0:
+        state["risk_full_swing_high"] = prior
     staged.save_state(sym, state)
 
     # First arm, or re-suggest after swing/trigger upgrade (risk_tg_suggested cleared above)
@@ -490,6 +638,18 @@ def run_once(
         first_arm or not bool(state.get("risk_tg_suggested"))
     )
     if should_announce:
+        if full_trig and full_source == "prior_swing" and prior > 0:
+            full_note = (
+                f" · full SL @ {grid.price_fmt(full_trig)} "
+                f"(prior swing {grid.price_fmt(prior)} +{reduce_buffer_pct(args):g}%)"
+            )
+        elif full_trig:
+            full_note = (
+                f" · full SL @ {grid.price_fmt(full_trig)} "
+                f"(fallback +{full_buffer_pct(args):g}%)"
+            )
+        else:
+            full_note = ""
         print(
             f"{grid.BOLD}{grid.CYAN}✓ Risk-reduce · {side} cut {pct:g}% @ "
             f"{grid.price_fmt(partial_trig)} "
@@ -501,17 +661,14 @@ def run_once(
                 else ""
             )
             + ")"
-            + (
-                f" · full SL @ {grid.price_fmt(full_trig)} "
-                f"(+{full_buffer_pct(args):g}%)"
-                if full_trig
-                else ""
-            )
+            + full_note
             + f"{grid.RESET}"
         )
         _telegram_suggest(
             sym, side, float(qty_d), entry, impulse, partial_trig, full_trig, pct, args,
             hedge, api, sec, recv, grid_top=grid_top,
+            prior_swing=prior if prior > 0 else None,
+            full_source=full_source,
         )
     else:
         print(
@@ -636,6 +793,8 @@ def _telegram_suggest(
     recv: int,
     *,
     grid_top: float = 0.0,
+    prior_swing: float | None = None,
+    full_source: str | None = None,
 ) -> None:
     import orderbook_staged_exit as staged
 
@@ -660,6 +819,8 @@ def _telegram_suggest(
             pnl_usdt=upnl,
             swing_bars=swing_bars(args),
             grid_top=grid_top if grid_top > 0 else None,
+            prior_swing=prior_swing,
+            full_source=full_source,
         )
         st["risk_tg_suggested"] = True
         staged.save_state(symbol, st)

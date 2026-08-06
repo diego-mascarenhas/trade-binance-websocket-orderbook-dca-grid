@@ -485,14 +485,24 @@ def notify_risk_reduce_armed(
     pnl_usdt: float | None = None,
     swing_bars: int = 120,
     grid_top: float | None = None,
+    prior_swing: float | None = None,
+    full_source: str | None = None,
 ) -> None:
     """Announce partial cut + suggested full SL (Telegram suggests the far stop)."""
     notional = abs(qty) * abs(entry)
-    full_line = (
-        f"Suggested full SL → {full_sl:g} (+{full_buffer_pct:g}% over swing {impulse_high:g})"
-        if full_sl and full_sl > 0
-        else "Full SL: off"
-    )
+    if full_sl and full_sl > 0:
+        if full_source == "prior_swing" and prior_swing and prior_swing > 0:
+            full_line = (
+                f"Suggested full SL → {full_sl:g} "
+                f"(prior HTF swing {prior_swing:g} +{reduce_buffer_pct:g}%)"
+            )
+        else:
+            full_line = (
+                f"Suggested full SL → {full_sl:g} "
+                f"(fallback +{full_buffer_pct:g}% over RR swing {impulse_high:g})"
+            )
+    else:
+        full_line = "Full SL: off"
     try:
         if _public_chat_id():
             _post_public_tag(
