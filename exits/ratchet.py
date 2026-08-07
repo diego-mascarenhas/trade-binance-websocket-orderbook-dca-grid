@@ -1,7 +1,11 @@
 """Exit: ratchet stop to the previous support/resistance as levels break.
 
 SHORT — as bid walls (supports) below entry are broken, move the reduce-only
-STOP up to the *previous* (higher) support. LONG — mirror on ask walls.
+STOP to the *previous* (higher) support. LONG — mirror on ask walls.
+
+Walls are **remembered across cycles**. Live order-book snapshots alone cannot
+detect breaks (a pierced bid disappears from the book); we merge each snapshot
+into ``ratchet_seen_levels`` and test pierces against that memory.
 
 Primary exit via ``--exit ratchet``. The stop itself is the exit; classic
 ``--protect-be`` is not stacked (this mode owns the BE algo tag).
@@ -21,6 +25,8 @@ from decimal import Decimal, ROUND_DOWN
 from ob_signals import profit_pct
 
 _CLOSE_REASONS: dict[str, str] = {}
+_MAX_SEEN_LEVELS = 80
+_DEDUP_PCT = 0.05  # min spacing between remembered walls (%% of entry)
 
 
 def pop_close_reason(symbol: str) -> str | None:
@@ -93,14 +99,76 @@ def _levels_from_book(
         if not is_long and p >= entry:
             continue
         out.append(p)
-    # SHORT: high→low (nearest support first). LONG: low→high.
-    out.sort(reverse=not is_long)
-    # Dedupe near-identical prices
+    return _dedupe_levels(out, entry=entry, is_long=is_long)
+
+
+def _dedupe_levels(
+    levels: list[float],
+    *,
+    entry: float,
+    is_long: bool,
+) -> list[float]:
+    """Sort + dedupe near-identical prices. SHORT high→low, LONG low→high."""
+    if entry <= 0:
+        return []
+    ordered = sorted((float(p) for p in levels if p and p > 0), reverse=not is_long)
     deduped: list[float] = []
-    for p in out:
-        if not deduped or abs(p - deduped[-1]) / entry * 100 >= 0.05:
+    for p in ordered:
+        if not deduped or abs(p - deduped[-1]) / entry * 100 >= _DEDUP_PCT:
             deduped.append(p)
     return deduped
+
+
+def _load_seen_levels(state: dict, *, entry: float, is_long: bool) -> list[float]:
+    raw = state.get("ratchet_seen_levels")
+    if not isinstance(raw, list):
+        # Migrate older state that only kept a short live snapshot
+        raw = state.get("ratchet_levels") or []
+    out: list[float] = []
+    for x in raw:
+        try:
+            p = float(x)
+        except (TypeError, ValueError):
+            continue
+        if p > 0:
+            out.append(p)
+    return _dedupe_levels(out, entry=entry, is_long=is_long)
+
+
+def _merge_seen_levels(
+    remembered: list[float],
+    live: list[float],
+    *,
+    entry: float,
+    is_long: bool,
+    mark: float,
+) -> list[float]:
+    """Union of memory + live walls; keep those still relevant to the trade path.
+
+    SHORT: keep walls ≤ entry (supports below entry). Prefer denser memory near
+    the path from entry down through mark (drop far-below-mark clutter last).
+    LONG: mirror.
+    """
+    merged = _dedupe_levels([*remembered, *live], entry=entry, is_long=is_long)
+    if is_long:
+        merged = [p for p in merged if p >= entry * 0.999]
+    else:
+        merged = [p for p in merged if p <= entry * 1.001]
+    if len(merged) <= _MAX_SEEN_LEVELS:
+        return merged
+
+    # Prefer levels between entry and a bit beyond the favorable extreme (mark),
+    # then fill with the nearest remaining walls.
+    if is_long:
+        band_hi = max(mark, entry) * 1.02
+        primary = [p for p in merged if entry <= p <= band_hi]
+        rest = [p for p in merged if p not in primary]
+    else:
+        band_lo = min(mark, entry) * 0.98
+        primary = [p for p in merged if band_lo <= p <= entry]
+        rest = [p for p in merged if p not in primary]
+    keep = _dedupe_levels([*primary, *rest], entry=entry, is_long=is_long)
+    return keep[:_MAX_SEEN_LEVELS]
 
 
 def _broken_levels(
@@ -293,17 +361,46 @@ def run_once(
     except (TypeError, ValueError):
         old_sl_f = None
 
-    levels = _levels_from_book(
+    live = _levels_from_book(
         bids, asks, is_long=side_is_long, entry=entry, min_mult=min_mult,
     )
+    remembered = _load_seen_levels(state, entry=entry, is_long=side_is_long)
+    levels = _merge_seen_levels(
+        remembered, live, entry=entry, is_long=side_is_long, mark=mark,
+    )
     broken = _broken_levels(levels, mark, is_long=side_is_long, pierce_pct=pierce)
+
+    # Track favorable extreme (for logs / future use)
+    try:
+        prev_ext = float(state.get("ratchet_extreme") or 0) or None
+    except (TypeError, ValueError):
+        prev_ext = None
+    if side_is_long:
+        extreme = mark if prev_ext is None else max(prev_ext, mark)
+    else:
+        extreme = mark if prev_ext is None else min(prev_ext, mark)
+
+    # Always persist wall memory (even while waiting to arm)
+    state.update({
+        "phase": "ratchet",
+        "symbol": symbol.upper(),
+        "is_long": side_is_long,
+        "entry": float(entry),
+        "entry_anchor": float(entry),
+        "ratchet_seen_levels": levels,
+        "ratchet_levels": levels[:12],
+        "ratchet_broken": broken[:12],
+        "ratchet_extreme": float(extreme),
+        "ratchet_live_walls": len(live),
+    })
 
     if pnl < min_pct and old_sl_f is None:
         print(
             f"{grid.DIM}Ratchet wait · {side} pnl={pnl:+.3f}% "
             f"(need ≥{min_pct:g}% to arm entry floor) · "
-            f"{len(levels)} wall(s){grid.RESET}"
+            f"seen={len(levels)} live={len(live)}{grid.RESET}"
         )
+        staged.save_state(symbol.upper(), state)
         return
 
     target, label = _previous_level(
@@ -320,16 +417,7 @@ def run_once(
         old_sl_f is None or abs(target - old_sl_f) / entry * 100 >= 0.02
     )
 
-    state.update({
-        "phase": "ratchet",
-        "symbol": symbol.upper(),
-        "is_long": side_is_long,
-        "entry": float(entry),
-        "entry_anchor": float(entry),
-        "be_protect_armed": True,
-        "ratchet_levels": levels[:12],
-        "ratchet_broken": broken[:12],
-    })
+    state["be_protect_armed"] = True
 
     if not need_place:
         print(

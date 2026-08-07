@@ -371,6 +371,9 @@ def run_exit_when_flat(
                 "be_protect_armed": False,
                 "pullback_extreme": None,
                 "ratchet_sl": None,
+                "ratchet_seen_levels": [],
+                "ratchet_broken": [],
+                "ratchet_extreme": None,
             },
         )
         if n:
