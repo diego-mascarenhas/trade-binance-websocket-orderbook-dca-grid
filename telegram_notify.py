@@ -303,6 +303,49 @@ def _post_public_tag(
     _send_public_html("\n".join(lines))
 
 
+def notify_us_session_weekend(*, blocked: bool) -> None:
+    """Announce weekend trade block on/off (English, public + ops).
+
+    Block starts near US cash close (Fri 21:00 UTC) and lifts near Asia
+    week-open liquidity (Sun 23:00 UTC) — not the US cash open (Mon).
+    """
+    if blocked:
+        body = (
+            "🇺🇸 <b>#MARKET weekend</b>\n"
+            "US cash equity markets are closed for the weekend.\n"
+            "Pumpstall will not open new ★ positions "
+            "until <b>Sun 23:00 UTC</b> (Asia week open).\n"
+            "Open trades continue to be managed."
+        )
+        ops = (
+            "🇺🇸 #MARKET weekend\n"
+            "US cash equity markets are closed for the weekend.\n"
+            "No new ★ positions until Sun 23:00 UTC (Asia week open).\n"
+            "Open trades continue to be managed."
+        )
+    else:
+        body = (
+            "🇯🇵 <b>#MARKET Asia open</b>\n"
+            "Asia week-open liquidity is back.\n"
+            "Pumpstall may open new ★ positions again.\n"
+            "(US cash opens Monday morning ET.)"
+        )
+        ops = (
+            "🇯🇵 #MARKET Asia open\n"
+            "Asia week-open liquidity is back.\n"
+            "New ★ positions may be opened.\n"
+            "(US cash opens Monday morning ET.)"
+        )
+    try:
+        if _public_chat_id():
+            _send_public_html(body)
+    except Exception:
+        pass
+    if is_configured() and not _ops_is_public_channel():
+        # Flag in body; skip send_bot 🤖 prefix
+        _send_async(ops)
+
+
 def notify_dca_filled(
     symbol: str,
     direction: str,

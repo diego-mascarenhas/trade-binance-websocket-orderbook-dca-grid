@@ -939,13 +939,17 @@ def _reap_active(
     return alive
 
 
+def _weekend_block_enabled() -> bool:
+    flag = (os.getenv("PUMPSTALL_WEEKEND_BLOCK", "1") or "1").strip().lower()
+    return flag not in ("0", "false", "off", "no")
+
+
 def _weekend_block_active() -> bool:
     """True during Fri 21:00 UTC → Sun 23:00 UTC (no new ★).
 
     Override with PUMPSTALL_WEEKEND_BLOCK=0 to disable (default: on).
     """
-    flag = (os.getenv("PUMPSTALL_WEEKEND_BLOCK", "1") or "1").strip().lower()
-    if flag in ("0", "false", "off", "no"):
+    if not _weekend_block_enabled():
         return False
     now = datetime.now(timezone.utc)
     wd = now.weekday()  # Mon=0 … Sun=6
@@ -957,6 +961,70 @@ def _weekend_block_active() -> bool:
     if wd == 6 and hm < (23, 0):  # Sunday before 23:00 UTC
         return True
     return False
+
+
+def _weekend_block_state_path() -> str:
+    return os.path.join(_repo_root(), ".state", "weekend_block.json")
+
+
+def _maybe_notify_weekend_block(*, telegram: bool) -> None:
+    """On transition into/out of the US weekend window, announce in English."""
+    if not _weekend_block_enabled():
+        return
+    active = _weekend_block_active()
+    path = _weekend_block_state_path()
+    prev: bool | None = None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if isinstance(raw, dict) and "active" in raw:
+            prev = bool(raw["active"])
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        prev = None
+
+    if prev is not None and prev == active:
+        return
+
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "active": active,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                fh,
+            )
+    except OSError:
+        pass
+
+    # First boot: seed state without spamming Telegram mid-weekend/weekday.
+    if prev is None:
+        print(
+            f"{DIM}Weekend block state seeded · "
+            f"{'ON (no new ★)' if active else 'OFF'}{RESET}"
+        )
+        return
+
+    if active:
+        print(
+            f"{YELLOW}AUTO: weekend block ON · Fri 21:00→Sun 23:00 UTC "
+            f"— no new ★{RESET}"
+        )
+    else:
+        print(
+            f"{GREEN}AUTO: weekend block OFF · US session open again "
+            f"— new ★ allowed{RESET}"
+        )
+
+    if not telegram:
+        return
+    try:
+        import telegram_notify as tg
+
+        tg.notify_us_session_weekend(blocked=active)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{DIM}Weekend block Telegram skipped: {exc}{RESET}")
 
 
 def _trade_exit_mode(args: argparse.Namespace) -> str:
@@ -1274,6 +1342,7 @@ def watch_loop(args: argparse.Namespace) -> int:
                 enabled=tg_on,
             )
             _maybe_daily_summary(tg_on)
+            _maybe_notify_weekend_block(telegram=tg_on)
             maybe_write_snapshot(
                 args,
                 hits=hits,
