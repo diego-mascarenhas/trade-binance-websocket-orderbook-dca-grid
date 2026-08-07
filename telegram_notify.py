@@ -488,21 +488,8 @@ def notify_risk_reduce_armed(
     prior_swing: float | None = None,
     full_source: str | None = None,
 ) -> None:
-    """Announce partial cut + suggested full SL (Telegram suggests the far stop)."""
+    """Public #RISK tag only — no private admin detail (levels live on exchange/logs)."""
     notional = abs(qty) * abs(entry)
-    if full_sl and full_sl > 0:
-        if full_source == "prior_swing" and prior_swing and prior_swing > 0:
-            full_line = (
-                f"Suggested full SL → {full_sl:g} "
-                f"(prior HTF swing {prior_swing:g} +{reduce_buffer_pct:g}%)"
-            )
-        else:
-            full_line = (
-                f"Suggested full SL → {full_sl:g} "
-                f"(fallback +{full_buffer_pct:g}% over RR swing {impulse_high:g})"
-            )
-    else:
-        full_line = "Full SL: off"
     try:
         if _public_chat_id():
             _post_public_tag(
@@ -512,28 +499,6 @@ def notify_risk_reduce_armed(
             )
     except Exception:
         pass
-    # Always suggest levels on the private botctl chat (even if trade-size alerts are off)
-    if not is_configured() or _ops_is_public_channel():
-        return
-    detail = ""
-    if not _skip_ops_trade():
-        detail = (
-            f" · {fmt_vol(qty, entry, leverage)}"
-            f"{pnl_suffix(pnl_usdt, notional, leverage)}"
-        )
-    grid_note = ""
-    if grid_top and grid_top > 0:
-        floor = grid_top * (1.0 + reduce_buffer_pct / 100.0)
-        if partial_sl + 1e-12 >= floor:
-            grid_note = f"\nAbove DCA grid top {grid_top:g}"
-    send_shield(
-        f"{symbol.upper()} futures #RISK {direction.upper()}\n"
-        f"Risk-reduce armed\n"
-        f"HTF swing ({swing_bars:d}d) {impulse_high:g}\n"
-        f"Cut ~{reduce_pct:.0f}% @ {partial_sl:g} (+{reduce_buffer_pct:g}%){detail}"
-        f"{grid_note}\n"
-        f"{full_line}"
-    )
 
 
 def notify_risk_reduce_filled(
