@@ -44,7 +44,7 @@ Any leftover `obstageRR*` algos are cancelled on the next risk sync.
 - `exits/risk_reduce.py` — ATH SL + entry gate helpers
 - `orderbook_dca_grid.py` — CLI + entry gate on new SHORT arms
 - `pump_stall_scan.py` — auto-trade skip near ATH; Help snapshot fields
-- `telegram_notify.py` — public tag `#ATH` when arming
+- `telegram_notify.py` — public tag `#SL` 🛡️ when arming (ATH-based stop)
 - `.env.example` — new env vars
 - Pumpstall site: `app/Support/StackParams.php`, `resources/views/help.blade.php`
 

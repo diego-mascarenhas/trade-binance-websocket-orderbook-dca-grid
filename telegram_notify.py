@@ -531,13 +531,12 @@ def notify_risk_reduce_armed(
     prior_swing: float | None = None,
     full_source: str | None = None,
 ) -> None:
-    """Public #ATH tag — full-size stop above historical ATH (no partial RR)."""
+    """Public #SL (🛡️) — full-size stop above historical ATH (no partial RR)."""
     notional = abs(qty) * abs(entry)
-    tag = "ATH" if (full_source or "").lower() == "ath" else "RISK"
     try:
         if _public_chat_id():
             _post_public_tag(
-                tag, symbol, direction,
+                "SL", symbol, direction,
                 pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
                 entry=entry, mark=full_sl if full_sl else partial_sl,
             )
