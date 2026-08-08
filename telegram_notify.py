@@ -531,12 +531,13 @@ def notify_risk_reduce_armed(
     prior_swing: float | None = None,
     full_source: str | None = None,
 ) -> None:
-    """Public #RISK tag only — no private admin detail (levels live on exchange/logs)."""
+    """Public #ATH tag — full-size stop above historical ATH (no partial RR)."""
     notional = abs(qty) * abs(entry)
+    tag = "ATH" if (full_source or "").lower() == "ath" else "RISK"
     try:
         if _public_chat_id():
             _post_public_tag(
-                "RISK", symbol, direction,
+                tag, symbol, direction,
                 pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
                 entry=entry, mark=full_sl if full_sl else partial_sl,
             )
@@ -558,6 +559,7 @@ def notify_risk_reduce_filled(
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
 ) -> None:
+    """Legacy RR-fill notice (partial cut removed — kept for old state replay)."""
     notional = abs(remain_qty) * abs(entry)
     try:
         _post_public_tag(
@@ -567,15 +569,12 @@ def notify_risk_reduce_filled(
         )
     except Exception:
         pass
-    rearm_txt = "re-arm DCA (still ★)" if rearm else "no DCA re-arm (not ★)"
-    full_txt = f"\nFull SL still @ {full_sl:g}" if full_sl and full_sl > 0 else ""
     body = (
         f"{symbol.upper()} futures #RR {direction.upper()}\n"
-        f"Risk-reduce filled @ {trigger:g}\n"
+        f"Legacy risk-reduce fill @ {trigger:g}\n"
         f"Closed {closed_qty:g} · runner {remain_qty:g} · "
         f"{fmt_vol(remain_qty, entry, leverage)}"
-        f"{pnl_suffix(pnl_usdt, notional, leverage)}\n"
-        f"HTF swing was {impulse_high:g} · {rearm_txt}{full_txt}"
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}"
     )
     if _skip_ops_trade():
         send_tp(body)

@@ -4,7 +4,7 @@ Composition model:
   --exit <eql|trailing|ob|pullback|ratchet|…>   primary close method (independent)
   --protect-be / --no-protect-be   optional BE SL addon (orthogonal; not for ratchet)
   --post-be trail                  optional trail *after* BE (structure/be only)
-  --risk-reduce / --no-risk-reduce optional SHORT cut above impulse high + far full SL
+  --risk-reduce / --no-risk-reduce optional SHORT full SL at ATH + RISK_ATH_SL_PCT
 
 Add new strategies here; the main bot only dispatches via run_exit_once().
 """
@@ -218,7 +218,7 @@ def _run_optional_risk_reduce(
         if enabled(args):
             risk_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
     except Exception as exc:  # noqa: BLE001
-        print(f"Risk-reduce skip: {exc}")
+        print(f"ATH SL skip: {exc}")
     return _refresh_side(symbol, side_is_long, hedge, api, sec, recv)
 
 

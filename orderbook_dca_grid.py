@@ -1264,6 +1264,24 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
     if gate_price_blocks(getattr(args, "gate_price", None), is_long, mid, verbose=verbose):
         return False
 
+    # ATH entry gate (SHORT): block new opens within RISK_ATH_ENTRY_MIN_GAP_PCT of ATH.
+    # Skip on dca_only re-arms — position already exists.
+    if not dca_only and not is_long:
+        try:
+            from exits.risk_reduce import entry_blocked_near_ath
+
+            blocked, why = entry_blocked_near_ath(args.symbol, mid, args)
+            if blocked:
+                if verbose:
+                    print(
+                        f"{YELLOW}ATH entry gate — skip arm {args.symbol.upper()}: "
+                        f"{why}{RESET}"
+                    )
+                return False
+        except Exception as exc:
+            if verbose:
+                print(f"{DIM}ATH entry gate check skipped: {exc}{RESET}")
+
     entry = args.price if args.price is not None else mid
     base_size = args.base_size
     if base_size <= 0:
@@ -2112,53 +2130,61 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--risk-reduce",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="SHORT: partial STOP above HTF 1D swing high + far full SL "
-             "(default on via RISK_REDUCE=1). Always above the DCA grid top. "
-             "After partial fill, runner must recover RR loss before BE/structure; "
-             "re-arm DCA if still ★. Env: RISK_REDUCE",
+        help="SHORT: place one full-size STOP at historical ATH + RISK_ATH_SL_PCT "
+             "(default +2%%). Also blocks new opens within "
+             "RISK_ATH_ENTRY_MIN_GAP_PCT of ATH (default 12%%). "
+             "Default on via RISK_REDUCE=1. Env: RISK_REDUCE",
     )
+    p.add_argument(
+        "--risk-ath-sl-pct",
+        type=float,
+        default=None,
+        help="%% above historical ATH for the ATH stop (default 2). "
+             "Env: RISK_ATH_SL_PCT",
+    )
+    p.add_argument(
+        "--risk-ath-entry-min-gap-pct",
+        type=float,
+        default=None,
+        help="Block new SHORT opens when price is closer than this %% to ATH "
+             "(default 12). Env: RISK_ATH_ENTRY_MIN_GAP_PCT",
+    )
+    # Legacy flags kept so old unit/env lines still parse; ignored by ATH SL logic.
     p.add_argument(
         "--risk-reduce-pct",
         type=float,
         default=None,
-        help="%% of position to cut on the partial risk stop (default 50). "
-             "Env: RISK_REDUCE_PCT",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--risk-reduce-buffer-pct",
         type=float,
         default=None,
-        help="%% above swing high for the partial cut (default 0.8). "
-             "Env: RISK_REDUCE_BUFFER_PCT",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--risk-reduce-swing-bars",
         type=int,
         default=None,
-        help="Daily bars for HTF swing high used by risk-reduce (default 120). "
-             "Env: RISK_REDUCE_SWING_BARS",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--risk-full-buffer-pct",
         type=float,
         default=None,
-        help="Fallback %% above RR swing for the full SL when no prior HTF pivot "
-             "exists (default 48; 0=disable full SL). Prefer prior swing above RR. "
-             "Env: RISK_FULL_BUFFER_PCT",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--risk-full-swing-lookback",
         type=int,
         default=None,
-        help="Daily bars searched for the prior HTF pivot above the RR swing "
-             "(default 500). Env: RISK_FULL_SWING_LOOKBACK",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--risk-full-swing-min-gap-pct",
         type=float,
         default=None,
-        help="Prior full-SL swing must clear the RR swing by at least this %% "
-             "(default 10; skips nearby noise). Env: RISK_FULL_SWING_MIN_GAP_PCT",
+        help=argparse.SUPPRESS,
     )
     p.add_argument("--be-arm-pct", type=float, default=None,
                    help="[--protect-be] Arm BE SL when unrealized profit %% ≥ this "

@@ -541,20 +541,17 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "boost_strict_stall": boost_strict_stall,
         "boost_strict_near": boost_strict_near,
         "boost_strict_ideal": boost_strict_ideal,
-        # Risk-reduce addon (SHORT) — Help page
+        # ATH SL addon (SHORT) — Help page
         "risk_reduce": (
             0
             if (os.getenv("RISK_REDUCE", "1") or "1").strip().lower()
             in ("0", "false", "off", "no")
             else 1
         ),
-        "risk_reduce_pct": float(os.getenv("RISK_REDUCE_PCT", "50") or 50),
-        "risk_reduce_buffer_pct": float(os.getenv("RISK_REDUCE_BUFFER_PCT", "0.8") or 0.8),
-        "risk_full_buffer_pct": float(os.getenv("RISK_FULL_BUFFER_PCT", "48") or 48),
-        "risk_full_swing_lookback": int(float(os.getenv("RISK_FULL_SWING_LOOKBACK", "500") or 500)),
-        "risk_full_swing_min_gap_pct": float(os.getenv("RISK_FULL_SWING_MIN_GAP_PCT", "10") or 10),
-        "risk_reduce_swing_bars": int(float(os.getenv("RISK_REDUCE_SWING_BARS", "120") or 120)),
-        "risk_reduce_ideal_near": float(os.getenv("RISK_REDUCE_IDEAL_NEAR", "90") or 90),
+        "risk_ath_sl_pct": float(os.getenv("RISK_ATH_SL_PCT", "2") or 2),
+        "risk_ath_entry_min_gap_pct": float(
+            os.getenv("RISK_ATH_ENTRY_MIN_GAP_PCT", "12") or 12
+        ),
     }
 
 
@@ -1270,6 +1267,26 @@ def _maybe_auto_trade(
                 f"(this bot) — wait for a slot{RESET}"
             )
             break
+        # ATH entry gate: skip ★ closer than RISK_ATH_ENTRY_MIN_GAP_PCT to ATH
+        try:
+            from exits.risk_reduce import entry_blocked_near_ath
+
+            # Prefer last from ticker via near_high isn't ATH — fetch mid via last print
+            last_px = 0.0
+            try:
+                from futures_scan import FAPI_BASE, fetch_klines
+
+                kl = fetch_klines(FAPI_BASE, sym, "1d", 2)
+                if kl:
+                    last_px = float(kl[-1][4])
+            except Exception:
+                last_px = 0.0
+            blocked, why = entry_blocked_near_ath(sym, last_px, args)
+            if blocked:
+                print(f"{YELLOW}AUTO: skip {sym} — ATH gate ({why}){RESET}")
+                continue
+        except Exception as exc:  # noqa: BLE001
+            print(f"{DIM}AUTO: ATH gate check skipped for {sym}: {exc}{RESET}")
         proc = _launch_dca_once(hit, args)
         if proc is not None:
             active[sym] = proc
