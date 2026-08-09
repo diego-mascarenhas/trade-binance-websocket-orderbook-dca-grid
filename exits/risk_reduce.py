@@ -413,33 +413,11 @@ def _telegram_suggest(
     sec: str,
     recv: int,
 ) -> None:
+    """ATH SL is announced on the IDEAL card — no separate public arm alert."""
     import orderbook_staged_exit as staged
 
     st = staged.load_state(symbol)
     if bool(st.get("risk_tg_suggested")):
         return
-    try:
-        import orderbook_dca_grid as grid
-        import telegram_notify as telegram
-
-        lev = grid.get_symbol_leverage(symbol, api, sec, recv)
-        _, upnl = staged.position_pnl(symbol, side == "LONG", hedge, api, sec, recv)
-        telegram.notify_risk_reduce_armed(
-            symbol, side, qty, entry,
-            impulse_high=ath,
-            partial_sl=0.0,
-            full_sl=full_trig,
-            reduce_pct=0.0,
-            reduce_buffer_pct=0.0,
-            full_buffer_pct=sl_pct,
-            leverage=lev,
-            pnl_usdt=upnl,
-            swing_bars=0,
-            grid_top=None,
-            prior_swing=ath,
-            full_source="ath",
-        )
-        st["risk_tg_suggested"] = True
-        staged.save_state(symbol, st)
-    except Exception:
-        pass
+    st["risk_tg_suggested"] = True
+    staged.save_state(symbol, st)

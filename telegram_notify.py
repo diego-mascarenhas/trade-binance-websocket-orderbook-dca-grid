@@ -539,20 +539,8 @@ def notify_risk_reduce_armed(
     prior_swing: float | None = None,
     full_source: str | None = None,
 ) -> None:
-    """Public 🛡️ #SL — protective ATH stop armed (not a loss fill)."""
-    notional = abs(qty) * abs(entry)
-    try:
-        if _public_chat_id():
-            # protect=True → always 🛡️ (like #BE). Do not pass SL as mark —
-            # that would invent a catastrophic %% vs entry for the public line.
-            _post_public_tag(
-                "SL", symbol, direction,
-                pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
-                entry=entry, mark=None,
-                protect=True,
-            )
-    except Exception:
-        pass
+    """No public alert — ATH SL is announced on the IDEAL card (🛡️ line)."""
+    return
 
 
 def notify_risk_reduce_filled(
