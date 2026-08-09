@@ -254,14 +254,21 @@ def _sl_emoji(pnl_usdt: float | None) -> str:
     return "🛡️"
 
 
-def _tag_emoji(tag: str, direction: str, pnl_usdt: float | None = None) -> str:
+def _tag_emoji(
+    tag: str,
+    direction: str,
+    pnl_usdt: float | None = None,
+    *,
+    protect: bool = False,
+) -> str:
     t = tag.strip().upper().lstrip("#")
+    # Protective arm (#BE, ATH #SL placed) — always shield, never the loss-fill cry.
+    if protect or t == "BE":
+        return "🛡️"
     if t == "CLOSE":
         return _close_emoji(pnl_usdt)
     if t == "TP":
         return "🥳"
-    if t == "BE":
-        return "🛡️"
     if t == "TRAIL":
         return "🏄"
     if t == "SL":
@@ -281,12 +288,13 @@ def _post_public_tag(
     leverage: float | int | None = None,
     entry: float | None = None,
     mark: float | None = None,
+    protect: bool = False,
 ) -> None:
     """Compact Pumpstall public alert — hashtag + %% only, never size."""
     if not _public_chat_id():
         return
     tag_u = tag.strip().upper().lstrip("#")
-    emoji = _tag_emoji(tag_u, direction, pnl_usdt)
+    emoji = _tag_emoji(tag_u, direction, pnl_usdt, protect=protect)
     pct = _pnl_pct_public(
         pnl_usdt,
         notional,
@@ -531,14 +539,17 @@ def notify_risk_reduce_armed(
     prior_swing: float | None = None,
     full_source: str | None = None,
 ) -> None:
-    """Public #SL (🛡️) — full-size stop above historical ATH (no partial RR)."""
+    """Public 🛡️ #SL — protective ATH stop armed (not a loss fill)."""
     notional = abs(qty) * abs(entry)
     try:
         if _public_chat_id():
+            # protect=True → always 🛡️ (like #BE). Do not pass SL as mark —
+            # that would invent a catastrophic %% vs entry for the public line.
             _post_public_tag(
                 "SL", symbol, direction,
                 pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
-                entry=entry, mark=full_sl if full_sl else partial_sl,
+                entry=entry, mark=None,
+                protect=True,
             )
     except Exception:
         pass
