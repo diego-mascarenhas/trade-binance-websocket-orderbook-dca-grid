@@ -196,6 +196,47 @@ def pnl_pct_from_close(
     return None
 
 
+def _ath_sl_ideal_line(symbol: str, *, from_price: float | None = None) -> str | None:
+    """🛡️ line for IDEAL cards: planned full SL at historical ATH + pct.
+
+    When ``from_price`` is set (usually first ask wall), append the total %%
+    climb from that level to the SL — same style as wall gaps.
+    """
+    try:
+        from exits.risk_reduce import (
+            ath_sl_pct,
+            ath_sl_trigger,
+            enabled,
+            fetch_historical_ath,
+        )
+    except Exception:
+        return None
+    if not enabled():
+        return None
+    try:
+        ath = fetch_historical_ath(symbol)
+    except Exception:
+        return None
+    if not ath or ath <= 0:
+        return None
+    try:
+        pct = ath_sl_pct()
+        sl = ath_sl_trigger(ath)
+    except Exception:
+        return None
+    ath_s = _html_escape(_fmt_wall_px(ath))
+    sl_s = _html_escape(_fmt_wall_px(sl))
+    total = ""
+    try:
+        base = float(from_price or 0)
+        if base > 0 and sl > 0:
+            total_pct = (sl - base) / base * 100.0
+            total = f"  (+{total_pct:.2f}%)"
+    except (TypeError, ValueError):
+        total = ""
+    return f"🛡️ <b>SL</b> · ATH {ath_s} +{pct:g}% → <b>{sl_s}</b>{total}"
+
+
 def format_open_signal(
     *,
     symbol: str,
@@ -210,6 +251,7 @@ def format_open_signal(
     ask_span_pct: float,
     wall_prices: list[float],
     note: str = "",
+    ath_sl_line: str | None = None,
 ) -> str:
     sym = _html_escape(symbol.upper())
     chg_emoji = "📈" if change_24h >= 0 else "📉"
@@ -238,6 +280,10 @@ def format_open_signal(
         f"stall {stall_score:.0f} · {ask_walls} walls / {ask_span_pct:.1f}%"
     )
 
+    from_px = walls[0] if walls else None
+    shield = (ath_sl_line or "").strip() or _ath_sl_ideal_line(symbol, from_price=from_px) or ""
+    shield_block = f"{shield}\n\n" if shield else ""
+
     # ★ ideal only — not a filled trade. Real #OPEN comes when orders are placed.
     return (
         f"⭐ <b>IDEAL</b> · <b>{sym}</b>\n"
@@ -250,6 +296,7 @@ def format_open_signal(
         f"\n"
         f"{walls_line}\n"
         f"\n"
+        f"{shield_block}"
         f"<i>{note_line}</i>"
     )
 

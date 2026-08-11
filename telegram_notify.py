@@ -254,14 +254,21 @@ def _sl_emoji(pnl_usdt: float | None) -> str:
     return "🛡️"
 
 
-def _tag_emoji(tag: str, direction: str, pnl_usdt: float | None = None) -> str:
+def _tag_emoji(
+    tag: str,
+    direction: str,
+    pnl_usdt: float | None = None,
+    *,
+    protect: bool = False,
+) -> str:
     t = tag.strip().upper().lstrip("#")
+    # Protective arm (#BE, ATH #SL placed) — always shield, never the loss-fill cry.
+    if protect or t == "BE":
+        return "🛡️"
     if t == "CLOSE":
         return _close_emoji(pnl_usdt)
     if t == "TP":
         return "🥳"
-    if t == "BE":
-        return "🛡️"
     if t == "TRAIL":
         return "🏄"
     if t == "SL":
@@ -281,12 +288,13 @@ def _post_public_tag(
     leverage: float | int | None = None,
     entry: float | None = None,
     mark: float | None = None,
+    protect: bool = False,
 ) -> None:
     """Compact Pumpstall public alert — hashtag + %% only, never size."""
     if not _public_chat_id():
         return
     tag_u = tag.strip().upper().lstrip("#")
-    emoji = _tag_emoji(tag_u, direction, pnl_usdt)
+    emoji = _tag_emoji(tag_u, direction, pnl_usdt, protect=protect)
     pct = _pnl_pct_public(
         pnl_usdt,
         notional,
@@ -531,17 +539,8 @@ def notify_risk_reduce_armed(
     prior_swing: float | None = None,
     full_source: str | None = None,
 ) -> None:
-    """Public #RISK tag only — no private admin detail (levels live on exchange/logs)."""
-    notional = abs(qty) * abs(entry)
-    try:
-        if _public_chat_id():
-            _post_public_tag(
-                "RISK", symbol, direction,
-                pnl_usdt=pnl_usdt, notional=notional, leverage=leverage,
-                entry=entry, mark=full_sl if full_sl else partial_sl,
-            )
-    except Exception:
-        pass
+    """No public alert — ATH SL is announced on the IDEAL card (🛡️ line)."""
+    return
 
 
 def notify_risk_reduce_filled(
@@ -558,6 +557,7 @@ def notify_risk_reduce_filled(
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
 ) -> None:
+    """Legacy RR-fill notice (partial cut removed — kept for old state replay)."""
     notional = abs(remain_qty) * abs(entry)
     try:
         _post_public_tag(
@@ -567,15 +567,12 @@ def notify_risk_reduce_filled(
         )
     except Exception:
         pass
-    rearm_txt = "re-arm DCA (still ★)" if rearm else "no DCA re-arm (not ★)"
-    full_txt = f"\nFull SL still @ {full_sl:g}" if full_sl and full_sl > 0 else ""
     body = (
         f"{symbol.upper()} futures #RR {direction.upper()}\n"
-        f"Risk-reduce filled @ {trigger:g}\n"
+        f"Legacy risk-reduce fill @ {trigger:g}\n"
         f"Closed {closed_qty:g} · runner {remain_qty:g} · "
         f"{fmt_vol(remain_qty, entry, leverage)}"
-        f"{pnl_suffix(pnl_usdt, notional, leverage)}\n"
-        f"HTF swing was {impulse_high:g} · {rearm_txt}{full_txt}"
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}"
     )
     if _skip_ops_trade():
         send_tp(body)
