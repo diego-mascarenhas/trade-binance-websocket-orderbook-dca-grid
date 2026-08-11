@@ -633,11 +633,42 @@ def build_report_payload(*, as_of: date | None = None) -> dict[str, Any]:
     }
 
 
+def _merge_report_closes(
+    previous: dict[str, Any] | None,
+    lightweight: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep wallet ROI from the last full report; refresh close counts only.
+
+    Lightweight pushes run on every #CLOSE and must not wipe ``pct`` / ``api_ok``
+    from the morning ``include_wallet_report=True`` snapshot.
+    """
+    if not isinstance(previous, dict) or not previous.get("api_ok"):
+        return lightweight
+    out = dict(lightweight)
+    out["api_ok"] = True
+    # Prefer previous as_of labels when they match a successful wallet fetch
+    if previous.get("as_of"):
+        out["as_of"] = previous.get("as_of")
+    if previous.get("as_of_label"):
+        out["as_of_label"] = previous.get("as_of_label")
+    for key in ("day", "week", "month"):
+        prev_b = previous.get(key) if isinstance(previous.get(key), dict) else {}
+        new_b = lightweight.get(key) if isinstance(lightweight.get(key), dict) else {}
+        merged = dict(new_b)
+        if prev_b.get("pct") is not None:
+            merged["pct"] = prev_b.get("pct")
+        if prev_b.get("net_usdt") is not None:
+            merged["net_usdt"] = prev_b.get("net_usdt")
+        out[key] = merged
+    return out
+
+
 def build_stats_payload(
     *,
     as_of: date | None = None,
     trade_limit: int = STATS_TRADE_LIMIT,
     include_wallet_report: bool = False,
+    previous_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Private stats for the unlisted web page (no Binance keys on the site)."""
     rows = _load_trades()
@@ -657,7 +688,8 @@ def build_stats_payload(
             payload["report"] = build_report_payload(as_of=as_of)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Stats report block skipped: %s", exc)
-            payload["report"] = None
+            # Keep last good wallet ROI rather than blanking the page
+            payload["report"] = previous_report if isinstance(previous_report, dict) else None
     else:
         # Lightweight: closes-only windows from the local log (no Binance call)
         try:
@@ -674,7 +706,7 @@ def build_stats_payload(
                 tzinfo=tz,
             )
             month_start = datetime(yesterday.year, yesterday.month, 1, tzinfo=tz)
-            payload["report"] = {
+            lightweight = {
                 "as_of": yesterday.isoformat(),
                 "as_of_label": yesterday.strftime("%d %b %Y"),
                 "api_ok": False,
@@ -685,8 +717,9 @@ def build_stats_payload(
                     "closes": len(_trades_between(rows, month_start, day_end)),
                 },
             }
+            payload["report"] = _merge_report_closes(previous_report, lightweight)
         except Exception:
-            payload["report"] = None
+            payload["report"] = previous_report if isinstance(previous_report, dict) else None
     return payload
 
 
@@ -702,7 +735,18 @@ def write_stats_snapshot(
     )
     if not out.is_absolute():
         out = ROOT / out
-    payload = build_stats_payload(include_wallet_report=include_wallet_report)
+    previous_report: dict[str, Any] | None = None
+    if out.is_file():
+        try:
+            prev = json.loads(out.read_text(encoding="utf-8"))
+            if isinstance(prev, dict) and isinstance(prev.get("report"), dict):
+                previous_report = prev["report"]
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            previous_report = None
+    payload = build_stats_payload(
+        include_wallet_report=include_wallet_report,
+        previous_report=previous_report,
+    )
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
