@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Wrapper: obstructure-scalp SYMBOL [--execute] ...
+set -euo pipefail
+_SRC="${BASH_SOURCE[0]}"
+while [[ -L "$_SRC" ]]; do
+  _DIR="$(cd "$(dirname "$_SRC")" && pwd)"
+  _SRC="$(readlink "$_SRC")"
+  [[ "$_SRC" != /* ]] && _SRC="$_DIR/$_SRC"
+done
+ROOT="$(cd "$(dirname "$_SRC")" && pwd)"
+cd "$ROOT"
+exec "${ROOT}/.venv/bin/python" -u "${ROOT}/orderbook_structure_scalp.py" "$@"

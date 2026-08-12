@@ -1502,6 +1502,10 @@ def supervise_loop(args: argparse.Namespace) -> None:
     dca_missing_retry_at: float = 0.0
     exit_preset_armed: bool = False
     seen_position = False  # --once: true after any open qty this cycle
+    # --once flat: stop after N failed arms so pump-stall slots don't stick forever
+    # (e.g. imbalance / margin blocks). Env: ONCE_MAX_ARM_FAILS (default 5).
+    once_max_arm_fails = max(0, int(_env_float("ONCE_MAX_ARM_FAILS", 5.0)))
+    once_arm_fails = 0
     margin_dca_frozen = False  # True after hard strip until ratio < hard
     last_mr_log: str | None = None
     sym = args.symbol.upper()
@@ -1897,6 +1901,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             print(f"{BOLD}Flat and no orders → re-arming grid…{RESET}")
                             placed = build_and_place_grid(args, api, sec, filt, verbose=True)
                             if placed:
+                                once_arm_fails = 0
                                 oo_new = _signed_request(
                                     "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
                                 ) or []
@@ -1914,8 +1919,20 @@ def supervise_loop(args: argparse.Namespace) -> None:
                                     leverage=lev,
                                 )
                             elif not placed:
+                                once_arm_fails += 1
                                 sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
                                 print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
+                                if (
+                                    once
+                                    and not seen_position
+                                    and once_max_arm_fails > 0
+                                    and once_arm_fails >= once_max_arm_fails
+                                ):
+                                    print(
+                                        f"{BOLD}{YELLOW}--once: {once_arm_fails} failed arm(s) "
+                                        f"without a fill → stopping (free slot).{RESET}",
+                                    )
+                                    return
             except Exception as exc:
                 print(f"{RED}Supervisor pass error: {exc}{RESET}")
                 telegram.notify_supervisor_error(sym, str(exc))

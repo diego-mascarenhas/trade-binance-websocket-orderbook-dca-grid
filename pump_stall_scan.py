@@ -1093,6 +1093,11 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         "--loss-cooldown-min", str(getattr(args, "loss_cooldown_min", 1440)),
         "--margin-ratio-soft", str(getattr(args, "margin_ratio_soft", 5.0)),
         "--margin-ratio-hard", str(getattr(args, "margin_ratio_hard", 8.0)),
+        # Short-only book: default imbalance gate (20–30%) blocks every new ★
+        # once a large SHORT (e.g. PUMP) is open. Env PUMPSTALL_MAX_IMBALANCE
+        # (default 0 = disable) overrides MAX_IMBALANCE for auto-trade children.
+        "--max-imbalance",
+        str(float(os.getenv("PUMPSTALL_MAX_IMBALANCE", os.getenv("MAX_IMBALANCE", "0")) or 0)),
         "--so-count", str(args.so_count),
         "--min-gap", str(args.min_gap),
         "--min-dist", str(args.min_dist),

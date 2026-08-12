@@ -274,9 +274,7 @@ def build_plan(
             if red_q < min_qty or red_q * wpx < min_notional:
                 continue
             if run_qty - red_q < min_qty:
-                red_q = float(grid._round_to(run_qty - min_qty, step, ROUND_DOWN))
-                if red_q < min_qty:
-                    break
+                continue  # skip — never promote dust remainders to almost-full close
             red_usdt = red_q * wpx
             pnl = _pnl_on_close(is_long, run_avg, wpx, red_q)
             realized += pnl
@@ -310,9 +308,7 @@ def build_plan(
             if red_q < min_qty or red_q * wpx < min_notional:
                 continue
             if run_qty - red_q < min_qty:
-                red_q = float(grid._round_to(run_qty - min_qty, step, ROUND_DOWN))
-                if red_q < min_qty:
-                    break
+                continue  # skip — never promote dust remainders to almost-full close
             red_usdt = red_q * wpx
             comp_usdt = red_usdt * mult
             raw_comp = comp_usdt / wpx
@@ -705,6 +701,39 @@ def _overlaps_price(px: float, others: list[float], gap_pct: float) -> bool:
     return False
 
 
+def _safe_reduce_qty(
+    run_qty: float,
+    reduce_pct: float,
+    *,
+    mark: float,
+    step: Decimal,
+    min_qty: float,
+    min_notional: float,
+    floor_qty: float = 0.0,
+) -> float:
+    """Size a single reduce slice — never flatten the bag via the old dust→wipe path.
+
+    Returns 0 if this slice should be skipped.
+    """
+    if run_qty <= 0 or mark <= 0:
+        return 0.0
+    # Hard floor: leave at least floor_qty (session min-remain) on the book
+    room = max(0.0, run_qty - max(0.0, float(floor_qty)))
+    if room < min_qty:
+        return 0.0
+    raw = run_qty * (float(reduce_pct) / 100.0)
+    # Absolute cap: never more than reduce_pct of current, and never more than room
+    cap = min(room, raw)
+    rq = float(grid._round_to(cap, step, ROUND_DOWN))
+    if rq < min_qty or rq * mark < min_notional:
+        return 0.0
+    # If remainder would be dust, skip (do NOT promote to almost-full close)
+    remain = run_qty - rq
+    if 0 < remain < min_qty or (remain > 0 and remain * mark < min_notional):
+        return 0.0
+    return rq
+
+
 def build_structure_actions(
     *,
     symbol: str,
@@ -724,6 +753,7 @@ def build_structure_actions(
     prearm: bool = True,
     live_hi: float | None = None,
     live_lo: float | None = None,
+    floor_qty: float = 0.0,
 ) -> list[dict[str, Any]]:
     """REDUCE/DCA at walls: pre-arm resting LIMITs; chase wick rejects with market.
 
@@ -736,6 +766,7 @@ def build_structure_actions(
     min_notional = float(filt["min_notional"])
     mult = max(1.0, float(comp_mult))
     actions: list[dict[str, Any]] = []
+    floor_q = max(0.0, float(floor_qty))
 
     if is_long:
         reduce_walls = [("resistance", w) for w in resistances]
@@ -765,27 +796,27 @@ def build_structure_actions(
     run_qty = float(qty)
     idx = 0
 
-    if wick_level > 0 and run_qty >= min_qty and not _already_chased_wick(symbol, wick_level):
-        raw = run_qty * (reduce_pct / 100.0)
-        rq = float(grid._round_to(raw, step, ROUND_DOWN))
-        if rq >= min_qty and rq * mark >= min_notional:
-            if run_qty - rq < min_qty:
-                rq = float(grid._round_to(run_qty - min_qty, step, ROUND_DOWN))
-            if rq >= min_qty:
-                idx += 1
-                actions.append({
-                    "role": "REDUCE",
-                    "status": "wick_now",
-                    "idx": idx,
-                    "wall_kind": "liquidity",
-                    "wall_px": wick_level,
-                    "wall_qty": 0.0,
-                    "dist_pct": wick_ext,
-                    "qty": rq,
-                    "usdt": rq * mark,
-                    "realized_pnl": _pnl_on_close(is_long, entry, mark, rq),
-                })
-                run_qty = max(0.0, run_qty - rq)
+    if wick_level > 0 and run_qty > floor_q and not _already_chased_wick(symbol, wick_level):
+        rq = _safe_reduce_qty(
+            run_qty, reduce_pct,
+            mark=mark, step=step, min_qty=min_qty, min_notional=min_notional,
+            floor_qty=floor_q,
+        )
+        if rq > 0:
+            idx += 1
+            actions.append({
+                "role": "REDUCE",
+                "status": "wick_now",
+                "idx": idx,
+                "wall_kind": "liquidity",
+                "wall_px": wick_level,
+                "wall_qty": 0.0,
+                "dist_pct": wick_ext,
+                "qty": rq,
+                "usdt": rq * mark,
+                "realized_pnl": _pnl_on_close(is_long, entry, mark, rq),
+            })
+            run_qty = max(0.0, run_qty - rq)
 
     for kind, (wpx, wqty, dist) in reduce_walls:
         is_sup = kind == "support"
@@ -803,26 +834,25 @@ def build_structure_actions(
             continue
         # Pre-arm resting LIMITs while far/hold — do not wait for touch
         can_arm = status in ("hold", "far") if prearm else status == "hold"
-        if not can_arm or run_qty < min_qty:
+        if not can_arm or run_qty <= floor_q:
             actions.append({
                 "role": "REDUCE", "status": status, "idx": idx,
                 "wall_kind": kind, "wall_px": wpx, "wall_qty": wqty,
                 "dist_pct": d_now, "qty": 0.0, "usdt": 0.0,
             })
             continue
-        raw = run_qty * (reduce_pct / 100.0)
-        rq = float(grid._round_to(raw, step, ROUND_DOWN))
-        if rq < min_qty or rq * wpx < min_notional:
+        rq = _safe_reduce_qty(
+            run_qty, reduce_pct,
+            mark=wpx if wpx > 0 else mark, step=step,
+            min_qty=min_qty, min_notional=min_notional, floor_qty=floor_q,
+        )
+        if rq <= 0:
             actions.append({
                 "role": "REDUCE", "status": "too_small", "idx": idx,
                 "wall_kind": kind, "wall_px": wpx, "wall_qty": wqty,
                 "dist_pct": d_now, "qty": 0.0, "usdt": 0.0,
             })
             continue
-        if run_qty - rq < min_qty:
-            rq = float(grid._round_to(run_qty - min_qty, step, ROUND_DOWN))
-            if rq < min_qty:
-                continue
         actions.append({
             "role": "REDUCE", "status": "arm", "idx": idx,
             "wall_kind": kind, "wall_px": wpx, "wall_qty": wqty,
@@ -1091,12 +1121,14 @@ def apply_structure(
     sec: str,
     recv: int,
     filt: dict[str, Decimal],
+    reduce_pct: float = 5.0,
 ) -> int:
     """Sync REDUCE/DCA LIMITs + chase wick rejects with market (no full cancel churn)."""
     cancel_cr_algos(symbol, api, sec, recv)  # drop legacy STOP mode algos
     set_dca_block(symbol, False)
     tick = float(filt["tick_size"])
     tol = max(tick * 2, (actions[0]["wall_px"] if actions else 1.0) * 0.0002)
+    red_pct = max(0.5, min(40.0, float(reduce_pct)))
 
     desired_arm = [a for a in actions if a.get("status") == "arm" and float(a.get("qty") or 0) > 0]
     wick_acts = [a for a in actions if a.get("status") == "wick_now" and float(a.get("qty") or 0) > 0]
@@ -1166,6 +1198,20 @@ def apply_structure(
         from orderbook_staged_exit import _market_reduce_qty
 
         qty = float(a["qty"])
+        try:
+            _side, live_qty, _ = grid._detect_open_side(symbol, hedge, api, sec, recv)
+            live_qty = float(live_qty or 0)
+        except Exception:
+            live_qty = 0.0
+        if live_qty <= 0:
+            print(f"{grid.YELLOW}Wick reduce skipped — flat{grid.RESET}")
+            break
+        # Hard cap vs live bag: never more than reduce_pct (blocks dust→wipe bugs)
+        cap = float(grid._round_to(live_qty * (red_pct / 100.0), filt["step_size"], ROUND_DOWN))
+        qty = min(qty, cap, live_qty)
+        qty = float(grid._round_to(qty, filt["step_size"], ROUND_DOWN))
+        if qty <= 0:
+            continue
         try:
             closed = _market_reduce_qty(
                 symbol, is_long, Decimal(str(qty)), hedge, filt, api, sec, recv,
@@ -1486,6 +1532,12 @@ def run_symbol(symbol: str, args: argparse.Namespace) -> int:
             resistances, sw_res, mark=mark, count=n, min_gap=float(args.min_gap),
         )
         existing_dca = _dca_prices_near(symbol, api, sec, recv)
+        min_remain = max(0.0, min(95.0, float(getattr(args, "min_remain_pct", 40.0))))
+        floor_qty = float(qty) * (min_remain / 100.0)
+        # Prefer session start floor when WS watch is tracking it
+        sess = float(getattr(args, "_session_qty0", 0) or 0)
+        if sess > 0:
+            floor_qty = max(floor_qty, sess * (min_remain / 100.0))
         actions = build_structure_actions(
             symbol=symbol,
             is_long=side_is_long,
@@ -1504,6 +1556,7 @@ def run_symbol(symbol: str, args: argparse.Namespace) -> int:
             prearm=True,
             live_hi=getattr(args, "_live_hi", None),
             live_lo=getattr(args, "_live_lo", None),
+            floor_qty=floor_qty,
         )
         print(render_structure(
             symbol=symbol.upper(),
@@ -1530,6 +1583,11 @@ def run_symbol(symbol: str, args: argparse.Namespace) -> int:
             )
             return 0
         print(f"\n{grid.BOLD}{grid.YELLOW}EXECUTE · structure (adverse)…{grid.RESET}")
+        if floor_qty > 0:
+            print(
+                f"{grid.DIM}Reduce floor: leave ≥{grid.qty_fmt(floor_qty)} "
+                f"({min_remain:g}% of session/open){grid.RESET}"
+            )
         apply_structure(
             symbol=symbol,
             is_long=side_is_long,
@@ -1539,6 +1597,7 @@ def run_symbol(symbol: str, args: argparse.Namespace) -> int:
             sec=sec,
             recv=recv,
             filt=filt,
+            reduce_pct=args.reduce_pct,
         )
         return 0
 
@@ -1623,6 +1682,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_env_float("CAPITAL_REDUCE_PCT", 5.0),
         help="%% of *remaining* position qty to close at each wall (default 5). "
              "Env: CAPITAL_REDUCE_PCT",
+    )
+    p.add_argument(
+        "--min-remain-pct",
+        type=float,
+        default=_env_float("CAPITAL_MIN_REMAIN_PCT", 40.0),
+        help="Stop reducing once qty ≤ this %% of session/open size (default 40). "
+             "Prevents capital-reduce from flattening the bag. Env: CAPITAL_MIN_REMAIN_PCT",
     )
     p.add_argument(
         "--comp-mult",
@@ -1733,6 +1799,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = p.parse_args(argv)
     args.reduce_pct = max(0.5, min(40.0, float(args.reduce_pct)))
+    args.min_remain_pct = max(0.0, min(95.0, float(getattr(args, "min_remain_pct", 40.0))))
     args.comp_mult = max(1.0, min(3.0, float(args.comp_mult)))
     args.now_trim_pct = max(0.0, min(50.0, float(args.now_trim_pct)))
     args.interval = max(10.0 if getattr(args, "structure", False) else 15.0, float(args.interval))
@@ -1802,6 +1869,7 @@ def run_ws_watch(args: argparse.Namespace) -> int:
         "cycle": 0,
         "last_event": "boot",
         "status": "listening",
+        "qty0": {s: 0.0 for s in symbols},  # session start qty for min-remain floor
     }
     paint_lock = threading.Lock()
     # Rolling window for hi/lo — session min forever made stale lo look like a live wick
@@ -1843,9 +1911,13 @@ def run_ws_watch(args: argparse.Namespace) -> int:
             side_is_long, qty, _entry = grid._detect_open_side(sym, hedge, api, sec, recv)
             if side_is_long is not None and qty > 0:
                 state["is_long"][sym] = bool(side_is_long)
+                if float(state["qty0"].get(sym) or 0) <= 0:
+                    state["qty0"][sym] = float(qty)
                 print(
                     f"{grid.DIM}{sym} side={'LONG' if side_is_long else 'SHORT'} "
-                    f"· reduce-wick={'↑ resistance' if side_is_long else '↓ support'}"
+                    f"qty0={grid.qty_fmt(state['qty0'][sym])} "
+                    f"· floor {args.min_remain_pct:g}% · reduce-wick="
+                    f"{'↑ resistance' if side_is_long else '↓ support'}"
                     f"{grid.RESET}"
                 )
             else:
@@ -1958,6 +2030,7 @@ def run_ws_watch(args: argparse.Namespace) -> int:
                     args._live_mark = state["mark"].get(sym) or None
                     args._live_hi = state["hi"].get(sym) or None
                     args._live_lo = state["lo"].get(sym) or None
+                    args._session_qty0 = float(state["qty0"].get(sym) or 0)
                 rc = run_symbol(sym, args)
                 # Refresh side cache after each cycle
                 try:
@@ -1996,6 +2069,7 @@ def run_ws_watch(args: argparse.Namespace) -> int:
                 args._live_mark = None
                 args._live_hi = None
                 args._live_lo = None
+                args._session_qty0 = None
                 state["status"] = "listening"
                 state["last_event"] = f"done rc={locals().get('rc', 1)}"
             _paint(sym, force=True)
