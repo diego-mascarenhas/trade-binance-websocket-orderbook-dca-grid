@@ -541,7 +541,6 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "boost_strict_stall": boost_strict_stall,
         "boost_strict_near": boost_strict_near,
         "boost_strict_ideal": boost_strict_ideal,
-        "empty_book_mult": _empty_book_mult(),
         # ATH SL addon (SHORT) — Help page
         "risk_reduce": (
             0
