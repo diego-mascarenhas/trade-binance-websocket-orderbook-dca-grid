@@ -1074,29 +1074,6 @@ def _max_trades(args: argparse.Namespace) -> int:
         return 3
 
 
-def _empty_book_mult() -> float:
-    """First ★ size mult when futures book is flat. Env: PUMPSTALL_EMPTY_MULT (default 2)."""
-    try:
-        m = float(os.getenv("PUMPSTALL_EMPTY_MULT", "2") or 2)
-    except (TypeError, ValueError):
-        m = 2.0
-    return max(1.0, min(m, 5.0))
-
-
-def _futures_book_flat(recv: int = 15000) -> bool | None:
-    """True if no futures notional; False if open; None if check unavailable."""
-    try:
-        from orderbook_dca_grid import account_exposure, load_keys
-
-        api, sec = load_keys(None)
-        if not api or not sec:
-            return None
-        long_n, short_n = account_exposure(api, sec, recv)
-        return (float(long_n) + float(short_n)) < 1.0
-    except Exception:
-        return None
-
-
 def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.Popen | None:
     """Start `dca SYMBOL short` with the configured trade exit --once."""
     root = _repo_root()
@@ -1221,9 +1198,6 @@ def _maybe_auto_trade(
 
     Other account positions / unrelated supervisors do not consume slots.
     We never launch outside the current top-N ★ list.
-
-    Empty futures book → 1 ★ at PUMPSTALL_EMPTY_MULT (default 2×) via size_boost.
-    Any active size boost → cap slots at 1 (don't fill MAX_TRADES).
     """
     active = _reap_active(active)
     max_trades = _max_trades(args)
@@ -1237,29 +1211,6 @@ def _maybe_auto_trade(
             print(f"{BOLD}{CYAN}{boost_note}{RESET}")
     except Exception as exc:  # noqa: BLE001
         print(f"{DIM}AUTO boost skipped: {exc}{RESET}")
-
-    empty_book = False
-    flat = _futures_book_flat()
-    has_boost = False
-    try:
-        import size_boost as sb
-
-        has_boost = bool(sb.list_boosts())
-    except Exception:
-        has_boost = False
-
-    if flat is True:
-        empty_book = True
-        effective_max = 1
-        print(
-            f"{BOLD}{CYAN}AUTO: empty book → 1 ★ @ "
-            f"{_empty_book_mult():g}×{RESET}"
-        )
-    elif has_boost:
-        effective_max = 1
-        print(f"{DIM}AUTO: size boost active → max 1 ★ (not {max_trades}){RESET}")
-    else:
-        effective_max = max_trades
 
     if _weekend_block_active():
         print(
@@ -1292,7 +1243,7 @@ def _maybe_auto_trade(
 
     # Target set: first N ★ by score, skipping symbols in loss cooldown
     target = _pick_ideals(
-        hits, args.ideal_near, exclude=set(cooling), limit=effective_max,
+        hits, args.ideal_near, exclude=set(cooling), limit=max_trades,
     )
     target_syms = [h.symbol.upper() for h in target]
     if not target_syms:
@@ -1306,7 +1257,7 @@ def _maybe_auto_trade(
     ours = {s.upper() for s in active}
 
     print(
-        f"{DIM}AUTO: target ★ top-{effective_max}: {', '.join(target_syms)}"
+        f"{DIM}AUTO: target ★ top-{max_trades}: {', '.join(target_syms)}"
         f" · ours {', '.join(sorted(ours)) or '—'} · "
         f"supervise {', '.join(sorted(running)) or '—'}{RESET}"
     )
@@ -1315,9 +1266,9 @@ def _maybe_auto_trade(
         sym = hit.symbol.upper()
         if sym in ours or sym in running:
             continue  # already covered (ours or any supervise on this symbol)
-        if len(active) >= effective_max:
+        if len(active) >= max_trades:
             print(
-                f"{DIM}AUTO: at max {effective_max} ★ "
+                f"{DIM}AUTO: at --max-trades={max_trades} "
                 f"(this bot) — wait for a slot{RESET}"
             )
             break
@@ -1341,24 +1292,6 @@ def _maybe_auto_trade(
                 continue
         except Exception as exc:  # noqa: BLE001
             print(f"{DIM}AUTO: ATH gate check skipped for {sym}: {exc}{RESET}")
-        if empty_book:
-            try:
-                import size_boost as sb
-
-                mult = _empty_book_mult()
-                sb.set_boost(
-                    sym,
-                    mult,
-                    source="auto",
-                    reason="empty-book",
-                    ttl_hours=sb.auto_ttl_hours(),
-                )
-                print(
-                    f"{BOLD}{CYAN}AUTO empty-book boost {sym} → "
-                    f"{sb.fmt_mult(mult)}{RESET}"
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"{DIM}AUTO empty-book boost failed: {exc}{RESET}")
         proc = _launch_dca_once(hit, args)
         if proc is not None:
             active[sym] = proc
@@ -1368,7 +1301,7 @@ def _maybe_auto_trade(
     covered = [s for s in target_syms if s in ours or s in running]
     if covered and not missing:
         print(f"{DIM}AUTO: top ★ covered ({', '.join(covered)}){RESET}")
-    elif missing and len(active) >= effective_max:
+    elif missing and len(active) >= max_trades:
         pass  # already logged slot wait
     elif missing:
         print(f"{DIM}AUTO: still need {', '.join(missing)}{RESET}")
