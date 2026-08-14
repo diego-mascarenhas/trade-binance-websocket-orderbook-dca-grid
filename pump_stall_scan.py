@@ -483,22 +483,13 @@ def annotate_ath_gates(
         hist_block = gap < min_gap
         prior_block = gap_p is not None and gap_p < min_gap
         h.ath_block = hist_block or prior_block
-        # Fold into `note` so the public scanner shows it even if the
-        # site Blade has not been updated to read ath_* keys.
+        # ATH copy lives under Hint (auto_notes), not on each row.
         if hist_block:
-            tag = f"ATH {gap:.1f}%<{min_gap:g}% no open"
             notes.append(f"skip {h.symbol} — ATH {gap:.1f}% < {min_gap:g}%")
         elif prior_block:
-            tag = f"prior ATH {gap_p:.1f}%<{min_gap:g}% no open"
             notes.append(
                 f"skip {h.symbol} — prior ATH {gap_p:.1f}% < {min_gap:g}%"
             )
-        elif gap_p is not None:
-            tag = f"ATH {gap:.1f}% · prior {gap_p:.1f}%"
-        else:
-            tag = f"ATH {gap:.1f}%"
-        if "ATH " not in (h.note or ""):
-            h.note = f"{h.note} · {tag}" if h.note else tag
     return notes
 
 
@@ -857,21 +848,6 @@ def print_hits(
             if h.wall_prices:
                 px = " → ".join(f"{p:g}" for p in h.wall_prices[:6])
                 print(f"      {DIM}ask walls: {px}{RESET}")
-            if h.ath_gap_pct is not None:
-                min_gap = float(h.ath_min_gap_pct or 12)
-                prior_bit = ""
-                if h.prior_ath_gap_pct is not None:
-                    prior_bit = f" · prior {h.prior_ath_gap_pct:.1f}%"
-                if h.ath_block:
-                    print(
-                        f"      {YELLOW}ATH {h.ath_gap_pct:.1f}%{prior_bit} below "
-                        f"(need ≥{min_gap:g}%) · no open{RESET}"
-                    )
-                else:
-                    print(
-                        f"      {DIM}ATH {h.ath_gap_pct:.1f}%{prior_bit} below "
-                        f"(gate {min_gap:g}%){RESET}"
-                    )
         if prev is not None:
             gone = [s for s in prev if s not in now_map]
             if gone:
