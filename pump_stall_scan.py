@@ -517,6 +517,8 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
     return {
         "trade_exit": trade_exit,
         "protect_be": protect_be,
+        "also_structure": 1 if bool(g("also_structure", False)) else 0,
+        "ratchet_min_profit_pct": 1.0,
         "be_arm_pct": be_arm,
         "be_profit_pct": be_profit,
         "post_be_arm_pct": post_arm,
@@ -556,36 +558,33 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
 
 
 def format_dca_hint(args: argparse.Namespace | None = None) -> str:
-    """Display hint with the flags this watch would pass to `dca`."""
+    """Display hint matching the flags this watch actually passes to `dca`."""
     s = stack_params(args)
-    exit_mode = s.get("trade_exit", "structure")
+    exit_mode = str(s.get("trade_exit") or "ratchet")
+    gap = f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
     be = " --protect-be" if s.get("protect_be", True) else " --no-protect-be"
     if exit_mode == "ob":
         return (
             f"Hint: dca SYMBOL short --exit ob{be} "
-            f"--imb-long {s['imb_long']:g} "
-            f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
+            f"--imb-long {s['imb_long']:g} {gap}"
         )
     if exit_mode == "trailing":
-        return (
-            f"Hint: dca SYMBOL short --exit trailing{be} "
-            f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
-        )
+        return f"Hint: dca SYMBOL short --exit trailing{be} {gap}"
     if exit_mode == "pullback":
-        return (
-            f"Hint: dca SYMBOL short --exit pullback{be} "
-            f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
-        )
+        return f"Hint: dca SYMBOL short --exit pullback{be} {gap}"
     if exit_mode == "ratchet":
+        overlay = " + also-structure" if int(s.get("also_structure") or 0) else ""
+        times = float(s.get("partial_tp_min_entry_pct") or 500) / 100.0
         return (
-            f"Hint: dca SYMBOL short --exit ratchet --partial-tp "
-            f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
+            f"Hint: dca SYMBOL short --exit ratchet · "
+            f"BE floor@+{s['ratchet_min_profit_pct']:g}%→{s['be_profit_pct']:g}% "
+            f"+ TP{s['tp_partial_pct']:g}%@+{s['tp1_profit_pct']:g}%"
+            f"(≥{times:g}×){overlay} {gap} --once"
         )
     return (
         f"Hint: dca SYMBOL short --exit structure{be} "
         f"--post-be trail --post-be-arm-pct {s['post_be_arm_pct']:g} "
-        f"--post-be-callback {s['post_be_callback']:g} "
-        f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
+        f"--post-be-callback {s['post_be_callback']:g} {gap}"
     )
 
 
