@@ -1308,6 +1308,7 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
         pass
 
     prev_force = args.force
+    star_bypass = False
     if force:
         args.force = True
     try:
@@ -1321,6 +1322,59 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
                             args.comp_factor, args.so_size, args.volume_scale)
         if dca_only:
             orders = orders[1:]
+            if not orders:
+                print(f"{RED}No DCA levels to place.{RESET}")
+                return False
+            try:
+                from exits.partial_tp import (
+                    dca_adds_blocked,
+                    dca_cap_threshold,
+                    position_notional,
+                    trim_orders_to_dca_cap,
+                )
+                import star_rearm as sr
+
+                side_now, qty_now, entry_now = _detect_open_side(
+                    args.symbol, _resolve_hedge(args, api, sec),
+                    api, sec, args.recv_window,
+                )
+                star_bypass = sr.pending(args.symbol)
+                blocked, why = dca_adds_blocked(
+                    args.symbol, args, qty_now, entry_now,
+                    api=api, sec=sec, recv=args.recv_window,
+                )
+                if blocked:
+                    if verbose:
+                        print(f"{YELLOW}DCA cap — skip re-arm: {why}{RESET}")
+                    return False
+                if star_bypass:
+                    if verbose:
+                        print(
+                            f"{BOLD}{CYAN}★ re-arm — one more grid "
+                            f"(bypass 12× cap){RESET}"
+                        )
+                else:
+                    cap, label = dca_cap_threshold(
+                        args, api=api, sec=sec, recv=args.recv_window,
+                    )
+                    current = position_notional(qty_now, entry_now)
+                    before = len(orders)
+                    orders = trim_orders_to_dca_cap(orders, current, cap)
+                    if not orders:
+                        if verbose:
+                            print(
+                                f"{YELLOW}DCA cap — no room under {label} "
+                                f"(position {current:,.0f} USDT){RESET}"
+                            )
+                        return False
+                    if len(orders) < before and verbose:
+                        print(
+                            f"{DIM}DCA cap · trimmed {before}→{len(orders)} "
+                            f"(room {cap - current:,.0f} USDT of {label}){RESET}"
+                        )
+            except Exception as exc:
+                if verbose:
+                    print(f"{DIM}DCA cap check skipped: {exc}{RESET}")
             if not orders:
                 print(f"{RED}No DCA levels to place.{RESET}")
                 return False
@@ -1341,7 +1395,16 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
         args.force = prev_force
 
     prepared = prepare_orders(orders, args.symbol, is_long, filt)
-    return place_orders(args.symbol, is_long, prepared, args, force=force, dca_only=dca_only)
+    placed = place_orders(args.symbol, is_long, prepared, args, force=force, dca_only=dca_only)
+    if placed and star_bypass:
+        try:
+            import star_rearm as sr
+
+            sr.consume(args.symbol)
+            sr.mark_grid_active(args.symbol)
+        except Exception:
+            pass
+    return placed
 
 
 def market_close_position(symbol: str, is_long: bool, qty: float, hedge: bool,
@@ -1520,6 +1583,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
     once_max_arm_fails = max(0, int(_env_float("ONCE_MAX_ARM_FAILS", 5.0)))
     once_arm_fails = 0
     margin_dca_frozen = False  # True after hard strip until ratio < hard
+    dca_size_frozen = False  # True after 12× (or custom) size cap / partial TP
     last_mr_log: str | None = None
     sym = args.symbol.upper()
     try:
@@ -1592,6 +1656,12 @@ def supervise_loop(args: argparse.Namespace) -> None:
                         ) or []
                     except Exception:
                         oo_pos = []
+                    try:
+                        import star_rearm as sr
+
+                        sr.note_grid_empty(sym, count_dca_orders(oo_pos, sym) > 0)
+                    except Exception:
+                        pass
 
                     # Account Margin Ratio (Binance UI): hard → strip DCA; below hard → re-arm.
                     ratio_now: float | None = None
@@ -1639,6 +1709,45 @@ def supervise_loop(args: argparse.Namespace) -> None:
                     dca_blocked = margin_dca_frozen or (
                         hard_mr > 0 and ratio_now is not None and ratio_now >= hard_mr
                     )
+                    size_why = ""
+                    try:
+                        from exits.partial_tp import dca_adds_blocked
+
+                        size_capped, size_why = dca_adds_blocked(
+                            sym, args, qty, entry,
+                            api=api, sec=sec, recv=args.recv_window,
+                        )
+                    except Exception:
+                        size_capped, size_why = False, ""
+                    if size_capped:
+                        n_cap = count_dca_orders(oo_pos, sym)
+                        if n_cap > 0:
+                            print(
+                                f"{YELLOW}DCA size cap · {size_why} → "
+                                f"cancelling {n_cap} leftover limit(s) "
+                                f"(TP/BE/trail kept)…{RESET}"
+                            )
+                            cancel_dca_grid_orders(
+                                sym, api, sec, args.recv_window,
+                            )
+                            try:
+                                oo_pos = _signed_request(
+                                    "GET", "/fapi/v1/openOrders",
+                                    {"symbol": sym}, api, sec, args.recv_window,
+                                ) or []
+                            except Exception:
+                                oo_pos = []
+                        elif not dca_size_frozen:
+                            print(
+                                f"{DIM}DCA size cap · {size_why} · "
+                                f"no more adds{RESET}"
+                            )
+                        dca_size_frozen = True
+                    elif dca_size_frozen:
+                        print(f"{GREEN}DCA size cap cleared → thaw re-arm{RESET}")
+                        dca_size_frozen = False
+                        dca_missing_retry_at = 0.0
+                    dca_blocked = dca_blocked or size_capped
                     risk_rearm_ok = True
                     try:
                         from exits.risk_reduce import allow_dca_rearm as _risk_rearm_ok
@@ -1789,7 +1898,21 @@ def supervise_loop(args: argparse.Namespace) -> None:
                                 leverage=get_symbol_leverage(sym, api, sec, args.recv_window),
                                 pnl_usdt=float(pos_chk.get("unrealized_pnl", 0) or 0),
                             )
-                            if exit_mode != EXIT_STAGED or dca_rearm_allowed(sym):
+                            orphan_ok = exit_mode != EXIT_STAGED or dca_rearm_allowed(sym)
+                            if orphan_ok:
+                                try:
+                                    from exits.partial_tp import dca_adds_blocked
+
+                                    blocked, why = dca_adds_blocked(
+                                        sym, args, qty_chk, entry_chk,
+                                        api=api, sec=sec, recv=args.recv_window,
+                                    )
+                                    if blocked:
+                                        print(f"{YELLOW}DCA cap — skip orphan re-arm: {why}{RESET}")
+                                        orphan_ok = False
+                                except Exception:
+                                    pass
+                            if orphan_ok:
                                 placed = build_and_place_grid(
                                     args, api, sec, filt, verbose=True,
                                     dca_only=True, force=True,
@@ -2148,6 +2271,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="[--exit structure|ratchet] Arm partial TP when position notional ≥ this %% of "
              "entry base size (default 500 = 5× entry, ~mid-grid). "
              "Env: PARTIAL_TP_MIN_ENTRY_PCT",
+    )
+    p.add_argument(
+        "--dca-max-entry-pct",
+        type=float,
+        default=None,
+        help="Cancel leftover DCA and skip auto re-arm when filled notional ≥ this %% of "
+             "entry base (default 1200 = 12×). A new ★ may place one more grid. "
+             "0 = unlimited. Env: DCA_MAX_ENTRY_PCT",
     )
     p.add_argument(
         "--partial-tp-min-notional",

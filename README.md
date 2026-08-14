@@ -233,6 +233,7 @@ dca ZAMAUSDT short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 \
   --partial-tp --tp-partial-pct 70 \
   --post-be trail --post-be-arm-pct 1.5 --post-be-callback 0.6 --once
 # 70% TAKE_PROFIT @ +0.3% gross (only if notional ≥ 500% of entry ≈ 5× / mid-grid)
+# · auto-DCA freezes at 12×; a new ★ may place one more grid
 # · BE @ +1% → entry+0.3% · trail from +1.5% (cb 0.6%) · TP resto = EQL
 ```
 

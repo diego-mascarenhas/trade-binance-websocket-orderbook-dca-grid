@@ -580,6 +580,7 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "tp_partial_pct": tp_partial,
         "tp1_profit_pct": tp1_profit,
         "partial_tp_min_entry_pct": partial_entry_pct,
+        "dca_max_entry_pct": 1200.0,
         "imb_long": imb_long,
         "loss_cooldown_min": float(g("loss_cooldown_min", 1440.0) or 1440.0),
         "margin_ratio_soft": float(g("margin_ratio_soft", 3.0) or 3.0),
@@ -629,11 +630,12 @@ def format_dca_hint(args: argparse.Namespace | None = None) -> str:
     if exit_mode == "ratchet":
         overlay = " + also-structure" if int(s.get("also_structure") or 0) else ""
         times = float(s.get("partial_tp_min_entry_pct") or 500) / 100.0
+        dca_x = float(s.get("dca_max_entry_pct") or 1200) / 100.0
         return (
             f"Hint: dca SYMBOL short --exit ratchet · "
             f"BE floor@+{s['ratchet_min_profit_pct']:g}%→{s['be_profit_pct']:g}% "
             f"+ TP{s['tp_partial_pct']:g}%@+{s['tp1_profit_pct']:g}%"
-            f"(≥{times:g}×){overlay} {gap} --once"
+            f"(≥{times:g}×) · DCA≤{dca_x:g}× · +grid if ★{overlay} {gap} --once"
         )
     return (
         f"Hint: dca SYMBOL short --exit structure{be} "
@@ -1190,6 +1192,7 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
             "--tp-partial-pct", "70",
             "--tp1-profit-pct", "0.3",
             "--partial-tp-min-entry-pct", "500",
+            "--dca-max-entry-pct", "1200",
         ])
         # post-BE trail only when BE is on and caller asked for it
         if use_be and float(getattr(args, "post_be_arm_pct", 0) or 0) > 0:
@@ -1209,7 +1212,7 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
             cmd.extend(["--structure-interval", str(args.structure_interval)])
         launch_note = (
             f"dca short --exit structure{be_note}{trail_note} "
-            f"+ TP70%@+0.3%(≥500% entry) --once"
+            f"+ TP70%@+0.3%(≥500% entry) · DCA≤12× --once"
         )
     elif exit_mode == "trailing":
         launch_note = f"dca short --exit trailing{be_note} --once"
@@ -1232,6 +1235,7 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
             "--tp-partial-pct", "70",
             "--tp1-profit-pct", "0.3",
             "--partial-tp-min-entry-pct", "500",
+            "--dca-max-entry-pct", "1200",
         ])
         overlay = ""
         if bool(getattr(args, "also_structure", False)):
@@ -1241,7 +1245,7 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
                 cmd.extend(["--structure-interval", str(args.structure_interval)])
         launch_note = (
             f"dca short --exit ratchet · BE floor@+1%→0.3% "
-            f"+ TP70%@+0.3%(≥5×){overlay} --once"
+            f"+ TP70%@+0.3%(≥5×) · DCA≤12×{overlay} --once"
         )
     elif exit_mode == "ob":
         imb = getattr(args, "imb_long", None)
@@ -1304,6 +1308,19 @@ def _maybe_auto_trade(
             print(f"{BOLD}{CYAN}{boost_note}{RESET}")
     except Exception as exc:  # noqa: BLE001
         print(f"{DIM}AUTO boost skipped: {exc}{RESET}")
+    try:
+        import star_rearm as sr
+
+        running_now = {s.upper() for s in _dca_supervisor_running()} | {
+            s.upper() for s in active
+        }
+        pulse = sr.sync_from_scan(
+            hits, float(args.ideal_near), running_now,
+        )
+        if pulse:
+            print(f"{BOLD}{CYAN}{pulse}{RESET}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"{DIM}AUTO ★ re-arm pulse skipped: {exc}{RESET}")
 
     if _weekend_block_active():
         print(

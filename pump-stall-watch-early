@@ -6,7 +6,7 @@
 #
 # Exit composition on auto-trade ★:
 #   --trade-exit ratchet  → BE floor + SL to previous wall
-#   --partial-tp          → 5× / 70% @ 0.3%+fees (on by default in the child)
+#   --partial-tp          → 5× / 70% @ 0.3%+fees; auto-DCA ≤12× (+grid if ★ again)
 #   --also-structure      → optional: EQL/EQH may close earlier (evaluate)
 #
 # Usage:

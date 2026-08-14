@@ -7,9 +7,13 @@ When position notional (qty × avg entry) reaches 5× the entry base
   • trigger = entry ± (``--tp1-profit-pct`` + ``--tp-fee-buffer``)
     (default **0.3% net + 0.12% fees**). Binance reduces as soon as mark
     touches that price.
+  • freeze auto-DCA at ``--dca-max-entry-pct`` (default **12×**):
+    cancel leftover safety orders and do not re-arm more adds.
+    A new ★ (scanner rising edge) may place one more grid past that cap.
 
 A favorable burst (``--partial-tp-burst-pct``, default 2%) can skip the 5×
-gate so a 1× fill that explodes still gets the partial.
+TP gate so a 1× fill that explodes still gets the partial. The DCA cap
+still applies (burst does not authorize more size).
 
 Does **not** cancel BE / post-BE trail. On TP1 fill: cancel leftover DCA.
 """
@@ -138,6 +142,111 @@ def partial_tp_threshold(
 
     thr = base * (pct / 100.0)
     return thr, f"{pct:g}% of entry {base:,.2f} USDT (= {thr:,.2f})"
+
+
+def dca_max_entry_pct(args: argparse.Namespace) -> float:
+    """Max filled notional as %% of entry base. 0 = unlimited.
+
+    Default **1200 = 12×** (independent of the 5× partial-TP gate).
+    Override with ``--dca-max-entry-pct`` / ``DCA_MAX_ENTRY_PCT``.
+    """
+    v = getattr(args, "dca_max_entry_pct", None)
+    if v is not None:
+        return float(v)
+    env = _env_float_optional("DCA_MAX_ENTRY_PCT")
+    if env is not None:
+        return float(env)
+    return 1200.0
+
+
+def dca_cap_threshold(
+    args: argparse.Namespace,
+    *,
+    api: str,
+    sec: str,
+    recv: int,
+) -> tuple[float, str]:
+    """Return (max_notional_usdt, label). ``0`` / non-finite = no cap."""
+    pct = dca_max_entry_pct(args)
+    if pct <= 0:
+        return 0.0, "off"
+    base = resolve_entry_base_usdt(args, api, sec, recv)
+    if base <= 0:
+        return float("inf"), "unresolved entry base"
+    thr = base * (pct / 100.0)
+    return thr, f"{pct:g}% of entry {base:,.2f} USDT (= {thr:,.2f})"
+
+
+def position_notional(qty: float, entry: float) -> float:
+    return abs(float(qty or 0) * float(entry or 0))
+
+
+def position_over_dca_cap(qty: float, entry: float, cap: float) -> bool:
+    """True when qty×avg entry already meets/exceeds the 12× (or custom) cap."""
+    if cap <= 0 or cap == float("inf"):
+        return False
+    return position_notional(qty, entry) >= cap - 1e-9
+
+
+def trim_orders_to_dca_cap(
+    orders: list[dict],
+    current_notional: float,
+    cap: float,
+) -> list[dict]:
+    """Keep leading orders whose size still fits under ``cap``."""
+    if cap <= 0 or cap == float("inf"):
+        return list(orders)
+    room = float(cap) - float(current_notional or 0)
+    if room <= 0:
+        return []
+    kept: list[dict] = []
+    used = 0.0
+    for o in orders:
+        sz = float(o.get("size_usdt") or 0)
+        if sz <= 0:
+            continue
+        if used + sz > room + 0.01:
+            break
+        kept.append(o)
+        used += sz
+    return kept
+
+
+def partial_tp_already_filled(symbol: str) -> bool:
+    """Runner after the 70% TP — do not add more DCA."""
+    try:
+        import orderbook_staged_exit as staged
+
+        return bool((staged.load_state(symbol.upper()) or {}).get("partial_tp_filled"))
+    except Exception:
+        return False
+
+
+def dca_adds_blocked(
+    symbol: str,
+    args: argparse.Namespace,
+    qty: float,
+    entry: float,
+    *,
+    api: str,
+    sec: str,
+    recv: int,
+) -> tuple[bool, str]:
+    """Whether to freeze DCA (cancel leftovers + skip re-arm)."""
+    if partial_tp_already_filled(symbol):
+        return True, "after partial TP"
+    try:
+        import star_rearm as sr
+
+        if sr.pending(symbol) or sr.grid_active(symbol):
+            return False, ""
+    except Exception:
+        pass
+    cap, label = dca_cap_threshold(args, api=api, sec=sec, recv=recv)
+    if position_over_dca_cap(qty, entry, cap):
+        notional = position_notional(qty, entry)
+        return True, f"notional {notional:,.0f} USDT ≥ {label}"
+    return False, ""
 
 
 def run_once(
