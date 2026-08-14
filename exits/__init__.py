@@ -1,12 +1,15 @@
 """Exit strategy plugins for orderbook_dca_grid.py --supervise.
 
 Composition model:
-  --exit <eql|trailing|ob|pullback|ratchet|…>   primary close method (independent)
-  --protect-be / --no-protect-be   optional BE SL addon (orthogonal; not for ratchet)
+  --exit <eql|trailing|ob|pullback|ratchet|…>   primary close method
+  --protect-be / --no-protect-be   optional BE SL addon (not stacked with ratchet)
+  --partial-tp                     5× / burst partial (structure + ratchet)
+  --also-structure                 overlay EQL/EQH close on top of ratchet
   --post-be trail                  optional trail *after* BE (structure/be only)
   --risk-reduce / --no-risk-reduce optional SHORT full SL at ATH + RISK_ATH_SL_PCT
 
-Add new strategies here; the main bot only dispatches via run_exit_once().
+Ratchet owns the BE algo tag (entry-floor SL, then walls). Partial TP and
+structure overlays may close earlier when they would be the better trade.
 """
 
 from __future__ import annotations
@@ -153,6 +156,35 @@ def protect_be_enabled(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "protect_be", True))
 
 
+def also_structure_enabled(args: argparse.Namespace) -> bool:
+    """EQL/EQH overlay on top of --exit ratchet (off unless asked)."""
+    v = getattr(args, "also_structure", None)
+    if v is not None:
+        return bool(v)
+    raw = (os.getenv("ALSO_STRUCTURE") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _run_optional_partial_tp(
+    symbol: str,
+    side_is_long: bool,
+    qty: float,
+    entry: float,
+    args: argparse.Namespace,
+    hedge: bool,
+    api: str,
+    sec: str,
+    filt: dict[str, Decimal],
+) -> tuple[bool, float, float] | None:
+    recv = int(getattr(args, "recv_window", 15000) or 15000)
+    from exits.partial_tp import partial_tp_enabled, run_once as partial_once
+
+    if not partial_tp_enabled(args):
+        return side_is_long, qty, entry
+    partial_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
+    return _refresh_side(symbol, side_is_long, hedge, api, sec, recv)
+
+
 def _refresh_side(
     symbol: str,
     side_is_long: bool,
@@ -293,17 +325,31 @@ def run_exit_once(
         return
 
     if mode == EXIT_RATCHET:
-        # Owns the BE algo tag — do not stack classic protect-be
+        # Floor: ratchet SL (owns BE tag). Overlays may take a better exit first.
+        recv = int(getattr(args, "recv_window", 15000) or 15000)
+        refreshed = _run_optional_partial_tp(
+            symbol, side_is_long, qty, entry, args, hedge, api, sec, filt,
+        )
+        if refreshed is None:
+            return
+        side_is_long, qty, entry = refreshed
+        if also_structure_enabled(args):
+            from exits.structure import run_once as structure_once
+
+            structure_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
+            refreshed = _refresh_side(symbol, side_is_long, hedge, api, sec, recv)
+            if refreshed is None:
+                return
+            side_is_long, qty, entry = refreshed
         from exits.ratchet import run_once as ratchet_once
         ratchet_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
         return
 
     if mode == EXIT_STRUCTURE:
         # optional partial → optional BE (+ optional post-BE trail) → EQL/EQH
-        from exits.partial_tp import run_once as partial_once
-
-        partial_once(symbol, side_is_long, qty, entry, args, hedge, api, sec, filt)
-        refreshed = _refresh_side(symbol, side_is_long, hedge, api, sec, recv)
+        refreshed = _run_optional_partial_tp(
+            symbol, side_is_long, qty, entry, args, hedge, api, sec, filt,
+        )
         if refreshed is None:
             return
         side_is_long, qty, entry = refreshed

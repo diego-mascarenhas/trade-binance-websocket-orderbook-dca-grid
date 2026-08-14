@@ -4,21 +4,21 @@
 # Looser entry so blow-offs near the 1D top can appear / trade sooner:
 #   stall ≥ 25 (default 35) · near ≥ 82 (default 85) · ★ near ≥ 90 (default 92)
 #
-# Exit composition on auto-trade ★ (independent knobs):
-#   --trade-exit ob     → soft-close on OB Long
-#   --protect-be        → BE@1%→0.3% (omit / pass --no-protect-be to skip)
+# Exit composition on auto-trade ★:
+#   --trade-exit ratchet  → BE floor + SL to previous wall
+#   --partial-tp          → 5× / 70% @ 0.3%+fees (on by default in the child)
+#   --also-structure      → optional: EQL/EQH may close earlier (evaluate)
 #
 # Usage:
 #   ./pump-stall-watch-early
-#   ./pump-stall-watch-early --no-protect-be
-#   ./pump-stall-watch-early --trade-exit structure --post-be-arm-pct 1.5
+#   ./pump-stall-watch-early --also-structure
+#   ./pump-stall-watch-early --trade-exit structure
 #
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec python3 "$ROOT/pump_stall_scan.py" --watch \
   --auto-trade \
   --telegram \
-  --trade-exit ob \
-  --protect-be \
+  --trade-exit ratchet \
   --max-trades 3 \
   --interval 60 \
   --loss-cooldown-min 1440 \

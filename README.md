@@ -249,7 +249,7 @@ Finds 1D blow-off → stall shorts with enough **ask** walls for a SHORT DCA gri
 | One-shot table | `./pump-stall` | No |
 | Live table | `./pump-stall-watch` | No |
 | Auto-trade (strict) | `./pump-stall-watch --auto-trade` | **Yes** |
-| Early profile (prod) | `./pump-stall-watch-early` | **Yes** (looser filters + `--trade-exit ob --protect-be`) |
+| Early profile (prod) | `./pump-stall-watch-early` | **Yes** (looser filters + `--trade-exit ratchet` + 5× partial TP) |
 | Early one-shot | `./pump-stall-early` | No |
 
 ```bash
@@ -276,14 +276,15 @@ python3 pump_stall_scan.py --help
 7. Losing close → **`--loss-cooldown-min`** (default **1440 = 24h**) on that symbol (`.state/loss_cooldown.json`)
 8. Weekend block (default **on**): no new ★ from **Fri 21:00 UTC → Sun 23:00 UTC** (`PUMPSTALL_WEEKEND_BLOCK=0` to disable). Open positions are left alone.
 
-**Exit composition (independent):** `--trade-exit structure|ob|trailing` picks the close method; `--protect-be` / `--no-protect-be` adds or skips BE. Early default: `ob` + BE.
+**Exit composition:** `--trade-exit ratchet` (early default) is BE floor + SL to the previous wall. A 5× partial TP (70% @ 0.3%+fees) can take profit first. `--also-structure` lets EQL/EQH close earlier so `/stats` Reason shows which condition won. CLI `--trade-exit` wins over `TRADE_EXIT` / `EXIT_MODE`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--watch` | off | Refresh table live |
 | `--auto-trade` | off | Launch trades (requires `--watch`) |
-| `--trade-exit` | `structure` | Primary exit: `structure` (EQL) · `ob` · `trailing` |
-| `--protect-be` | on | Optional BE SL addon (`--no-protect-be` to skip) |
+| `--trade-exit` | `ratchet` | Primary: `ratchet` (BE+walls) · `structure` · `ob` · `pullback` |
+| `--protect-be` | on | Optional BE SL addon (ignored by ratchet, which owns BE) |
+| `--also-structure` | off | On ratchet: also allow EQL/EQH to close earlier |
 | `--max-trades` / `MAX_TRADES` | `3` | How many top ★ to run (`.env` wins after restart) |
 | `--interval` | `60` | Refresh seconds (min 15) |
 | `--ideal-near` | `92` | near% ≥ this → ★ (early profile: 90) |
@@ -485,7 +486,8 @@ REARM_BACKOFF=60
 | `TP1_PROFIT_PCT` | `0.3` | futures staged | First partial trigger (%) |
 | `BE_PROFIT_PCT` | `0.1` | futures staged | Runner SL profit lock after TP1 (%) |
 | `TP_PARTIAL_PCT` | `70` | futures staged/structure | First partial size (%) |
-| `PARTIAL_TP_MIN_ENTRY_PCT` | `500` | futures structure | Arm partial when notional ≥ this % of entry (5×) |
+| `PARTIAL_TP_MIN_ENTRY_PCT` | `500` | futures structure | Arm partial when notional ≥ this % of entry (5×). Notional is qty×entry, not × leverage |
+| `PARTIAL_TP_BURST_PCT` | `2` | futures structure | Skip the 5× gate when favorable move ≥ this % (ráfaga on a 1× fill) |
 | `PARTIAL_TP_MIN_NOTIONAL` | — | futures structure | Absolute USDT override (skips entry-%) |
 | `TELEGRAM_BOT_TOKEN` | — | telegram | Bot token for alerts + remote control |
 | `TELEGRAM_CHAT_ID` | — | telegram | Allowed chat for alerts + commands |

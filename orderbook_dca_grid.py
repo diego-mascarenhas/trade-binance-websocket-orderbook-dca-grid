@@ -1291,6 +1291,8 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
         except Exception as exc:
             print(f"{RED}Wallet balance read failed: {exc}{RESET}")
             return False
+        if base_size > 0:
+            args.base_size = float(base_size)
 
     try:
         from size_boost import apply_boost
@@ -1471,6 +1473,17 @@ def supervise_loop(args: argparse.Namespace) -> None:
 
     hedge = _resolve_hedge(args, api, sec)
     exit_mode = resolve_exit_mode(args)
+    if float(getattr(args, "base_size", 0) or 0) <= 0:
+        try:
+            bal = get_wallet_balance(api, sec, args.recv_window)
+            args.base_size = bal * float(args.wallet_pct) / 100.0
+            print(
+                f"{BOLD}{CYAN}Entry size: {args.wallet_pct:g}% of wallet{RESET} "
+                f"{DIM}(wallet {bal:,.2f} USDT → {args.base_size:,.2f} USDT) "
+                f"· partial-TP 5× gate uses this, not live wallet{RESET}"
+            )
+        except Exception as exc:
+            print(f"{YELLOW}Wallet size unresolved ({exc}) — partial TP uses fill/burst{RESET}")
     ttl_note = f", grid refresh {args.grid_ttl:g}s" if args.grid_ttl > 0 else ""
     gate = getattr(args, "gate_price", None)
     gate_note = ""
@@ -1680,8 +1693,16 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             from exits.pullback import pop_close_reason as pop_pb_reason
                             close_reason = pop_pb_reason(sym)
                         elif exit_mode == EXIT_RATCHET:
+                            from exits.structure import pop_close_reason as pop_st_reason
                             from exits.ratchet import pop_close_reason as pop_rt_reason
-                            close_reason = pop_rt_reason(sym) or "ratchet SL"
+                            import orderbook_staged_exit as staged
+
+                            close_reason = pop_st_reason(sym) or pop_rt_reason(sym) or "ratchet SL"
+                            try:
+                                if bool((staged.load_state(sym) or {}).get("partial_tp_filled")):
+                                    close_reason = f"{close_reason} · after partial TP"
+                            except Exception:
+                                pass
                         elif after_runner:
                             close_reason = "runner / trail"
                         close_pnl = float(last_pos_meta.get("unrealized_pnl", 0) or 0)
@@ -2109,13 +2130,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-tp", action="store_true",
                    help="Legacy alias for --exit none (skip automatic exit management)")
     p.add_argument("--tp1-profit-pct", type=float, default=None,
-                   help="[--exit staged|structure] Partial TP profit %% from entry (gross). "
+                   help="[--exit staged|structure] Partial TP net profit %% from entry "
+                        "(fees added via --tp-fee-buffer). "
                         "With --exit structure default 0.3. Env: TP1_PROFIT_PCT")
     p.add_argument(
         "--partial-tp",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="[--exit structure] Arm TAKE_PROFIT on --tp-partial-pct when position "
+        help="[--exit structure|ratchet] Arm TAKE_PROFIT on --tp-partial-pct when position "
              "notional ≥ --partial-tp-min-entry-pct of entry (default on). "
              "Use --no-partial-tp to disable",
     )
@@ -2123,7 +2145,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--partial-tp-min-entry-pct",
         type=float,
         default=None,
-        help="[--exit structure] Arm partial TP when position notional ≥ this %% of "
+        help="[--exit structure|ratchet] Arm partial TP when position notional ≥ this %% of "
              "entry base size (default 500 = 5× entry, ~mid-grid). "
              "Env: PARTIAL_TP_MIN_ENTRY_PCT",
     )
@@ -2134,6 +2156,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="[--exit structure] Absolute USDT floor override for partial TP "
              "(if set, ignores --partial-tp-min-entry-pct). "
              "Env: PARTIAL_TP_MIN_NOTIONAL",
+    )
+    p.add_argument(
+        "--partial-tp-burst-pct",
+        type=float,
+        default=None,
+        help="[--exit structure|ratchet] Favorable move %% that arms partial TP even if "
+             "the 5× size gate is not met (default 2; 0=off). "
+             "Env: PARTIAL_TP_BURST_PCT",
+    )
+    p.add_argument(
+        "--also-structure",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="[--exit ratchet] Also soft-close on EQL/EQH while green (evaluate vs "
+             "ratchet SL). Default off. Env: ALSO_STRUCTURE=1",
     )
     p.add_argument(
         "--protect-be",

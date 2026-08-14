@@ -1,16 +1,17 @@
-"""Partial TP (default 70% @ +0.3% gross) for the structure + BE stack.
+"""Partial TP (default 70% @ +0.3% net + fees) for the structure + BE stack.
 
-Arms a reduce-only TAKE_PROFIT_MARKET on ``--tp-partial-pct`` of the position
-at entry ± ``--tp1-profit-pct`` (default **0.3%**, gross — fees not added).
+When position notional (qty × avg entry) reaches 5× the entry base
+(``--partial-tp-min-entry-pct``, default 500):
 
-Only arms when position notional (qty × avg entry) reaches a size gate:
-  • default: ``--partial-tp-min-entry-pct`` of the entry base size
-    (default **500%** = 5× entry — typically mid-grid / ~5th DCA fill)
-  • optional absolute override: ``--partial-tp-min-notional`` /
-    ``PARTIAL_TP_MIN_NOTIONAL``
+  • arm TAKE_PROFIT_MARKET on ``--tp-partial-pct`` (default **70%**)
+  • trigger = entry ± (``--tp1-profit-pct`` + ``--tp-fee-buffer``)
+    (default **0.3% net + 0.12% fees**). Binance reduces as soon as mark
+    touches that price.
 
-Does **not** cancel BE / post-BE trail algos. On TP1 fill: cancel leftover DCA
-limits so the runner is not re-averaged; BE/structure continue on the remainder.
+A favorable burst (``--partial-tp-burst-pct``, default 2%) can skip the 5×
+gate so a 1× fill that explodes still gets the partial.
+
+Does **not** cancel BE / post-BE trail. On TP1 fill: cancel leftover DCA.
 """
 
 from __future__ import annotations
@@ -52,11 +53,24 @@ def tp_partial_pct(args: argparse.Namespace) -> float:
 
 
 def tp1_profit_pct(args: argparse.Namespace) -> float:
-    """Gross TP distance from entry (fees not added). Default 0.3%."""
+    """Net TP distance from entry (fees added separately). Default 0.3%."""
     v = getattr(args, "tp1_profit_pct", None)
     if v is not None:
         return float(v)
     return _env_float("TP1_PROFIT_PCT", 0.3)
+
+
+def tp_fee_buffer_pct(args: argparse.Namespace) -> float:
+    """Round-trip fee+slippage %% added on top of the 0.3% net TP. Default 0.12."""
+    v = getattr(args, "tp_fee_buffer", None)
+    if v is not None:
+        return float(v)
+    return _env_float("TP_FEE_BUFFER", 0.12)
+
+
+def tp1_gross_pct(args: argparse.Namespace) -> float:
+    """Trigger distance: net TP1 + fee buffer (stays green after round-trip)."""
+    return tp1_profit_pct(args) + max(tp_fee_buffer_pct(args), 0.0)
 
 
 def partial_tp_min_entry_pct(args: argparse.Namespace) -> float:
@@ -65,6 +79,14 @@ def partial_tp_min_entry_pct(args: argparse.Namespace) -> float:
     if v is not None:
         return float(v)
     return _env_float("PARTIAL_TP_MIN_ENTRY_PCT", 500.0)
+
+
+def partial_tp_burst_pct(args: argparse.Namespace) -> float:
+    """Favorable move %% that bypasses the 5× size gate (0 = off). Default 2."""
+    v = getattr(args, "partial_tp_burst_pct", None)
+    if v is not None:
+        return float(v)
+    return _env_float("PARTIAL_TP_BURST_PCT", 2.0)
 
 
 def resolve_entry_base_usdt(
@@ -140,27 +162,29 @@ def run_once(
     recv = int(getattr(args, "recv_window", 15000) or 15000)
     dry = bool(getattr(args, "dry_run", False))
     partial = tp_partial_pct(args)
-    profit_pct = tp1_profit_pct(args)
+    net_pct = tp1_profit_pct(args)
+    fee_pct = tp_fee_buffer_pct(args)
+    profit_pct = tp1_gross_pct(args)
     min_notional, thr_label = partial_tp_threshold(
         args, api=api, sec=sec, recv=recv,
     )
     if partial <= 0 or partial >= 100 or profit_pct <= 0:
         return
 
+    # qty×entry = USDT-M notional. Do not multiply by leverage (Binance Size in
+    # USDT is already qty×mark; 30 USDT @ 50x is still 30 notional, ~0.6 margin).
     notional = abs(float(qty) * float(entry))
-    if notional < min_notional:
-        print(
-            f"{grid.DIM}Partial TP skip · notional {notional:,.0f} USDT "
-            f"< {thr_label}{grid.RESET}"
-        )
-        return
+    sym = symbol.upper()
+    burst_pct = partial_tp_burst_pct(args)
+    mark = staged.get_mark_price(sym, api, sec, recv)
+    fav_pct = staged.profit_pct(entry, mark, side_is_long) if mark > 0 else 0.0
+    burst = burst_pct > 0 and fav_pct >= burst_pct
 
     tick = filt["tick_size"]
     step = filt["step_size"]
     price_dp = grid._dec_places(tick)
     qty_dp = grid._dec_places(step)
     side = "LONG" if side_is_long else "SHORT"
-    sym = symbol.upper()
 
     state = staged.load_state(sym)
     # Detect TP1 fill: position shrank vs what we armed
@@ -207,6 +231,19 @@ def run_once(
         # Already took the 70% — do not re-arm on the runner
         return
 
+    already_armed = bool(state.get("partial_tp_armed"))
+    if notional < min_notional and not burst and not already_armed:
+        print(
+            f"{grid.DIM}Partial TP skip · notional {notional:,.0f} USDT "
+            f"< {thr_label} · pnl {fav_pct:+.2f}% < burst {burst_pct:g}%{grid.RESET}"
+        )
+        return
+    if burst and notional < min_notional and not already_armed:
+        print(
+            f"{grid.YELLOW}Partial TP burst · pnl {fav_pct:+.2f}% ≥ {burst_pct:g}% "
+            f"· notional {notional:,.0f} USDT < {thr_label} → skip size gate{grid.RESET}"
+        )
+
     existing = staged.find_our_algo(sym, "TP1", api, sec, recv)
     tp1_trig_f = staged.profit_target_price(entry, side_is_long, profit_pct, tick)
     tp1_d, remain_d = staged.split_partial_qty(
@@ -229,14 +266,13 @@ def run_once(
             print(
                 f"{grid.DIM}Partial TP armed · {side} {partial:g}% "
                 f"notional {notional:,.0f} USDT · "
-                f"TAKE_PROFIT @ {tp1_trig} (+{profit_pct:g}% gross){grid.RESET}"
+                f"TAKE_PROFIT @ {tp1_trig} (+{net_pct:g}% net + {fee_pct:g}% fees){grid.RESET}"
             )
             return
 
     # Replace only our TP1 — never wipe BE / trail
     staged.cancel_our_algos(sym, "TP1", api, sec, recv)
 
-    mark = staged.get_mark_price(sym, api, sec, recv)
     if staged.profit_target_hit(entry, mark, side_is_long, profit_pct):
         print(
             f"{grid.YELLOW}Partial TP already hit (mark) — "
@@ -262,7 +298,7 @@ def run_once(
 
     print(
         f"{close_side} TAKE_PROFIT_MARKET {tp1_str} ({partial:g}%) @ {tp1_trig} "
-        f"(+{profit_pct:g}% gross · notional {notional:,.0f} USDT ≥ {thr_label})"
+        f"(+{net_pct:g}% net + {fee_pct:g}% fees · notional {notional:,.0f} USDT ≥ {thr_label})"
     )
     if dry:
         return
@@ -295,7 +331,7 @@ def run_once(
 
     print(
         f"{grid.GREEN}✓ Partial TP algoId={resp.get('algoId')} "
-        f"(+{profit_pct:g}% / {partial:g}% · ≥ {thr_label}){grid.RESET}"
+        f"(+{net_pct:g}% net + {fee_pct:g}% fees / {partial:g}% · ≥ {thr_label}){grid.RESET}"
     )
     algo_ids = dict(state.get("algo_ids") or {})
     algo_ids["tp1"] = resp.get("algoId")

@@ -13,7 +13,7 @@ Display-only by default. With --watch --auto-trade: run the top
 Primary exit via `--trade-exit` / .env TRADE_EXIT|EXIT_MODE
   (structure|ob|trailing|pullback|ratchet…); BE is optional
 via `--protect-be` / `--no-protect-be` (orthogonal).
-Early profile: `--trade-exit ob --protect-be`.
+Early profile: `--trade-exit ratchet` (BE floor + wall SL + 5× partial TP).
 Other open pairs on the account do not consume these slots.
 Account Margin Ratio (Binance UI): ≥ soft (default 5%) → no new ★;
 ≥ hard (default 8%) → cancel DCA limits (keep exits); below hard → re-arm DCA.
@@ -489,7 +489,7 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         imb_long = float(g("imb_long", 0.55) or 0.55)
     except (TypeError, ValueError):
         imb_long = 0.55
-    trade_exit = "structure"
+    trade_exit = "ratchet"
     protect_be = True
     if args is not None:
         trade_exit = _trade_exit_mode(args)
@@ -578,7 +578,7 @@ def format_dca_hint(args: argparse.Namespace | None = None) -> str:
         )
     if exit_mode == "ratchet":
         return (
-            f"Hint: dca SYMBOL short --exit ratchet "
+            f"Hint: dca SYMBOL short --exit ratchet --partial-tp "
             f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
         )
     return (
@@ -1027,14 +1027,16 @@ def _maybe_notify_weekend_block(*, telegram: bool) -> None:
 def _trade_exit_mode(args: argparse.Namespace) -> str:
     """Primary exit for auto-trade children.
 
-    Preference: TRADE_EXIT / EXIT_MODE in .env (EnvironmentFile) → --trade-exit → structure.
-    So a VPS .env change wins over a hardcoded unit flag after restart.
+    Preference: explicit ``--trade-exit`` → TRADE_EXIT → EXIT_MODE → ratchet.
+    Early default is BE+ratchet. CLI wins over .env so a leftover EXIT_MODE
+    cannot silently replace the unit flag.
     """
+    cli = getattr(args, "trade_exit", None)
     raw = (
-        os.getenv("TRADE_EXIT")
+        cli
+        or os.getenv("TRADE_EXIT")
         or os.getenv("EXIT_MODE")
-        or getattr(args, "trade_exit", None)
-        or "structure"
+        or "ratchet"
     )
     raw = str(raw).strip().lower()
     if raw in ("be-ob", "be_ob", "beob", "ob-long", "ob_long", "oblong", "ob"):
@@ -1049,7 +1051,7 @@ def _trade_exit_mode(args: argparse.Namespace) -> str:
         return "structure"
     if raw in ("be", "staged", "none"):
         return raw
-    return "structure"
+    return "ratchet"
 
 
 def _protect_be_for_trade(args: argparse.Namespace) -> bool:
@@ -1144,12 +1146,28 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
             cmd[cmd.index("--protect-be")] = "--no-protect-be"
         elif "--no-protect-be" not in cmd:
             cmd.append("--no-protect-be")
-        # Drop BE arm flags if we already appended them
         for flag in ("--be-arm-pct", "--be-profit-pct"):
             if flag in cmd:
                 i = cmd.index(flag)
                 del cmd[i:i + 2]
-        launch_note = "dca short --exit ratchet --once"
+        cmd.extend([
+            "--be-profit-pct", "0.3",
+            "--ratchet-min-profit-pct", "1",
+            "--partial-tp",
+            "--tp-partial-pct", "70",
+            "--tp1-profit-pct", "0.3",
+            "--partial-tp-min-entry-pct", "500",
+        ])
+        overlay = ""
+        if bool(getattr(args, "also_structure", False)):
+            cmd.append("--also-structure")
+            overlay = " + also-structure"
+            if getattr(args, "structure_interval", None):
+                cmd.extend(["--structure-interval", str(args.structure_interval)])
+        launch_note = (
+            f"dca short --exit ratchet · BE floor@+1%→0.3% "
+            f"+ TP70%@+0.3%(≥5×){overlay} --once"
+        )
     elif exit_mode == "ob":
         imb = getattr(args, "imb_long", None)
         if imb is not None:
@@ -1477,16 +1495,25 @@ Production (VPS):
     p.add_argument(
         "--trade-exit",
         choices=["structure", "ob", "trailing", "pullback", "ratchet", "be", "staged", "none"],
-        default="structure",
-        help="Primary exit for auto-trade children. .env TRADE_EXIT / EXIT_MODE "
-             "overrides unit flags after restart. Default: structure",
+        default=None,
+        help="Primary exit for auto-trade children (default: ratchet). "
+             "Wins over TRADE_EXIT / EXIT_MODE in .env. "
+             "Env is used only when this flag is omitted",
     )
     p.add_argument(
         "--protect-be",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Pass --protect-be to dca children (default on). "
+        help="Pass --protect-be to dca children (default on; ignored by ratchet). "
              "Use --no-protect-be for exit-only (no BE SL)",
+    )
+    p.add_argument(
+        "--also-structure",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="With --trade-exit ratchet: also pass --also-structure so EQL/EQH "
+             "can close earlier (evaluate vs ratchet SL). Default off. "
+             "Env on the dca child: ALSO_STRUCTURE=1",
     )
     p.add_argument(
         "--imb-long",

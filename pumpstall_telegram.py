@@ -408,8 +408,33 @@ def notify_close(
     return ok
 
 
+def _mode_from_reason(reason: str | None) -> str | None:
+    """Who actually flattened — overlays beat the primary --exit on /stats."""
+    r = (reason or "").strip().lower()
+    if not r:
+        return None
+    if "pullback" in r:
+        return "pullback"
+    if "ratchet" in r:
+        return "ratchet"
+    if "ob-flip" in r or "ob long" in r or "ob short" in r:
+        return "ob"
+    if "eql" in r or "eqh" in r or "structure" in r:
+        return "structure"
+    if "partial" in r or r.startswith("tp1"):
+        return "partial"
+    if "trail" in r or "runner" in r:
+        return "trailing"
+    if r.startswith("be") or "break-even" in r or "breakeven" in r:
+        return "be"
+    return None
+
+
 def infer_exit_mode(reason: str | None, exit_mode: str | None = None) -> str:
-    """Normalize exit mode; fall back to parsing close reason for older rows."""
+    """Credit the closer from reason when present (ratchet + structure overlay)."""
+    from_reason = _mode_from_reason(reason)
+    if from_reason:
+        return from_reason
     raw = (exit_mode or "").strip().lower()
     if raw and raw not in ("none", "unknown", "?"):
         if raw in ("eql", "eq", "eqh", "structure_tp"):
@@ -423,21 +448,6 @@ def infer_exit_mode(reason: str | None, exit_mode: str | None = None) -> str:
         if raw in ("ob-long", "ob_long", "be-ob", "be_ob"):
             return "ob"
         return raw
-    r = (reason or "").strip().lower()
-    if not r:
-        return "unknown"
-    if "pullback" in r:
-        return "pullback"
-    if "ratchet" in r:
-        return "ratchet"
-    if "ob-flip" in r or "ob long" in r or "ob short" in r:
-        return "ob"
-    if "eql" in r or "eqh" in r or "structure" in r:
-        return "structure"
-    if "trail" in r or "runner" in r:
-        return "trailing"
-    if r.startswith("be") or "break-even" in r or "breakeven" in r:
-        return "be"
     return "unknown"
 
 
