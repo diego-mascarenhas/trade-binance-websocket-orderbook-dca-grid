@@ -136,10 +136,16 @@ def sync_from_scan(
     seen_dir = _dir(SEEN_DIRNAME)
     known = {p.stem.upper() for p in seen_dir.glob("*.json")}
 
+    # Running but not ★: remember "off" so the next ★ is a real rising edge.
+    # (If we leave seen=None, the next ★ would be treated as inherit / no pulse.)
+    for sym in sorted(running_u - now_stars):
+        if _seen_star(sym) is None:
+            _set_seen(sym, False)
+
     for sym in sorted(now_stars):
         was = _seen_star(sym)
         if was is None:
-            # Inherit current episode (esp. live supervisor after deploy).
+            # Already ★ at first sight while supervised → same episode, no pulse.
             _set_seen(sym, True)
             continue
         if was:
