@@ -100,6 +100,8 @@ class PumpStallHit:
     ath_gap_pct: float | None = None
     ath_block: bool = False
     ath_min_gap_pct: float | None = None
+    prior_ath: float | None = None
+    prior_ath_gap_pct: float | None = None
 
 
 @dataclass
@@ -447,9 +449,10 @@ def annotate_ath_gates(
     try:
         from exits.risk_reduce import (
             ath_entry_min_gap_pct,
-            cached_historical_ath,
+            cached_ath_levels,
             distance_to_ath_pct,
             enabled,
+            prior_ath_enabled,
         )
     except Exception:
         return []
@@ -461,7 +464,9 @@ def annotate_ath_gates(
     notes: list[str] = []
     for h in hits:
         try:
-            ath = cached_historical_ath(h.symbol, last=float(h.last or 0))
+            ath, prior = cached_ath_levels(
+                h.symbol, last=float(h.last or 0), args=args,
+            )
         except Exception:
             continue
         if not ath or ath <= 0 or h.last <= 0:
@@ -469,13 +474,27 @@ def annotate_ath_gates(
         gap = distance_to_ath_pct(float(h.last), float(ath))
         h.ath = float(ath)
         h.ath_gap_pct = gap
-        h.ath_block = gap < min_gap
         h.ath_min_gap_pct = min_gap
+        gap_p = None
+        if prior_ath_enabled(args) and prior and prior > 0:
+            gap_p = distance_to_ath_pct(float(h.last), float(prior))
+            h.prior_ath = float(prior)
+            h.prior_ath_gap_pct = gap_p
+        hist_block = gap < min_gap
+        prior_block = gap_p is not None and gap_p < min_gap
+        h.ath_block = hist_block or prior_block
         # Fold into `note` so the public scanner shows it even if the
         # site Blade has not been updated to read ath_* keys.
-        if h.ath_block:
+        if hist_block:
             tag = f"ATH {gap:.1f}%<{min_gap:g}% no open"
             notes.append(f"skip {h.symbol} — ATH {gap:.1f}% < {min_gap:g}%")
+        elif prior_block:
+            tag = f"prior ATH {gap_p:.1f}%<{min_gap:g}% no open"
+            notes.append(
+                f"skip {h.symbol} — prior ATH {gap_p:.1f}% < {min_gap:g}%"
+            )
+        elif gap_p is not None:
+            tag = f"ATH {gap:.1f}% · prior {gap_p:.1f}%"
         else:
             tag = f"ATH {gap:.1f}%"
         if "ATH " not in (h.note or ""):
@@ -502,6 +521,8 @@ def _hit_to_dict(h: PumpStallHit) -> dict:
         "ath_gap_pct": h.ath_gap_pct,
         "ath_block": bool(h.ath_block),
         "ath_min_gap_pct": h.ath_min_gap_pct,
+        "prior_ath": h.prior_ath,
+        "prior_ath_gap_pct": h.prior_ath_gap_pct,
     }
 
 
@@ -608,6 +629,12 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "risk_ath_sl_pct": float(os.getenv("RISK_ATH_SL_PCT", "2") or 2),
         "risk_ath_entry_min_gap_pct": float(
             os.getenv("RISK_ATH_ENTRY_MIN_GAP_PCT", "12") or 12
+        ),
+        "risk_ath_prior": (
+            0
+            if (os.getenv("RISK_ATH_PRIOR", "1") or "1").strip().lower()
+            in ("0", "false", "off", "no")
+            else 1
         ),
     }
 
@@ -832,14 +859,17 @@ def print_hits(
                 print(f"      {DIM}ask walls: {px}{RESET}")
             if h.ath_gap_pct is not None:
                 min_gap = float(h.ath_min_gap_pct or 12)
+                prior_bit = ""
+                if h.prior_ath_gap_pct is not None:
+                    prior_bit = f" · prior {h.prior_ath_gap_pct:.1f}%"
                 if h.ath_block:
                     print(
-                        f"      {YELLOW}ATH {h.ath_gap_pct:.1f}% below "
+                        f"      {YELLOW}ATH {h.ath_gap_pct:.1f}%{prior_bit} below "
                         f"(need ≥{min_gap:g}%) · no open{RESET}"
                     )
                 else:
                     print(
-                        f"      {DIM}ATH {h.ath_gap_pct:.1f}% below "
+                        f"      {DIM}ATH {h.ath_gap_pct:.1f}%{prior_bit} below "
                         f"(gate {min_gap:g}%){RESET}"
                     )
         if prev is not None:
@@ -852,7 +882,7 @@ def print_hits(
         if ath_skips:
             print(
                 f"{YELLOW}AUTO: skip {', '.join(ath_skips)} — ATH gate "
-                f"(too close to historical high){RESET}"
+                f"(too close to historical / prior high){RESET}"
             )
         if why_limit > 0 and blocked is not None:
             print()

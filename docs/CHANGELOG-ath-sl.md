@@ -11,6 +11,7 @@ There is now a **single** risk stop:
 
 - Full-size `STOP_MARKET` (tag `RF`) at **historical ATH + 2%**
 - New SHORT opens are **blocked** if price is **within 12%** of that ATH
+  **or** the prior ATH (previous 1D peak outside the current ATH impulse)
 
 Exit-mode SLs (staged BE, ratchet, protect-be, etc.) are unchanged; this only replaces the risk-reduce addon.
 

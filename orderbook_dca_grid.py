@@ -2331,8 +2331,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--risk-ath-entry-min-gap-pct",
         type=float,
         default=None,
-        help="Block new SHORT opens when price is closer than this %% to ATH "
-             "(default 12). Env: RISK_ATH_ENTRY_MIN_GAP_PCT",
+        help="Block new SHORT opens when price is closer than this %% to the "
+             "regime ATH (last ~90d high) or the previous peak (default 12). "
+             "Env: RISK_ATH_ENTRY_MIN_GAP_PCT",
+    )
+    p.add_argument(
+        "--risk-ath-prior",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Also block new SHORT opens within the entry gap of the prior ATH "
+             "(previous 1D peak, not a 7-day high). Default on. Env: RISK_ATH_PRIOR",
     )
     # Legacy flags kept so old unit/env lines still parse; ignored by ATH SL logic.
     p.add_argument(

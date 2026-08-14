@@ -5,14 +5,18 @@ Replaces the old risk-reduce partial cut (RR). Behaviour:
   · One STOP_MARKET BUY reduce-only on the full position (tag RF)
   · Trigger = historical ATH × (1 + RISK_ATH_SL_PCT/100)  (default ATH + 2%)
   · New SHORT opens are blocked when price is within RISK_ATH_ENTRY_MIN_GAP_PCT
-    of ATH (default 12% — i.e. last must sit ≤ ATH × 0.88)
+    of the **regime ATH** (max 1d high in the last N days, default 90) **or**
+    the prior peak in that window (e.g. 8 Aug after a 14 Aug spike)
 
-ATH = max daily high over paginated Binance USDT-M 1d history.
+Historical ATH (all available 1d history) is used **only** for the SL.
+A 2023 print at 17.3 must not hide a 0.163 structure high.
 
 Env / CLI:
   RISK_REDUCE=1                     # master switch (default on)
   RISK_ATH_SL_PCT=2                 # SL = ATH + this %%
-  RISK_ATH_ENTRY_MIN_GAP_PCT=12     # block new opens closer than this %% to ATH
+  RISK_ATH_ENTRY_MIN_GAP_PCT=12     # block new opens closer than this %% to regime / prior
+  RISK_ATH_PRIOR=1                  # also gate on the previous peak in the lookback
+  RISK_ATH_LOOKBACK_BARS=90         # 1d bars for the entry-gate peaks
 """
 
 from __future__ import annotations
@@ -30,6 +34,10 @@ TAG_PARTIAL = "RR"  # legacy — cancelled on sync, never re-placed
 TAG_FULL = "RF"
 DEFAULT_ATH_SL_PCT = 2.0
 DEFAULT_ENTRY_MIN_GAP_PCT = 12.0
+DEFAULT_PRIOR_RECENT_BARS = 7  # unused; kept so old env lines still parse
+DEFAULT_PRIOR_CLUSTER_PCT = 15.0
+DEFAULT_PRIOR_MIN_FRAC = 0.30  # ignore leftover chop (prior must be ≥ 30% of ATH)
+DEFAULT_ATH_LOOKBACK_BARS = 90
 ATH_MAX_BARS = 6000  # ~16y of daily bars (paginated 1500/req)
 
 
@@ -84,6 +92,38 @@ def ath_entry_min_gap_pct(args: argparse.Namespace | None = None) -> float:
     return max(0.0, _env_float("RISK_ATH_ENTRY_MIN_GAP_PCT", DEFAULT_ENTRY_MIN_GAP_PCT))
 
 
+def prior_ath_enabled(args: argparse.Namespace | None = None) -> bool:
+    if args is not None:
+        v = getattr(args, "risk_ath_prior", None)
+        if v is not None:
+            return bool(v)
+    return _env_bool("RISK_ATH_PRIOR", True)
+
+
+def prior_ath_recent_bars(args: argparse.Namespace | None = None) -> int:
+    if args is not None:
+        v = getattr(args, "risk_ath_prior_recent_bars", None)
+        if v is not None:
+            return max(1, int(v))
+    return max(1, int(_env_float("RISK_ATH_PRIOR_RECENT_BARS", DEFAULT_PRIOR_RECENT_BARS)))
+
+
+def prior_ath_cluster_pct(args: argparse.Namespace | None = None) -> float:
+    if args is not None:
+        v = getattr(args, "risk_ath_prior_cluster_pct", None)
+        if v is not None:
+            return max(0.5, float(v))
+    return max(0.5, _env_float("RISK_ATH_PRIOR_CLUSTER_PCT", DEFAULT_PRIOR_CLUSTER_PCT))
+
+
+def ath_lookback_bars(args: argparse.Namespace | None = None) -> int:
+    if args is not None:
+        v = getattr(args, "risk_ath_lookback_bars", None)
+        if v is not None:
+            return max(10, int(v))
+    return max(10, int(_env_float("RISK_ATH_LOOKBACK_BARS", DEFAULT_ATH_LOOKBACK_BARS)))
+
+
 def allow_dca_rearm(symbol: str) -> bool:
     """Legacy hook — always allow (partial RR path removed)."""
     return True
@@ -99,54 +139,52 @@ def _ath_cache_path(symbol: str) -> Path:
     return root / ".state" / "ath" / f"{symbol.upper()}.json"
 
 
-def cached_historical_ath(
-    symbol: str,
+def split_ath_and_prior(
+    highs: list[float],
     *,
-    last: float | None = None,
-    max_bars: int = ATH_MAX_BARS,
-    ttl_s: float = 6 * 3600.0,
-) -> float | None:
-    """ATH with a disk cache so the scanner can show the gate every cycle."""
-    sym = (symbol or "").strip().upper()
-    if not sym:
-        return None
-    path = _ath_cache_path(sym)
-    cached: float | None = None
-    age = 1e18
-    if path.is_file():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            cached = float(data.get("ath") or 0) or None
-            age = time.time() - float(data.get("ts") or 0)
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            cached = None
-    if cached and cached > 0 and last and last > cached * 1.0001:
-        cached = None  # new high — refresh
-    if cached and cached > 0 and age < ttl_s:
-        return cached
-    fetched = fetch_historical_ath(sym, max_bars=max_bars)
-    if fetched and fetched > 0:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps({"symbol": sym, "ath": fetched, "ts": time.time()}) + "\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-        return fetched
-    return cached
+    recent_bars: int = DEFAULT_PRIOR_RECENT_BARS,
+    cluster_pct: float = DEFAULT_PRIOR_CLUSTER_PCT,
+    min_frac: float = DEFAULT_PRIOR_MIN_FRAC,
+) -> tuple[float | None, float | None]:
+    """Return (historical ATH, previous peak or None).
+
+    Prior = max 1d high **outside** the current ATH impulse (bars with
+    high ≥ ATH×(1−cluster) around the ATH bar). ``recent_bars`` is ignored;
+    the previous peak is used whenever it is a real top (≥ ``min_frac`` of ATH).
+    """
+    del recent_bars  # kept for call-site compat
+    clean = [float(h) for h in highs if h and float(h) > 0]
+    if not clean:
+        return None, None
+    ath = max(clean)
+    floor = ath * (1.0 - max(0.0, float(cluster_pct)) / 100.0)
+    ath_idx = max(i for i, h in enumerate(clean) if h >= ath * 0.9999)
+    left = ath_idx
+    while left > 0 and clean[left - 1] >= floor:
+        left -= 1
+    right = ath_idx
+    while right + 1 < len(clean) and clean[right + 1] >= floor:
+        right += 1
+    outside = [h for i, h in enumerate(clean) if i < left or i > right]
+    if not outside:
+        return ath, None
+    prior = max(outside)
+    if prior <= 0 or prior >= ath * 0.999:
+        return ath, None
+    if prior < ath * max(0.0, float(min_frac)):
+        return ath, None
+    return ath, prior
 
 
-def fetch_historical_ath(symbol: str, *, max_bars: int = ATH_MAX_BARS) -> float | None:
-    """Max daily high over available Binance futures history (paginated)."""
+def fetch_daily_highs(symbol: str, *, max_bars: int = ATH_MAX_BARS) -> list[float]:
+    """Chronological 1d highs (oldest → newest), paginated."""
     try:
         from futures_scan import FAPI_BASE, _get
     except Exception:
-        return None
+        return []
 
     sym = symbol.upper()
-    ath = 0.0
+    pages: list[list[float]] = []
     end_time: int | None = None
     fetched = 0
     while fetched < max_bars:
@@ -164,13 +202,15 @@ def fetch_historical_ath(symbol: str, *, max_bars: int = ATH_MAX_BARS) -> float 
             break
         if not isinstance(data, list) or not data:
             break
+        highs: list[float] = []
         for row in data:
             try:
-                h = float(row[2])
+                highs.append(float(row[2]))
             except (TypeError, ValueError, IndexError):
                 continue
-            if h > ath:
-                ath = h
+        if not highs:
+            break
+        pages.append(highs)
         fetched += len(data)
         try:
             first_open = int(data[0][0])
@@ -181,7 +221,134 @@ def fetch_historical_ath(symbol: str, *, max_bars: int = ATH_MAX_BARS) -> float 
         end_time = first_open - 1
         if end_time <= 0:
             break
-    return ath if ath > 0 else None
+    out: list[float] = []
+    for page in reversed(pages):
+        out.extend(page)
+    return out
+
+
+def fetch_ath_bundle(
+    symbol: str,
+    *,
+    max_bars: int = ATH_MAX_BARS,
+    lookback: int = DEFAULT_ATH_LOOKBACK_BARS,
+    cluster_pct: float = DEFAULT_PRIOR_CLUSTER_PCT,
+) -> tuple[float | None, float | None, float | None]:
+    """(historical ATH, regime ATH, prior peak) from 1d history."""
+    highs = fetch_daily_highs(symbol, max_bars=max_bars)
+    if not highs:
+        return None, None, None
+    hist = max(highs)
+    n = max(10, int(lookback))
+    window = highs[-n:] if len(highs) > n else highs
+    regime, prior = split_ath_and_prior(window, cluster_pct=cluster_pct)
+    return hist, regime, prior
+
+
+def fetch_ath_levels(
+    symbol: str,
+    *,
+    max_bars: int = ATH_MAX_BARS,
+    recent_bars: int = DEFAULT_PRIOR_RECENT_BARS,
+    cluster_pct: float = DEFAULT_PRIOR_CLUSTER_PCT,
+    lookback: int = DEFAULT_ATH_LOOKBACK_BARS,
+) -> tuple[float | None, float | None]:
+    """(regime ATH, prior peak) for the entry gate — last ``lookback`` days."""
+    del recent_bars
+    _hist, regime, prior = fetch_ath_bundle(
+        symbol, max_bars=max_bars, lookback=lookback, cluster_pct=cluster_pct,
+    )
+    return regime, prior
+
+
+def cached_ath_levels(
+    symbol: str,
+    *,
+    last: float | None = None,
+    max_bars: int = ATH_MAX_BARS,
+    ttl_s: float = 6 * 3600.0,
+    args: argparse.Namespace | None = None,
+) -> tuple[float | None, float | None]:
+    """Cached (regime ATH, prior peak) for the entry gate."""
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None, None
+    path = _ath_cache_path(sym)
+    cached_hist: float | None = None
+    cached_regime: float | None = None
+    cached_prior: float | None = None
+    age = 1e18
+    has_regime_key = False
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            cached_hist = float(data.get("ath") or 0) or None
+            raw_r = data.get("regime_ath")
+            cached_regime = float(raw_r) if raw_r not in (None, "", 0, 0.0) else None
+            has_regime_key = "regime_ath" in data
+            raw_p = data.get("prior_ath")
+            cached_prior = float(raw_p) if raw_p not in (None, "", 0, 0.0) else None
+            age = time.time() - float(data.get("ts") or 0)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            cached_hist = None
+    peak_for_new = cached_regime or cached_hist
+    if peak_for_new and last and last > peak_for_new * 1.0001:
+        cached_regime = None
+    if cached_regime and cached_regime > 0 and age < ttl_s and has_regime_key:
+        return cached_regime, cached_prior
+    hist, regime, prior = fetch_ath_bundle(
+        sym,
+        max_bars=max_bars,
+        lookback=ath_lookback_bars(args),
+        cluster_pct=prior_ath_cluster_pct(args),
+    )
+    if regime and regime > 0:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({
+                    "symbol": sym,
+                    "ath": hist,
+                    "regime_ath": regime,
+                    "prior_ath": prior,
+                    "ts": time.time(),
+                }) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        return regime, prior
+    return cached_regime, cached_prior
+
+
+def cached_historical_ath(
+    symbol: str,
+    *,
+    last: float | None = None,
+    max_bars: int = ATH_MAX_BARS,
+    ttl_s: float = 6 * 3600.0,
+) -> float | None:
+    """Historical ATH (SL). Prefers cache written by ``cached_ath_levels``."""
+    path = _ath_cache_path(symbol)
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            hist = float(data.get("ath") or 0) or None
+            age = time.time() - float(data.get("ts") or 0)
+            if hist and hist > 0 and age < ttl_s:
+                if last and last > hist * 1.0001:
+                    hist = None
+                else:
+                    return hist
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    return fetch_historical_ath(symbol, max_bars=max_bars)
+
+
+def fetch_historical_ath(symbol: str, *, max_bars: int = ATH_MAX_BARS) -> float | None:
+    """Max daily high over available Binance futures history (paginated)."""
+    highs = fetch_daily_highs(symbol, max_bars=max_bars)
+    return max(highs) if highs else None
 
 
 # Back-compat alias used by older call sites / Help page
@@ -206,10 +373,12 @@ def entry_blocked_near_ath(
     args: argparse.Namespace | None = None,
     *,
     ath: float | None = None,
+    prior_ath: float | None = None,
 ) -> tuple[bool, str]:
-    """Return (blocked, reason) for a new SHORT open near ATH.
+    """Return (blocked, reason) for a new SHORT open near ATH / prior ATH.
 
-    Blocked when distance-to-ATH < RISK_ATH_ENTRY_MIN_GAP_PCT (default 12%).
+    Blocked when distance to the regime ATH (lookback high) **or** the
+    previous peak in that window is below RISK_ATH_ENTRY_MIN_GAP_PCT.
     """
     if not enabled(args):
         return False, ""
@@ -218,7 +387,12 @@ def entry_blocked_near_ath(
         return False, ""
     if price <= 0:
         return False, ""
-    peak = ath if ath and ath > 0 else cached_historical_ath(symbol, last=price)
+    peak = ath if ath and ath > 0 else None
+    prior = prior_ath if prior_ath and prior_ath > 0 else None
+    if peak is None:
+        peak, cached_prior = cached_ath_levels(symbol, last=price, args=args)
+        if prior is None:
+            prior = cached_prior
     if not peak or peak <= 0:
         return False, ""  # can't measure — don't block arm; SL arm will skip too
     gap = distance_to_ath_pct(price, float(peak))
@@ -227,6 +401,13 @@ def entry_blocked_near_ath(
             f"near ATH {gap:.1f}% < min gap {min_gap:g}% "
             f"(ATH {peak:g} · last {price:g})"
         )
+    if prior_ath_enabled(args) and prior and prior > 0:
+        gap_p = distance_to_ath_pct(price, float(prior))
+        if gap_p < min_gap:
+            return True, (
+                f"near prior ATH {gap_p:.1f}% < min gap {min_gap:g}% "
+                f"(prior {prior:g} · ATH {peak:g} · last {price:g})"
+            )
     return False, ""
 
 
