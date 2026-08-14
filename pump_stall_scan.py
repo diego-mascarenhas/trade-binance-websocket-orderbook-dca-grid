@@ -471,10 +471,15 @@ def annotate_ath_gates(
         h.ath_gap_pct = gap
         h.ath_block = gap < min_gap
         h.ath_min_gap_pct = min_gap
+        # Fold into `note` so the public scanner shows it even if the
+        # site Blade has not been updated to read ath_* keys.
         if h.ath_block:
-            notes.append(
-                f"skip {h.symbol} — ATH {gap:.1f}% < {min_gap:g}%"
-            )
+            tag = f"ATH {gap:.1f}%<{min_gap:g}% no open"
+            notes.append(f"skip {h.symbol} — ATH {gap:.1f}% < {min_gap:g}%")
+        else:
+            tag = f"ATH {gap:.1f}%"
+        if "ATH " not in (h.note or ""):
+            h.note = f"{h.note} · {tag}" if h.note else tag
     return notes
 
 
