@@ -526,8 +526,8 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "partial_tp_min_entry_pct": partial_entry_pct,
         "imb_long": imb_long,
         "loss_cooldown_min": float(g("loss_cooldown_min", 1440.0) or 1440.0),
-        "margin_ratio_soft": float(g("margin_ratio_soft", 5.0) or 5.0),
-        "margin_ratio_hard": float(g("margin_ratio_hard", 8.0) or 8.0),
+        "margin_ratio_soft": float(g("margin_ratio_soft", 3.0) or 3.0),
+        "margin_ratio_hard": float(g("margin_ratio_hard", 5.0) or 5.0),
         "wallet_pct": wallet_pct,
         "min_gap": float(g("min_gap", 0.8) or 0.8),
         "so_count": int(g("so_count", 8) or 8),
@@ -1093,8 +1093,8 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         "--protect-be" if use_be else "--no-protect-be",
         "--once",
         "--loss-cooldown-min", str(getattr(args, "loss_cooldown_min", 1440)),
-        "--margin-ratio-soft", str(getattr(args, "margin_ratio_soft", 5.0)),
-        "--margin-ratio-hard", str(getattr(args, "margin_ratio_hard", 8.0)),
+        "--margin-ratio-soft", str(getattr(args, "margin_ratio_soft", 3.0)),
+        "--margin-ratio-hard", str(getattr(args, "margin_ratio_hard", 5.0)),
         # Short-only book: default imbalance gate (20–30%) blocks every new ★
         # once a large SHORT (e.g. PUMP) is open. Env PUMPSTALL_MAX_IMBALANCE
         # (default 0 = disable) overrides MAX_IMBALANCE for auto-trade children.
@@ -1240,7 +1240,7 @@ def _maybe_auto_trade(
     import loss_cooldown as lcd
     from orderbook_dca_grid import get_margin_ratio_pct, load_keys
 
-    soft_mr = float(getattr(args, "margin_ratio_soft", 5.0) or 0)
+    soft_mr = float(getattr(args, "margin_ratio_soft", 3.0) or 0)
     if soft_mr > 0:
         api, sec = load_keys(None)
         if api and sec:
@@ -1250,7 +1250,7 @@ def _maybe_auto_trade(
                     f"{YELLOW}AUTO: margin ratio {ratio:.2f}% ≥ soft "
                     f"{soft_mr:g}% — no new ★ "
                     f"(DCA strip at hard "
-                    f"{getattr(args, 'margin_ratio_hard', 8):g}%){RESET}"
+                    f"{getattr(args, 'margin_ratio_hard', 5):g}%){RESET}"
                 )
                 return active
 
@@ -1562,16 +1562,16 @@ Production (VPS):
     p.add_argument(
         "--margin-ratio-soft",
         type=float,
-        default=float(os.getenv("MARGIN_RATIO_SOFT", "5") or 5),
-        help="Binance Margin Ratio %% ≥ this → no new ★ (default 5; 0=off). "
+        default=float(os.getenv("MARGIN_RATIO_SOFT", "3") or 3),
+        help="Binance Margin Ratio %% ≥ this → no new ★ (default 3; 0=off). "
              "Env: MARGIN_RATIO_SOFT",
     )
     p.add_argument(
         "--margin-ratio-hard",
         type=float,
-        default=float(os.getenv("MARGIN_RATIO_HARD", "8") or 8),
+        default=float(os.getenv("MARGIN_RATIO_HARD", "5") or 5),
         help="Passed to dca: %% ≥ this → cancel DCA limits; below → re-arm "
-             "(default 8; 0=off). Env: MARGIN_RATIO_HARD",
+             "(default 5; 0=off). Env: MARGIN_RATIO_HARD",
     )
     p.add_argument(
         "--why",

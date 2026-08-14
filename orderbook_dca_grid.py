@@ -2058,13 +2058,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Skip new grid if projected initial margin / balance exceeds this %% "
                         "(0=off). Env: MAX_MARGIN_PCT")
     p.add_argument("--margin-ratio-soft", type=float,
-                   default=_env_float("MARGIN_RATIO_SOFT", 5.0),
+                   default=_env_float("MARGIN_RATIO_SOFT", 3.0),
                    help="Binance Margin Ratio %% (maint/equity). ≥ this → no new grids / ★ "
-                        "(default 5; 0=off). Env: MARGIN_RATIO_SOFT")
+                        "(default 3; 0=off). Env: MARGIN_RATIO_SOFT")
     p.add_argument("--margin-ratio-hard", type=float,
-                   default=_env_float("MARGIN_RATIO_HARD", 8.0),
+                   default=_env_float("MARGIN_RATIO_HARD", 5.0),
                    help="Binance Margin Ratio %%. ≥ this → cancel open DCA limits (keep TP/BE/trail); "
-                        "when it drops back below, re-arm DCA (default 8; 0=off). "
+                        "when it drops back below, re-arm DCA (default 5; 0=off). "
                         "Env: MARGIN_RATIO_HARD")
     p.add_argument("--min-liq-distance-pct", type=float, default=_env_float("MIN_LIQ_DISTANCE_PCT", 20.0),
                    help="Skip new grid if any open position is closer to liquidation than this %% "
