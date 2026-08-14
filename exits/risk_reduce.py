@@ -18,9 +18,12 @@ Env / CLI:
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import time
 import urllib.parse
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
+from pathlib import Path
 from typing import Any
 
 TAG_PARTIAL = "RR"  # legacy — cancelled on sync, never re-placed
@@ -89,6 +92,50 @@ def allow_dca_rearm(symbol: str) -> bool:
 def recovery_pct_for(symbol: str) -> float:
     """Legacy hook — no RR recovery floor after ATH-only change."""
     return 0.0
+
+
+def _ath_cache_path(symbol: str) -> Path:
+    root = Path(__file__).resolve().parent.parent
+    return root / ".state" / "ath" / f"{symbol.upper()}.json"
+
+
+def cached_historical_ath(
+    symbol: str,
+    *,
+    last: float | None = None,
+    max_bars: int = ATH_MAX_BARS,
+    ttl_s: float = 6 * 3600.0,
+) -> float | None:
+    """ATH with a disk cache so the scanner can show the gate every cycle."""
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+    path = _ath_cache_path(sym)
+    cached: float | None = None
+    age = 1e18
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            cached = float(data.get("ath") or 0) or None
+            age = time.time() - float(data.get("ts") or 0)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            cached = None
+    if cached and cached > 0 and last and last > cached * 1.0001:
+        cached = None  # new high — refresh
+    if cached and cached > 0 and age < ttl_s:
+        return cached
+    fetched = fetch_historical_ath(sym, max_bars=max_bars)
+    if fetched and fetched > 0:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"symbol": sym, "ath": fetched, "ts": time.time()}) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        return fetched
+    return cached
 
 
 def fetch_historical_ath(symbol: str, *, max_bars: int = ATH_MAX_BARS) -> float | None:
@@ -171,7 +218,7 @@ def entry_blocked_near_ath(
         return False, ""
     if price <= 0:
         return False, ""
-    peak = ath if ath and ath > 0 else fetch_historical_ath(symbol)
+    peak = ath if ath and ath > 0 else cached_historical_ath(symbol, last=price)
     if not peak or peak <= 0:
         return False, ""  # can't measure — don't block arm; SL arm will skip too
     gap = distance_to_ath_pct(price, float(peak))

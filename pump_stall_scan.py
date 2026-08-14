@@ -96,6 +96,10 @@ class PumpStallHit:
     wall_prices: list[float]
     score: float
     note: str
+    ath: float | None = None
+    ath_gap_pct: float | None = None
+    ath_block: bool = False
+    ath_min_gap_pct: float | None = None
 
 
 @dataclass
@@ -433,6 +437,47 @@ def _block_tag(reason: str) -> str:
     return f"{c}{BOLD}{reason:<6}{RESET}"
 
 
+def annotate_ath_gates(
+    hits: list[PumpStallHit],
+    args: argparse.Namespace | None = None,
+) -> list[str]:
+    """Fill ATH gap on table rows so the scanner shows why ★ do not open."""
+    if not hits:
+        return []
+    try:
+        from exits.risk_reduce import (
+            ath_entry_min_gap_pct,
+            cached_historical_ath,
+            distance_to_ath_pct,
+            enabled,
+        )
+    except Exception:
+        return []
+    if not enabled(args):
+        return []
+    min_gap = ath_entry_min_gap_pct(args)
+    if min_gap <= 0:
+        return []
+    notes: list[str] = []
+    for h in hits:
+        try:
+            ath = cached_historical_ath(h.symbol, last=float(h.last or 0))
+        except Exception:
+            continue
+        if not ath or ath <= 0 or h.last <= 0:
+            continue
+        gap = distance_to_ath_pct(float(h.last), float(ath))
+        h.ath = float(ath)
+        h.ath_gap_pct = gap
+        h.ath_block = gap < min_gap
+        h.ath_min_gap_pct = min_gap
+        if h.ath_block:
+            notes.append(
+                f"skip {h.symbol} — ATH {gap:.1f}% < {min_gap:g}%"
+            )
+    return notes
+
+
 def _hit_to_dict(h: PumpStallHit) -> dict:
     return {
         "symbol": h.symbol,
@@ -448,6 +493,10 @@ def _hit_to_dict(h: PumpStallHit) -> dict:
         "note": h.note,
         "wall_prices": list(h.wall_prices[:6]),
         "flag": "",
+        "ath": h.ath,
+        "ath_gap_pct": h.ath_gap_pct,
+        "ath_block": bool(h.ath_block),
+        "ath_min_gap_pct": h.ath_min_gap_pct,
     }
 
 
@@ -601,6 +650,7 @@ def build_snapshot(
     why_limit: int,
     hint: str | None = None,
     stack: dict | None = None,
+    auto_notes: list[str] | None = None,
 ) -> dict:
     """Payload for Pumpstall web (same keys as DemoScanSnapshot)."""
     ranked = sorted(
@@ -626,6 +676,7 @@ def build_snapshot(
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "hint": hint or format_dca_hint(),
         "stack": stack or stack_params(),
+        "auto_notes": list(auto_notes or []),
     }
 
 
@@ -652,6 +703,7 @@ def maybe_write_snapshot(
     time_s: str,
     scan_s: float,
     mode: str,
+    auto_notes: list[str] | None = None,
 ) -> None:
     if getattr(args, "no_snapshot", False):
         return
@@ -670,6 +722,7 @@ def maybe_write_snapshot(
         why_limit=int(getattr(args, "why", 15) or 0),
         hint=format_dca_hint(args),
         stack=stack_params(args),
+        auto_notes=auto_notes,
     )
     write_snapshot(path, payload)
 
@@ -770,12 +823,30 @@ def print_hits(
             if h.wall_prices:
                 px = " → ".join(f"{p:g}" for p in h.wall_prices[:6])
                 print(f"      {DIM}ask walls: {px}{RESET}")
+            if h.ath_gap_pct is not None:
+                min_gap = float(h.ath_min_gap_pct or 12)
+                if h.ath_block:
+                    print(
+                        f"      {YELLOW}ATH {h.ath_gap_pct:.1f}% below "
+                        f"(need ≥{min_gap:g}%) · no open{RESET}"
+                    )
+                else:
+                    print(
+                        f"      {DIM}ATH {h.ath_gap_pct:.1f}% below "
+                        f"(gate {min_gap:g}%){RESET}"
+                    )
         if prev is not None:
             gone = [s for s in prev if s not in now_map]
             if gone:
                 print(f"{DIM}left: {', '.join(gone)}{RESET}")
         print()
         print(f"{DIM}{hint or format_dca_hint()}{RESET}")
+        ath_skips = [h.symbol for h in ranked if h.ath_block]
+        if ath_skips:
+            print(
+                f"{YELLOW}AUTO: skip {', '.join(ath_skips)} — ATH gate "
+                f"(too close to historical high){RESET}"
+            )
         if why_limit > 0 and blocked is not None:
             print()
             print_blocked(blocked, limit=why_limit)
@@ -1348,6 +1419,7 @@ def watch_loop(args: argparse.Namespace) -> int:
             t0 = time.time()
             try:
                 hits, blocked = scan(args)
+                auto_notes = annotate_ath_gates(hits, args)
             except Exception as exc:  # noqa: BLE001
                 _clear_screen()
                 print(f"{RED}Scan failed: {exc}{RESET}")
@@ -1390,6 +1462,7 @@ def watch_loop(args: argparse.Namespace) -> int:
                 time_s=now,
                 scan_s=elapsed,
                 mode=mode,
+                auto_notes=auto_notes,
             )
             if auto:
                 print()
@@ -1616,6 +1689,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{DIM}(1D blow-off filter · display only){RESET}"
     )
     hits, blocked = scan(args)
+    annotate_ath_gates(hits, args)
     print_hits(
         hits,
         ideal_near=args.ideal_near,
