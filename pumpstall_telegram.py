@@ -403,6 +403,7 @@ def notify_close(
     if ok:
         record_trade(
             symbol, direction, pct, reason=reason, exit_mode=exit_mode,
+            **_boost_fields(symbol),
         )
         logger.info("Pumpstall CLOSE sent %s pnl=%+.2f%%", symbol.upper(), pct)
     return ok
@@ -451,6 +452,28 @@ def infer_exit_mode(reason: str | None, exit_mode: str | None = None) -> str:
     return "unknown"
 
 
+def _boost_fields(symbol: str) -> dict[str, Any]:
+    """★ on /stats = auto size boost (early entry that also passed strict)."""
+    try:
+        import size_boost as sb
+
+        armed = sb.armed_boost(symbol)
+    except Exception:
+        return {}
+    if not armed:
+        return {}
+    src = str(armed.get("source") or "manual")
+    try:
+        mult = float(armed.get("mult") or 0)
+    except (TypeError, ValueError):
+        mult = 0.0
+    return {
+        "boost_mult": mult if mult > 0 else None,
+        "boost_source": src,
+        "strict": src == "auto",
+    }
+
+
 def record_trade(
     symbol: str,
     direction: str,
@@ -459,6 +482,9 @@ def record_trade(
     reason: str | None = None,
     exit_mode: str | None = None,
     when: datetime | None = None,
+    boost_mult: float | None = None,
+    boost_source: str | None = None,
+    strict: bool | None = None,
 ) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     ts = when or datetime.now(timezone.utc)
@@ -470,6 +496,9 @@ def record_trade(
         "pnl_pct": float(pnl_pct),
         "reason": (reason or "").strip() or None,
         "exit_mode": mode,
+        "boost_mult": boost_mult,
+        "boost_source": (str(boost_source).strip().lower() or None) if boost_source else None,
+        "strict": bool(strict) if strict is not None else False,
     }
     with TRADES_FILE.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -582,6 +611,12 @@ def _normalize_trade_row(row: dict[str, Any]) -> dict[str, Any]:
         pnl = float(row.get("pnl_pct", 0) or 0)
     except (TypeError, ValueError):
         pnl = 0.0
+    src = str(row.get("boost_source") or "").strip().lower() or None
+    try:
+        boost_mult = float(row.get("boost_mult") or 0) or None
+    except (TypeError, ValueError):
+        boost_mult = None
+    strict = bool(row.get("strict")) or src == "auto"
     return {
         "ts": row.get("ts"),
         "symbol": str(row.get("symbol") or "").upper(),
@@ -589,6 +624,9 @@ def _normalize_trade_row(row: dict[str, Any]) -> dict[str, Any]:
         "pnl_pct": pnl,
         "reason": (str(reason).strip() if reason else None) or None,
         "exit_mode": mode,
+        "boost_mult": boost_mult,
+        "boost_source": src,
+        "strict": strict,
     }
 
 

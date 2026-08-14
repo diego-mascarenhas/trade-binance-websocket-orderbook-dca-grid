@@ -20,6 +20,7 @@ from typing import Any
 
 STATE_DIRNAME = ".state"
 BOOST_DIRNAME = "boost"
+ARMED_DIRNAME = "boost_armed"
 DWELL_FILENAME = "boost_dwell.json"
 DEFAULT_MULT = 1.5
 MIN_MULT = 1.0
@@ -50,6 +51,16 @@ def boost_dir() -> Path:
 
 def boost_path(symbol: str) -> Path:
     return boost_dir() / f"{symbol.upper()}.json"
+
+
+def armed_dir() -> Path:
+    d = _repo_root() / STATE_DIRNAME / ARMED_DIRNAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def armed_path(symbol: str) -> Path:
+    return armed_dir() / f"{symbol.upper()}.json"
 
 
 def dwell_path() -> Path:
@@ -176,14 +187,80 @@ def is_manual(symbol: str) -> bool:
 
 
 def apply_boost(symbol: str, base_size: float) -> tuple[float, float | None]:
-    """Return (sized, mult_or_None)."""
+    """Return (sized, mult_or_None). Stamps arm-time boost for /stats ★."""
     size = float(base_size or 0)
     if size <= 0:
         return size, None
     mult = get_mult(symbol)
     if mult is None:
+        clear_armed(symbol)
         return size, None
+    src = boost_source(symbol) or "manual"
+    stamp_armed(symbol, mult, src)
     return size * mult, mult
+
+
+def stamp_armed(symbol: str, mult: float, source: str) -> None:
+    """Persist the boost used at arm so /stats can star the later close."""
+    sym = normalize_symbol(symbol)
+    if not sym:
+        return
+    row = {
+        "symbol": sym,
+        "mult": _clamp(float(mult)),
+        "source": "auto" if str(source).strip().lower() == "auto" else "manual",
+        "armed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    armed_path(sym).write_text(json.dumps(row, indent=2) + "\n", encoding="utf-8")
+
+
+def clear_armed(symbol: str) -> None:
+    sym = normalize_symbol(symbol)
+    if not sym:
+        return
+    path = armed_path(sym)
+    if path.is_file():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _read_armed(symbol: str) -> dict[str, Any] | None:
+    sym = normalize_symbol(symbol)
+    if not sym:
+        return None
+    path = armed_path(sym)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def armed_boost(symbol: str) -> dict[str, Any] | None:
+    """Boost applied at arm. Sidecar first; live ``.state/boost`` as fallback."""
+    data = _read_armed(symbol)
+    if data:
+        try:
+            mult = float(data.get("mult", 0) or 0)
+        except (TypeError, ValueError):
+            mult = 0.0
+        if mult >= MIN_MULT:
+            src = str(data.get("source") or "manual").strip().lower()
+            return {
+                "mult": _clamp(mult),
+                "source": "auto" if src == "auto" else "manual",
+            }
+    live = get_mult(symbol)
+    if live is None:
+        return None
+    return {
+        "mult": live,
+        "source": boost_source(symbol) or "manual",
+    }
 
 
 def set_boost(
