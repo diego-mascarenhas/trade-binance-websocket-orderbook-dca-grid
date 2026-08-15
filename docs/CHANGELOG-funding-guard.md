@@ -37,6 +37,13 @@ Example: SHORT + funding rate −0.92% → pay 0.92% ≥ 0.3% → no new ★ / c
 - `pump_stall_scan.py` — auto-trade funding gate
 - `.env.example` — new vars
 
-## Deploy
+## Occupied slots (2026-08-15)
 
-Pull code, restart `pump-stall-watch-early` and any live `--once` / supervise children so they load the guard. Optional `.env` overrides; defaults apply if unset.
+`MAX_TRADES` now counts **all** of:
+
+1. This watcher's `--once` children  
+2. Any live `orderbook_dca_grid.py --supervise` process  
+3. Open Binance USD-M positions  
+
+So after a `pump-stall-watch` restart, orphans like ACEUSDT still consume a slot and the bot will not open past the cap.
+

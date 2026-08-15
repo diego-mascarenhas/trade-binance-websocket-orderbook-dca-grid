@@ -985,6 +985,52 @@ def _dca_supervisor_running() -> list[str]:
         return []
 
 
+def _open_position_symbols(
+    api: str,
+    sec: str,
+    recv: int = 15000,
+) -> set[str]:
+    """USDT-M symbols with a non-flat futures position (survives watch restarts)."""
+    try:
+        from orderbook_dca_grid import _signed_request
+
+        rows = _signed_request("GET", "/fapi/v2/positionRisk", {}, api, sec, recv)
+    except Exception:
+        return set()
+    out: set[str] = set()
+    for r in rows if isinstance(rows, list) else []:
+        try:
+            amt = float(r.get("positionAmt", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(amt) <= 0:
+            continue
+        sym = str(r.get("symbol", "") or "").upper()
+        if sym.endswith("USDT"):
+            out.add(sym)
+    return out
+
+
+def _occupied_trade_slots(
+    active: dict[str, subprocess.Popen],
+    *,
+    api: str | None = None,
+    sec: str | None = None,
+) -> set[str]:
+    """Symbols that already consume a MAX_TRADES slot.
+
+    Counts: this watcher's children + any live --supervise process + open
+    Binance positions (so a restart cannot open past the cap).
+    """
+    occupied = {s.upper() for s in active} | {s.upper() for s in _dca_supervisor_running()}
+    if api and sec:
+        try:
+            occupied |= _open_position_symbols(api, sec)
+        except Exception:
+            pass
+    return occupied
+
+
 def _pick_ideals(
     hits: list[PumpStallHit],
     ideal_near: float,
@@ -1297,10 +1343,11 @@ def _maybe_auto_trade(
     *,
     active: dict[str, subprocess.Popen],
 ) -> dict[str, subprocess.Popen]:
-    """Keep the top --max-trades ★ from this scan running (this bot only).
+    """Keep up to --max-trades ★ running, respecting already-open exposure.
 
-    Other account positions / unrelated supervisors do not consume slots.
-    We never launch outside the current top-N ★ list.
+    Slots are consumed by this watcher's children, any live --supervise
+    process, and open Binance futures positions — so a watch restart cannot
+    exceed MAX_TRADES when orphans are still open.
     """
     active = _reap_active(active)
     max_trades = _max_trades(args)
@@ -1338,9 +1385,9 @@ def _maybe_auto_trade(
     import loss_cooldown as lcd
     from orderbook_dca_grid import get_margin_ratio_pct, load_keys
 
+    api, sec = load_keys(None)
     soft_mr = float(getattr(args, "margin_ratio_soft", 3.0) or 0)
     if soft_mr > 0:
-        api, sec = load_keys(None)
         if api and sec:
             ratio = get_margin_ratio_pct(api, sec, 15000)
             if ratio is not None and ratio >= soft_mr:
@@ -1357,35 +1404,49 @@ def _maybe_auto_trade(
         bits = [f"{s} {lcd.fmt_remaining(t)}" for s, t in sorted(cooling.items())]
         print(f"{DIM}AUTO: loss cooldown · {', '.join(bits)}{RESET}")
 
-    # Target set: first N ★ by score, skipping symbols in loss cooldown
+    occupied = _occupied_trade_slots(active, api=api or None, sec=sec or None)
+    slots_left = max(0, max_trades - len(occupied))
+    if slots_left <= 0:
+        print(
+            f"{DIM}AUTO: at --max-trades={max_trades} · occupied "
+            f"{', '.join(sorted(occupied)) or '—'} — no new ★{RESET}"
+        )
+        return active
+
+    # Target set: first N free ★ by score (N = remaining slots)
     target = _pick_ideals(
-        hits, args.ideal_near, exclude=set(cooling), limit=max_trades,
+        hits,
+        args.ideal_near,
+        exclude=set(cooling) | occupied,
+        limit=slots_left,
     )
     target_syms = [h.symbol.upper() for h in target]
     if not target_syms:
         if cooling:
-            print(f"{DIM}AUTO: no ★ ideal outside cooldown — skip{RESET}")
+            print(f"{DIM}AUTO: no ★ ideal outside cooldown/slots — skip{RESET}")
         else:
             print(f"{DIM}AUTO: no ★ ideal this round — skip{RESET}")
         return active
 
-    running = {s.upper() for s in _dca_supervisor_running()}
     ours = {s.upper() for s in active}
+    running = {s.upper() for s in _dca_supervisor_running()}
 
     print(
-        f"{DIM}AUTO: target ★ top-{max_trades}: {', '.join(target_syms)}"
-        f" · ours {', '.join(sorted(ours)) or '—'} · "
+        f"{DIM}AUTO: target ★ slots {slots_left}/{max_trades}: "
+        f"{', '.join(target_syms)}"
+        f" · occupied {', '.join(sorted(occupied)) or '—'} · "
+        f"ours {', '.join(sorted(ours)) or '—'} · "
         f"supervise {', '.join(sorted(running)) or '—'}{RESET}"
     )
 
     for hit in target:
         sym = hit.symbol.upper()
-        if sym in ours or sym in running:
-            continue  # already covered (ours or any supervise on this symbol)
-        if len(active) >= max_trades:
+        if sym in occupied:
+            continue  # already covered (position / supervise / ours)
+        if len(occupied) >= max_trades:
             print(
-                f"{DIM}AUTO: at --max-trades={max_trades} "
-                f"(this bot) — wait for a slot{RESET}"
+                f"{DIM}AUTO: at --max-trades={max_trades} · occupied "
+                f"{', '.join(sorted(occupied))} — wait for a slot{RESET}"
             )
             break
         # ATH entry gate: skip ★ closer than RISK_ATH_ENTRY_MIN_GAP_PCT to ATH
@@ -1422,12 +1483,13 @@ def _maybe_auto_trade(
         if proc is not None:
             active[sym] = proc
             ours.add(sym)
+            occupied.add(sym)
 
-    missing = [s for s in target_syms if s not in ours and s not in running]
-    covered = [s for s in target_syms if s in ours or s in running]
+    missing = [s for s in target_syms if s not in occupied]
+    covered = [s for s in target_syms if s in occupied]
     if covered and not missing:
         print(f"{DIM}AUTO: top ★ covered ({', '.join(covered)}){RESET}")
-    elif missing and len(active) >= max_trades:
+    elif missing and len(occupied) >= max_trades:
         pass  # already logged slot wait
     elif missing:
         print(f"{DIM}AUTO: still need {', '.join(missing)}{RESET}")
