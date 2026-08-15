@@ -627,6 +627,17 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
             in ("0", "false", "off", "no")
             else 1
         ),
+        # Funding guard — Help page
+        "funding_guard": (
+            0
+            if (os.getenv("FUNDING_GUARD", "1") or "1").strip().lower()
+            in ("0", "false", "off", "no")
+            else 1
+        ),
+        "funding_pay_max_pct": float(os.getenv("FUNDING_PAY_MAX_PCT", "0.3") or 0.3),
+        "funding_close_lead_min": float(
+            os.getenv("FUNDING_CLOSE_LEAD_MIN", "10") or 10
+        ),
     }
 
 
@@ -1337,6 +1348,52 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         return None
 
 
+def _print_auto_account_status(
+    args: argparse.Namespace,
+    *,
+    api: str | None,
+    sec: str | None,
+    occupied: set[str],
+    max_trades: int,
+) -> None:
+    """Always-on strip under the table so soft/hard gates are not invisible."""
+    soft_mr = float(getattr(args, "margin_ratio_soft", 3.0) or 0)
+    hard_mr = float(getattr(args, "margin_ratio_hard", 5.0) or 5.0)
+    bits: list[str] = []
+
+    if _weekend_block_active():
+        bits.append(f"{YELLOW}weekend block (Fri 21:00→Sun 23:00 UTC){RESET}")
+    elif not _weekend_block_enabled():
+        bits.append(f"{DIM}weekend off{RESET}")
+
+    if soft_mr <= 0:
+        bits.append(f"{DIM}margin soft off{RESET}")
+    elif not api or not sec:
+        bits.append(f"{YELLOW}margin unread (no API keys){RESET}")
+    else:
+        from orderbook_dca_grid import get_margin_ratio_pct
+
+        ratio = get_margin_ratio_pct(api, sec, 15000)
+        if ratio is None:
+            bits.append(f"{YELLOW}margin unread (API error){RESET}")
+        elif ratio >= soft_mr:
+            bits.append(
+                f"{YELLOW}margin {ratio:.2f}% ≥ soft {soft_mr:g}% "
+                f"(hard {hard_mr:g}%) — no new ★{RESET}"
+            )
+        else:
+            bits.append(
+                f"{DIM}margin {ratio:.2f}% < soft {soft_mr:g}% "
+                f"(hard {hard_mr:g}%){RESET}"
+            )
+
+    occ = ", ".join(sorted(occupied)) or "—"
+    bits.append(
+        f"{DIM}slots {len(occupied)}/{max_trades} · occupied {occ}{RESET}"
+    )
+    print("AUTO · " + " · ".join(bits))
+
+
 def _maybe_auto_trade(
     hits: list[PumpStallHit],
     args: argparse.Namespace,
@@ -1375,6 +1432,19 @@ def _maybe_auto_trade(
     except Exception as exc:  # noqa: BLE001
         print(f"{DIM}AUTO ★ re-arm pulse skipped: {exc}{RESET}")
 
+    import loss_cooldown as lcd
+    from orderbook_dca_grid import get_margin_ratio_pct, load_keys
+
+    api, sec = load_keys(None)
+    occupied = _occupied_trade_slots(active, api=api or None, sec=sec or None)
+    _print_auto_account_status(
+        args,
+        api=api or None,
+        sec=sec or None,
+        occupied=occupied,
+        max_trades=max_trades,
+    )
+
     if _weekend_block_active():
         print(
             f"{YELLOW}AUTO: weekend block Fri 21:00→Sun 23:00 UTC "
@@ -1382,15 +1452,21 @@ def _maybe_auto_trade(
         )
         return active
 
-    import loss_cooldown as lcd
-    from orderbook_dca_grid import get_margin_ratio_pct, load_keys
-
-    api, sec = load_keys(None)
     soft_mr = float(getattr(args, "margin_ratio_soft", 3.0) or 0)
     if soft_mr > 0:
-        if api and sec:
+        if not api or not sec:
+            print(
+                f"{YELLOW}AUTO: cannot enforce soft margin "
+                f"{soft_mr:g}% — missing API keys{RESET}"
+            )
+        else:
             ratio = get_margin_ratio_pct(api, sec, 15000)
-            if ratio is not None and ratio >= soft_mr:
+            if ratio is None:
+                print(
+                    f"{YELLOW}AUTO: cannot read margin ratio — "
+                    f"soft {soft_mr:g}% not enforced this cycle{RESET}"
+                )
+            elif ratio >= soft_mr:
                 print(
                     f"{YELLOW}AUTO: margin ratio {ratio:.2f}% ≥ soft "
                     f"{soft_mr:g}% — no new ★ "
@@ -1404,7 +1480,6 @@ def _maybe_auto_trade(
         bits = [f"{s} {lcd.fmt_remaining(t)}" for s, t in sorted(cooling.items())]
         print(f"{DIM}AUTO: loss cooldown · {', '.join(bits)}{RESET}")
 
-    occupied = _occupied_trade_slots(active, api=api or None, sec=sec or None)
     slots_left = max(0, max_trades - len(occupied))
     if slots_left <= 0:
         print(

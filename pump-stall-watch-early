@@ -22,6 +22,8 @@ exec python3 "$ROOT/pump_stall_scan.py" --watch \
   --max-trades 3 \
   --interval 60 \
   --loss-cooldown-min 1440 \
+  --margin-ratio-soft 3 \
+  --margin-ratio-hard 5 \
   --min-stall 25 \
   --min-near-high 82 \
   --ideal-near 90 \
