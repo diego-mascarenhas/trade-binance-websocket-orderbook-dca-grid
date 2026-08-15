@@ -484,11 +484,22 @@ def annotate_ath_gates(
         prior_block = gap_p is not None and gap_p < min_gap
         h.ath_block = hist_block or prior_block
         # ATH copy lives under Hint (auto_notes), not on each row.
+        try:
+            from exits.risk_reduce import ath_lookback_bars
+
+            lb = int(ath_lookback_bars(args))
+        except Exception:
+            lb = 90
         if hist_block:
-            notes.append(f"skip {h.symbol} — ATH {gap:.1f}% < {min_gap:g}%")
+            notes.append(
+                f"skip {h.symbol} — {lb:d}d high {float(ath):g} · "
+                f"{gap:.1f}% off < min {min_gap:g}% "
+                f"(not listing ATH)"
+            )
         elif prior_block:
             notes.append(
-                f"skip {h.symbol} — prior ATH {gap_p:.1f}% < {min_gap:g}%"
+                f"skip {h.symbol} — prior swing {float(prior):g} · "
+                f"{gap_p:.1f}% off < min {min_gap:g}%"
             )
     return notes
 
@@ -868,8 +879,8 @@ def print_hits(
         ath_skips = [h.symbol for h in ranked if h.ath_block]
         if ath_skips:
             print(
-                f"{YELLOW}AUTO: skip {', '.join(ath_skips)} — ATH gate "
-                f"(too close to historical / prior high){RESET}"
+                f"{YELLOW}skip {', '.join(ath_skips)} — too close to "
+                f"90d/regime high (or prior swing if enabled){RESET}"
             )
         if why_limit > 0 and blocked is not None:
             print()
@@ -1540,20 +1551,20 @@ def _maybe_auto_trade(
                 last_px = 0.0
             blocked, why = entry_blocked_near_ath(sym, last_px, args)
             if blocked:
-                print(f"{YELLOW}AUTO: skip {sym} — ATH gate ({why}){RESET}")
+                print(f"{YELLOW}skip {sym} — {why}{RESET}")
                 continue
         except Exception as exc:  # noqa: BLE001
-            print(f"{DIM}AUTO: ATH gate check skipped for {sym}: {exc}{RESET}")
+            print(f"{DIM}ATH gate check skipped for {sym}: {exc}{RESET}")
         # Funding gate: skip ★ when we would pay expensive funding this window
         try:
             from exits.funding import entry_blocked_by_funding
 
             blocked, why = entry_blocked_by_funding(sym, False, args)  # pumpstall = SHORT
             if blocked:
-                print(f"{YELLOW}AUTO: skip {sym} — funding gate ({why}){RESET}")
+                print(f"{YELLOW}skip {sym} — funding ({why}){RESET}")
                 continue
         except Exception as exc:  # noqa: BLE001
-            print(f"{DIM}AUTO: funding gate check skipped for {sym}: {exc}{RESET}")
+            print(f"{DIM}funding gate check skipped for {sym}: {exc}{RESET}")
         proc = _launch_dca_once(hit, args)
         if proc is not None:
             active[sym] = proc

@@ -397,16 +397,17 @@ def entry_blocked_near_ath(
         return False, ""  # can't measure — don't block arm; SL arm will skip too
     gap = distance_to_ath_pct(price, float(peak))
     if gap < min_gap:
+        lb = ath_lookback_bars(args)
         return True, (
-            f"near ATH {gap:.1f}% < min gap {min_gap:g}% "
-            f"(ATH {peak:g} · last {price:g})"
+            f"{lb:d}d high {peak:g} · {gap:.1f}% off < min {min_gap:g}% "
+            f"(last {price:g}; not listing ATH)"
         )
     if prior_ath_enabled(args) and prior and prior > 0:
         gap_p = distance_to_ath_pct(price, float(prior))
         if gap_p < min_gap:
             return True, (
-                f"near prior ATH {gap_p:.1f}% < min gap {min_gap:g}% "
-                f"(prior {prior:g} · ATH {peak:g} · last {price:g})"
+                f"prior swing {prior:g} · {gap_p:.1f}% off < min {min_gap:g}% "
+                f"(regime {peak:g} · last {price:g})"
             )
     return False, ""
 
