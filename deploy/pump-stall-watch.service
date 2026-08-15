@@ -10,7 +10,7 @@ User=forge
 WorkingDirectory=/opt/trade-binance-websocket-orderbook-dca-grid
 EnvironmentFile=-/opt/trade-binance-websocket-orderbook-dca-grid/.env
 # ★ slots via .env MAX_TRADES (default 3) · structure TP + BE + trail · refresh 60s
-# Margin Ratio: soft 3% no new ★ · hard 5% strip DCA / re-arm below
+# Margin soft/hard from .env (MARGIN_RATIO_SOFT / MARGIN_RATIO_HARD) — do not CLI-override
 # Override flags via drop-in if needed (systemctl edit pump-stall-watch).
 ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/pump_stall_scan.py \
   --watch \
@@ -19,9 +19,7 @@ ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/pu
   --interval 60 \
   --loss-cooldown-min 1440 \
   --post-be-arm-pct 1.5 \
-  --post-be-callback 0.6 \
-  --margin-ratio-soft 3 \
-  --margin-ratio-hard 5
+  --post-be-callback 0.6
 Restart=always
 RestartSec=15
 # Child dca --once processes use start_new_session; they keep running if this unit restarts.

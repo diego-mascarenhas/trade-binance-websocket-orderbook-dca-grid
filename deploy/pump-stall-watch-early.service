@@ -14,7 +14,7 @@ EnvironmentFile=-/opt/trade-binance-websocket-orderbook-dca-grid/.env
 # ★ slots via .env MAX_TRADES · early stall thresholds
 # Exit: --trade-exit ratchet (BE floor + wall SL). CLI wins over TRADE_EXIT/EXIT_MODE.
 # Optional overlay: add --also-structure to the unit to let EQL/EQH close earlier.
-# Margin Ratio (Binance UI): soft 3% no new ★ · hard 5% strip DCA / re-arm below
+# Margin soft/hard from .env (MARGIN_RATIO_SOFT / MARGIN_RATIO_HARD) — do not CLI-override
 ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/pump_stall_scan.py \
   --watch \
   --auto-trade \
@@ -22,8 +22,6 @@ ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/pu
   --trade-exit ratchet \
   --interval 60 \
   --loss-cooldown-min 1440 \
-  --margin-ratio-soft 3 \
-  --margin-ratio-hard 5 \
   --min-stall 25 \
   --min-near-high 82 \
   --ideal-near 90 \
