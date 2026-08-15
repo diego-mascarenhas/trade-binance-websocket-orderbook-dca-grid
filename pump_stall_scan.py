@@ -1408,6 +1408,16 @@ def _maybe_auto_trade(
                 continue
         except Exception as exc:  # noqa: BLE001
             print(f"{DIM}AUTO: ATH gate check skipped for {sym}: {exc}{RESET}")
+        # Funding gate: skip ★ when we would pay expensive funding this window
+        try:
+            from exits.funding import entry_blocked_by_funding
+
+            blocked, why = entry_blocked_by_funding(sym, False, args)  # pumpstall = SHORT
+            if blocked:
+                print(f"{YELLOW}AUTO: skip {sym} — funding gate ({why}){RESET}")
+                continue
+        except Exception as exc:  # noqa: BLE001
+            print(f"{DIM}AUTO: funding gate check skipped for {sym}: {exc}{RESET}")
         proc = _launch_dca_once(hit, args)
         if proc is not None:
             active[sym] = proc

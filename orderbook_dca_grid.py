@@ -1282,6 +1282,23 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
             if verbose:
                 print(f"{DIM}ATH entry gate check skipped: {exc}{RESET}")
 
+    # Funding guard: skip new opens when we would pay expensive funding this window.
+    if not dca_only:
+        try:
+            from exits.funding import entry_blocked_by_funding
+
+            blocked, why = entry_blocked_by_funding(args.symbol, is_long, args)
+            if blocked:
+                if verbose:
+                    print(
+                        f"{YELLOW}Funding gate — skip arm {args.symbol.upper()}: "
+                        f"{why}{RESET}"
+                    )
+                return False
+        except Exception as exc:
+            if verbose:
+                print(f"{DIM}Funding gate check skipped: {exc}{RESET}")
+
     entry = args.price if args.price is not None else mid
     base_size = args.base_size
     if base_size <= 0:
@@ -1793,15 +1810,21 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             sym, api, sec, args.recv_window,
                         )
                         close_reason = None
-                        if exit_mode == EXIT_STRUCTURE:
+                        try:
+                            from exits.funding import pop_close_reason as pop_fund_reason
+
+                            close_reason = pop_fund_reason(sym)
+                        except Exception:
+                            close_reason = None
+                        if not close_reason and exit_mode == EXIT_STRUCTURE:
                             close_reason = pop_close_reason(sym)
-                        elif exit_mode == EXIT_OB:
+                        elif not close_reason and exit_mode == EXIT_OB:
                             from exits.ob_long import pop_close_reason as pop_ob_reason
                             close_reason = pop_ob_reason(sym)
-                        elif exit_mode == EXIT_PULLBACK:
+                        elif not close_reason and exit_mode == EXIT_PULLBACK:
                             from exits.pullback import pop_close_reason as pop_pb_reason
                             close_reason = pop_pb_reason(sym)
-                        elif exit_mode == EXIT_RATCHET:
+                        elif not close_reason and exit_mode == EXIT_RATCHET:
                             from exits.structure import pop_close_reason as pop_st_reason
                             from exits.ratchet import pop_close_reason as pop_rt_reason
                             import orderbook_staged_exit as staged
@@ -1812,7 +1835,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
                                     close_reason = f"{close_reason} · after partial TP"
                             except Exception:
                                 pass
-                        elif after_runner:
+                        elif not close_reason and after_runner:
                             close_reason = "runner / trail"
                         close_pnl = float(last_pos_meta.get("unrealized_pnl", 0) or 0)
                         telegram.notify_position_closed(
@@ -2341,6 +2364,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Also block new SHORT opens within the entry gap of the prior ATH "
              "(previous 1D peak, not a 7-day high). Default on. Env: RISK_ATH_PRIOR",
+    )
+    p.add_argument(
+        "--funding-guard",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Block new opens / flatten before funding when we would pay "
+             "≥ FUNDING_PAY_MAX_PCT (default on). Env: FUNDING_GUARD",
+    )
+    p.add_argument(
+        "--funding-pay-max-pct",
+        type=float,
+        default=None,
+        help="Funding %% we would pay that triggers block/close (default 0.3). "
+             "Env: FUNDING_PAY_MAX_PCT",
+    )
+    p.add_argument(
+        "--funding-close-lead-min",
+        type=float,
+        default=None,
+        help="Minutes before nextFundingTime to market-close when paying "
+             "(default 10). Env: FUNDING_CLOSE_LEAD_MIN",
     )
     # Legacy flags kept so old unit/env lines still parse; ignored by ATH SL logic.
     p.add_argument(

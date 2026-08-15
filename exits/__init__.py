@@ -266,6 +266,17 @@ def run_exit_once(
     sec: str,
     filt: dict[str, Decimal],
 ) -> None:
+    # Orthogonal: flatten before expensive funding (any exit mode, incl. none)
+    try:
+        from exits.funding import run_once as funding_once
+
+        if funding_once(
+            symbol, side_is_long, qty, entry, args, hedge, api, sec, filt,
+        ):
+            return
+    except Exception as exc:  # noqa: BLE001
+        print(f"Funding guard skip: {exc}")
+
     if mode == EXIT_NONE:
         return
 
