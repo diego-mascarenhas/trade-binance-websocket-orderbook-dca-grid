@@ -443,7 +443,7 @@ def annotate_ath_gates(
     hits: list[PumpStallHit],
     args: argparse.Namespace | None = None,
 ) -> list[str]:
-    """Fill ATH gap on table rows so the scanner shows why ★ do not open."""
+    """Fill prior-swing gap on rows; entry block is prior-only (not 90d high)."""
     if not hits:
         return []
     try:
@@ -452,7 +452,6 @@ def annotate_ath_gates(
             cached_ath_levels,
             distance_to_ath_pct,
             enabled,
-            prior_ath_enabled,
         )
     except Exception:
         return []
@@ -469,34 +468,21 @@ def annotate_ath_gates(
             )
         except Exception:
             continue
-        if not ath or ath <= 0 or h.last <= 0:
+        if h.last <= 0:
             continue
-        gap = distance_to_ath_pct(float(h.last), float(ath))
-        h.ath = float(ath)
-        h.ath_gap_pct = gap
+        if ath and ath > 0:
+            h.ath = float(ath)
+            h.ath_gap_pct = distance_to_ath_pct(float(h.last), float(ath))
         h.ath_min_gap_pct = min_gap
-        gap_p = None
-        if prior_ath_enabled(args) and prior and prior > 0:
-            gap_p = distance_to_ath_pct(float(h.last), float(prior))
-            h.prior_ath = float(prior)
-            h.prior_ath_gap_pct = gap_p
-        hist_block = gap < min_gap
-        prior_block = gap_p is not None and gap_p < min_gap
-        h.ath_block = hist_block or prior_block
-        # ATH copy lives under Hint (auto_notes), not on each row.
-        try:
-            from exits.risk_reduce import ath_lookback_bars
-
-            lb = int(ath_lookback_bars(args))
-        except Exception:
-            lb = 90
-        if hist_block:
-            notes.append(
-                f"skip {h.symbol} — {lb:d}d high {float(ath):g} · "
-                f"{gap:.1f}% off < min {min_gap:g}% "
-                f"(not listing ATH)"
-            )
-        elif prior_block:
+        h.ath_block = False
+        if not prior or prior <= 0:
+            continue
+        h.prior_ath = float(prior)
+        gap_p = distance_to_ath_pct(float(h.last), float(prior))
+        h.prior_ath_gap_pct = gap_p
+        # Only block when still below the prior swing and too close to it.
+        if float(h.last) < float(prior) and gap_p < min_gap:
+            h.ath_block = True
             notes.append(
                 f"skip {h.symbol} — prior swing {float(prior):g} · "
                 f"{gap_p:.1f}% off < min {min_gap:g}%"
@@ -878,9 +864,13 @@ def print_hits(
         print(f"{DIM}{hint or format_dca_hint()}{RESET}")
         ath_skips = [h.symbol for h in ranked if h.ath_block]
         if ath_skips:
+            min_g = next(
+                (h.ath_min_gap_pct for h in ranked if h.ath_min_gap_pct),
+                12.0,
+            )
             print(
-                f"{YELLOW}skip {', '.join(ath_skips)} — too close to "
-                f"90d/regime high (or prior swing if enabled){RESET}"
+                f"{YELLOW}skip {', '.join(ath_skips)} — too close below "
+                f"prior swing (need ≥{min_g:g}% off){RESET}"
             )
         if why_limit > 0 and blocked is not None:
             print()

@@ -2354,9 +2354,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--risk-ath-entry-min-gap-pct",
         type=float,
         default=None,
-        help="Block new SHORT opens when price is closer than this %% to the "
-             "regime ATH (last ~90d high) or the previous peak (default 12). "
-             "Env: RISK_ATH_ENTRY_MIN_GAP_PCT",
+        help="Block new SHORT opens when last is below the prior swing and "
+             "within this %% of it (default 12). Current 90d high is not an "
+             "entry block. Env: RISK_ATH_ENTRY_MIN_GAP_PCT",
     )
     p.add_argument(
         "--risk-ath-prior",

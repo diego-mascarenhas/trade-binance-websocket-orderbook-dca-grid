@@ -4,9 +4,10 @@ Replaces the old risk-reduce partial cut (RR). Behaviour:
 
   · One STOP_MARKET BUY reduce-only on the full position (tag RF)
   · Trigger = historical ATH × (1 + RISK_ATH_SL_PCT/100)  (default ATH + 2%)
-  · New SHORT opens are blocked when price is within RISK_ATH_ENTRY_MIN_GAP_PCT
-    of the **regime ATH** (max 1d high in the last N days, default 90) **or**
-    the prior peak in that window (e.g. 8 Aug after a 14 Aug spike)
+  · New SHORT opens are blocked when price sits **below** the prior swing
+    in the lookback window and within RISK_ATH_ENTRY_MIN_GAP_PCT of it
+    (default 12%). The current 90d / regime high is **not** an entry block
+    (that would fight ★ near the pump top).
 
 Historical ATH (all available 1d history) is used **only** for the SL.
 A 2023 print at 17.3 must not hide a 0.163 structure high.
@@ -14,8 +15,8 @@ A 2023 print at 17.3 must not hide a 0.163 structure high.
 Env / CLI:
   RISK_REDUCE=1                     # master switch (default on)
   RISK_ATH_SL_PCT=2                 # SL = ATH + this %%
-  RISK_ATH_ENTRY_MIN_GAP_PCT=12     # block new opens closer than this %% to regime / prior
-  RISK_ATH_PRIOR=1                  # also gate on the previous peak in the lookback
+  RISK_ATH_ENTRY_MIN_GAP_PCT=12     # block new opens closer than this %% below prior swing
+  RISK_ATH_PRIOR=1                  # (cluster knobs still used to find that swing)
   RISK_ATH_LOOKBACK_BARS=90         # 1d bars for the entry-gate peaks
 """
 
@@ -84,7 +85,7 @@ def ath_sl_pct(args: argparse.Namespace | None = None) -> float:
 
 
 def ath_entry_min_gap_pct(args: argparse.Namespace | None = None) -> float:
-    """Block new SHORT opens when distance-to-ATH %% is below this (default 12)."""
+    """Block new SHORT opens when distance-to-prior-swing %% is below this (default 12)."""
     if args is not None:
         v = getattr(args, "risk_ath_entry_min_gap_pct", None)
         if v is not None:
@@ -375,10 +376,12 @@ def entry_blocked_near_ath(
     ath: float | None = None,
     prior_ath: float | None = None,
 ) -> tuple[bool, str]:
-    """Return (blocked, reason) for a new SHORT open near ATH / prior ATH.
+    """Return (blocked, reason) for a new SHORT open near the prior swing.
 
-    Blocked when distance to the regime ATH (lookback high) **or** the
-    previous peak in that window is below RISK_ATH_ENTRY_MIN_GAP_PCT.
+    Blocks only when ``price`` is **below** the previous 1D peak (outside the
+    current regime-high impulse) and the gap to that peak is under
+    RISK_ATH_ENTRY_MIN_GAP_PCT. Price at/above that swing (new pump / ★ zone)
+    is allowed. The regime / listing ATH is not used for this gate.
     """
     if not enabled(args):
         return False, ""
@@ -387,28 +390,21 @@ def entry_blocked_near_ath(
         return False, ""
     if price <= 0:
         return False, ""
-    peak = ath if ath and ath > 0 else None
+    del ath  # regime high is display/SL context only — not an entry block
     prior = prior_ath if prior_ath and prior_ath > 0 else None
-    if peak is None:
-        peak, cached_prior = cached_ath_levels(symbol, last=price, args=args)
-        if prior is None:
-            prior = cached_prior
-    if not peak or peak <= 0:
-        return False, ""  # can't measure — don't block arm; SL arm will skip too
-    gap = distance_to_ath_pct(price, float(peak))
-    if gap < min_gap:
-        lb = ath_lookback_bars(args)
+    if prior is None:
+        _regime, cached_prior = cached_ath_levels(symbol, last=price, args=args)
+        prior = cached_prior
+    if not prior or prior <= 0:
+        return False, ""  # no prior swing → don't block ★
+    if price >= float(prior):
+        return False, ""  # above prior swing = current impulse / new high
+    gap_p = distance_to_ath_pct(price, float(prior))
+    if gap_p < min_gap:
         return True, (
-            f"{lb:d}d high {peak:g} · {gap:.1f}% off < min {min_gap:g}% "
-            f"(last {price:g}; not listing ATH)"
+            f"prior swing {prior:g} · {gap_p:.1f}% off < min {min_gap:g}% "
+            f"(last {price:g})"
         )
-    if prior_ath_enabled(args) and prior and prior > 0:
-        gap_p = distance_to_ath_pct(price, float(prior))
-        if gap_p < min_gap:
-            return True, (
-                f"prior swing {prior:g} · {gap_p:.1f}% off < min {min_gap:g}% "
-                f"(regime {peak:g} · last {price:g})"
-            )
     return False, ""
 
 

@@ -10,8 +10,9 @@ The old **risk-reduce** addon cut part of the position above an HTF swing (tag `
 There is now a **single** risk stop:
 
 - Full-size `STOP_MARKET` (tag `RF`) at **historical ATH + 2%**
-- New SHORT opens are **blocked** if price is **within 12%** of that ATH
-  **or** the prior ATH (previous 1D peak outside the current ATH impulse)
+- New SHORT opens are **blocked** only when price is **below** the **prior
+  swing** (previous 1D peak outside the current impulse) and within **12%** of
+  it. The current 90d / regime high is **not** an entry block (that fought ★).
 
 Exit-mode SLs (staged BE, ratchet, protect-be, etc.) are unchanged; this only replaces the risk-reduce addon.
 
@@ -21,17 +22,18 @@ Exit-mode SLs (staged BE, ratchet, protect-be, etc.) are unchanged; this only re
 |------|---------|-----------|
 | Master switch | on | `RISK_REDUCE=1` / `--risk-reduce` / `--no-risk-reduce` |
 | SL trigger | ATH × 1.02 | `RISK_ATH_SL_PCT=2` / `--risk-ath-sl-pct` |
-| Entry block | gap to ATH &lt; 12% | `RISK_ATH_ENTRY_MIN_GAP_PCT=12` / `--risk-ath-entry-min-gap-pct` |
+| Entry block | gap below prior swing &lt; 12% | `RISK_ATH_ENTRY_MIN_GAP_PCT=12` / `--risk-ath-entry-min-gap-pct` |
 
-**ATH** = max daily high over paginated Binance USDT-M `1d` history (up to ~6000 bars).
+**SL ATH** = max daily high over paginated Binance USDT-M `1d` history (up to ~6000 bars).
+
+**Entry gate** = prior swing only (price still under that peak and too close). Price at/above the prior swing (new pump) is allowed.
 
 **Entry gate** applies when:
 
 1. Arming a **new** grid (`build_and_place_grid`, not `dca_only` re-arms)
 2. Pumpstall **auto-trade** before launching `dca SYMBOL short --once`
 
-Example: ATH = 100 → SL at 102; opens allowed only if last ≤ 88 (at least 12% below ATH).
-
+Example: prior swing = 100 → opens blocked only if last is in (88, 100); last ≥ 100 (new high) is allowed.
 ## Removed / ignored
 
 - Partial cut (`RR`, `RISK_REDUCE_PCT`, recovery floor for structure/BE after RR)
