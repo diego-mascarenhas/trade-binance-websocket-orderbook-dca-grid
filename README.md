@@ -413,7 +413,9 @@ python3 orderbook_dca_grid_spot.py BTCUSDT --tp-only --once   # sync OCO once an
 ### Key behavior
 
 - **BUY LIMIT** grid on real **bid walls**; DCA count from the book (`SO_WALL_MULT`), capped by `SO_MAX`.
-- **OCO SELL** while holding: TP on ask walls, SL **below the deepest open DCA** (`SPOT_SL` is fallback when grid is fully filled).
+- **Entry size (default):** exchange `minNotional` × `SPOT_MIN_BUFFER` (1.1) per symbol — smallest legal fill. Use `SPOT_SIZE_MODE=wallet` for `%` of free USDT, or `BASE_SIZE` for a fixed amount.
+- **TP default:** net `SPOT_TP` (2%) after estimated fees (`SPOT_FEE_PCT`, default 0.2%) and tax (`SPOT_TAX_PCT`, default 19%). The bot raises the **gross** floor accordingly, then anchors the SELL to an ask **resistance** (local qty max / trend-flip shelf) at/above that floor (`SPOT_TP_STRUCTURE=1`).
+- **Exit:** TP LIMIT_MAKER by default (no SL); optional OCO with `--with-sl` / `SPOT_NO_SL=0`.
 - **Budget fit**: before placing, sums grid notional vs free USDT and `MAX_SYMBOL_PCT` (default **25%** of wallet); drops deepest DCAs until it fits.
 - **Grid refresh**: `--supervise` cancels and re-arms after `GRID_TTL` (default **1 h**; `0` = off).
 
@@ -497,9 +499,13 @@ REARM_BACKOFF=60
 | `FUTURES_UNIT` | `dca-futures` | deploy / botctl | systemd template name |
 | `FUTURES_PAIRS` | — | deploy | Comma-separated symbols for `dca-futures@` |
 | `SPOT_PAIRS` | — | deploy | Comma-separated symbols for `dca-spot@` |
+| `SPOT_SIZE_MODE` | `min` | spot | `min` = minNotional×buffer; `wallet` = WALLET_PCT of free USDT |
+| `SPOT_MIN_BUFFER` | `1.1` | spot | Multiplier on minNotional in min mode |
 | `MAX_SYMBOL_PCT` | `25` | spot | Cap per symbol (% of total USDT wallet) |
 | `MIN_BASE_USDT` | `10` | spot | Floor for wallet-% entry size |
-| `SPOT_TP` / `SPOT_SL` | `0.5` / `5` | spot | OCO TP/SL % |
+| `SPOT_TP` / `SPOT_FEE_PCT` / `SPOT_TAX_PCT` | `2` / `0.2` / `19` | spot | Net TP %; fee RT %; tax % on gains (gross-up) |
+| `SPOT_TP_STRUCTURE` | `1` | spot | Prefer ask resistance (local max) for TP |
+| `SPOT_SL` | `5` | spot | Optional OCO SL % |
 
 Example pair lists (alphabetical):
 

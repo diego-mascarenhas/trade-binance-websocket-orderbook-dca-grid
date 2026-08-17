@@ -5,9 +5,11 @@ Sibling of orderbook_dca_grid.py, but for Binance **Spot** (api.binance.com):
   - Spot is LONG-only: the grid places BUY LIMIT orders on real BID walls below
     the entry price to accumulate the base asset (DCA on dips).
   - While holding, ``--supervise`` keeps those DCA buys visible/re-armed below
-    until the take-profit leg fills (wider defaults: TP 1.5%, min-gap 0.8%).
+    until the take-profit leg fills (defaults: TP 2.0%, min-gap 0.8%).
+  - Default entry size: exchange ``minNotional`` × buffer (smallest legal);
+    set ``SPOT_SIZE_MODE=wallet`` for %% of free USDT.
   - Default exit: a single **LIMIT_MAKER** SELL take-profit (no stop-loss).
-    Opt into classic **OCO** (TP + STOP_LOSS_LIMIT) with ``--sl`` / ``SPOT_NO_SL=0``.
+    Opt into classic **OCO** (TP + STOP_LOSS_LIMIT) with ``--with-sl`` / ``SPOT_NO_SL=0``.
   - No leverage, no shorting, no hedge mode (none exist on Spot).
 
 Uses the SAME .env as the futures bot (BINANCE_API_KEY / BINANCE_SECRET_KEY);
@@ -107,6 +109,61 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None or str(raw).strip() == "":
         return default
     return str(raw).strip().lower() not in ("0", "false", "off", "no")
+
+
+def spot_fee_pct(args: argparse.Namespace | None = None) -> float:
+    """Estimated round-trip trading fees %% (default 0.2). Env: SPOT_FEE_PCT."""
+    if args is not None:
+        v = getattr(args, "spot_fee_pct", None)
+        if v is not None:
+            return max(0.0, float(v))
+    return max(0.0, _env_float("SPOT_FEE_PCT", 0.2))
+
+
+def spot_tax_pct(args: argparse.Namespace | None = None) -> float:
+    """Tax %% on net trading gains (default 19). Env: SPOT_TAX_PCT. 0=off."""
+    if args is not None:
+        v = getattr(args, "spot_tax_pct", None)
+        if v is not None:
+            return max(0.0, min(99.0, float(v)))
+    return max(0.0, min(99.0, _env_float("SPOT_TAX_PCT", 19.0)))
+
+
+def effective_tp_pct(args: argparse.Namespace) -> float:
+    """Gross TP %% so that after fees + tax, net ≈ --tp (SPOT_TP).
+
+    Want net N after fees F and tax T on (G−F):
+      (G − F) × (1 − T/100) = N  →  G = N / (1 − T/100) + F
+    """
+    net = max(0.05, float(getattr(args, "tp", 0) or _env_float("SPOT_TP", 2.0)))
+    fee = spot_fee_pct(args)
+    tax = spot_tax_pct(args)
+    if tax >= 99.0:
+        return net + fee
+    return fee + net / (1.0 - tax / 100.0)
+
+
+def spot_tp_structure(args: argparse.Namespace | None = None) -> bool:
+    """Prefer local-max ask walls (resistance / trend flip). Default on."""
+    if args is not None and getattr(args, "tp_structure", None) is not None:
+        return bool(args.tp_structure)
+    return _env_bool("SPOT_TP_STRUCTURE", True)
+
+
+def _ask_resistance_walls(
+    asks: list[list[float]], min_wall: float,
+) -> list[tuple[float, float]]:
+    """Ask levels that are local qty maxima (resistance / supply shelves)."""
+    out: list[tuple[float, float]] = []
+    n = len(asks)
+    for i, (p, q) in enumerate(asks):
+        if q < min_wall:
+            continue
+        left = asks[i - 1][1] if i > 0 else 0.0
+        right = asks[i + 1][1] if i + 1 < n else 0.0
+        if q >= left and q >= right:
+            out.append((p, q))
+    return out
 
 
 def spot_use_sl(args: argparse.Namespace) -> bool:
@@ -423,18 +480,54 @@ def cap_base_size_to_budget(base_size: float, budget: float, min_notional: float
 
 def resolve_base_size(args: argparse.Namespace, filt: dict, api: str, sec: str,
                       verbose: bool = True) -> float | None:
-    """Resolve entry size from --base-size or wallet % (+ min floor)."""
-    base_size = args.base_size
+    """Resolve entry size: fixed --base-size, exchange minNotional, or wallet %%."""
+    base_size = float(getattr(args, "base_size", 0) or 0)
     if base_size > 0:
         return base_size
+
+    mode = str(getattr(args, "spot_size_mode", None) or os.getenv("SPOT_SIZE_MODE", "min") or "min")
+    mode = mode.strip().lower()
+    min_n = float(filt.get("min_notional") or 5)
+    buffer = float(getattr(args, "spot_min_buffer", None) or _env_float("SPOT_MIN_BUFFER", 1.1))
+    buffer = max(1.0, buffer)
+
+    if mode in ("min", "minimum", "minnotional", "exchange"):
+        # Smallest exchange-legal entry (+ buffer so TP/qty rounding stays valid).
+        base_size = min_n * buffer
+        if verbose:
+            print(
+                f"{BOLD}{CYAN}Entry size: exchange min{RESET} "
+                f"{DIM}(minNotional {min_n:g} × {buffer:g} → {base_size:,.2f} USDT){RESET}"
+            )
+        return base_size
+
+    # wallet %% of free quote
     try:
         quote_free = get_free(api, sec, args.recv_window, filt["quote_asset"])
         base_size = quote_free * args.wallet_pct / 100.0
-        if base_size < args.min_base_usdt:
+        floor = float(getattr(args, "min_base_usdt", 0) or 0)
+        if floor > 0 and base_size < floor:
             if verbose:
-                print(f"{DIM}Wallet {args.wallet_pct:g}% = {base_size:,.2f} USDT < floor "
-                      f"{args.min_base_usdt:g} → using {args.min_base_usdt:g} USDT.{RESET}")
-            base_size = args.min_base_usdt
+                print(
+                    f"{DIM}Wallet {args.wallet_pct:g}% = {base_size:,.2f} USDT < floor "
+                    f"{floor:g} → using {floor:g} USDT.{RESET}"
+                )
+            base_size = floor
+        # Never below exchange minNotional
+        need = min_n * buffer
+        if base_size < need:
+            if verbose:
+                print(
+                    f"{DIM}Size {base_size:,.2f} < minNotional×buffer {need:,.2f} "
+                    f"→ using {need:,.2f} USDT.{RESET}"
+                )
+            base_size = need
+        if verbose:
+            print(
+                f"{BOLD}{CYAN}Entry size: {args.wallet_pct:g}% of free "
+                f"{filt['quote_asset']}{RESET} "
+                f"{DIM}→ {base_size:,.2f} USDT{RESET}"
+            )
         return base_size
     except Exception as exc:
         if verbose:
@@ -665,11 +758,14 @@ def place_buy_grid(symbol: str, prepared: list[dict], args: argparse.Namespace,
 def choose_oco_prices(bids: list[list[float]], asks: list[list[float]], avg: float,
                       tp_pct: float, sl_pct: float, sl_buffer_pct: float, tick: Decimal,
                       wall_min_mult: float, pick: str,
-                      grid_bottom: float | None = None) -> dict:
+                      grid_bottom: float | None = None,
+                      *,
+                      prefer_structure: bool = True) -> dict:
     """Anchor the OCO exit to real order-book walls.
 
-    - TP (LIMIT_MAKER): a real ASK wall (resistance) at/above the profit floor
-      avg*(1+tp%); if none is deep enough, falls back to that floor.
+    - TP (LIMIT_MAKER): a real ASK **resistance** (local qty max / trend-flip shelf)
+      at/above the profit floor avg*(1+tp%); falls back to any wall, then floor.
+      ``tp_pct`` should already be the *gross* floor (fees + tax gross-up).
     - SL (STOP_LOSS_LIMIT): placed BELOW the whole DCA grid — under the deepest
       still-open DCA order (`grid_bottom`), snapped just under a support wall
       beneath it, with a `sl_buffer_pct` cushion. Only if the grid is fully
@@ -683,17 +779,27 @@ def choose_oco_prices(bids: list[list[float]], asks: list[list[float]], avg: flo
     med = statistics.median(all_q) if all_q else 0.0
     min_wall = med * wall_min_mult
 
-    # --- Take-profit: nearest/strongest ASK wall at/above the profit floor ---
+    # --- Take-profit: resistance ask wall at/above the (gross) profit floor ---
     tp_floor = max(avg * (1 + tp_pct / 100), best_ask + tickf)
-    ask_walls = [(p, q) for p, q in asks if p >= tp_floor and q >= min_wall]
-    if ask_walls:
-        wall = (min(ask_walls, key=lambda x: x[0]) if pick == "nearest"
-                else max(ask_walls, key=lambda x: x[1]))
+    used_structure = False
+    candidates: list[tuple[float, float]] = []
+    if prefer_structure:
+        candidates = [
+            (p, q) for p, q in _ask_resistance_walls(asks, min_wall) if p >= tp_floor
+        ]
+        used_structure = bool(candidates)
+    if not candidates:
+        candidates = [(p, q) for p, q in asks if p >= tp_floor and q >= min_wall]
+    if candidates:
+        wall = (min(candidates, key=lambda x: x[0]) if pick == "nearest"
+                else max(candidates, key=lambda x: x[1]))
         tp = wall[0]
         tp_wall_qty = wall[1]
+        tp_kind = "resistance" if used_structure else "ask wall"
     else:
         tp = tp_floor
         tp_wall_qty = None
+        tp_kind = "profit floor"
     tp_d = _round_to(tp, tick, ROUND_UP)
 
     # --- Stop-loss: BELOW the DCA grid (only cut once the whole grid is broken) ---
@@ -716,8 +822,15 @@ def choose_oco_prices(bids: list[list[float]], asks: list[list[float]], avg: flo
     if sl_limit_d >= stop_d:
         sl_limit_d = stop_d - tick
 
-    return {"tp": tp_d, "stop": stop_d, "sl_limit": sl_limit_d,
-            "tp_wall_qty": tp_wall_qty, "sl_wall_qty": sl_wall_qty}
+    return {
+        "tp": tp_d,
+        "stop": stop_d,
+        "sl_limit": sl_limit_d,
+        "tp_wall_qty": tp_wall_qty,
+        "sl_wall_qty": sl_wall_qty,
+        "tp_kind": tp_kind,
+        "tp_floor_pct": float(tp_pct),
+    }
 
 
 def place_oco_sell(symbol: str, qty_str: str, prices: dict, filt: dict,
@@ -751,13 +864,29 @@ def place_tp_limit_sell(symbol: str, qty_str: str, tp_price: Decimal, filt: dict
     return _signed_request("POST", "/api/v3/order", params, api, sec, recv)
 
 
+def _tp_anchor_note(prices: dict, *, net_tp: float | None = None) -> str:
+    """Human note for TP placement (resistance / wall / floor + gross %)."""
+    kind = str(prices.get("tp_kind") or ("ask wall" if prices.get("tp_wall_qty") else "profit floor"))
+    qty = prices.get("tp_wall_qty")
+    gross = prices.get("tp_floor_pct")
+    bits = [kind]
+    if qty:
+        bits[0] = f"on {qty_fmt(qty)} {kind}"
+    if gross is not None:
+        bits.append(f"gross ≥{float(gross):.2f}%")
+    if net_tp is not None:
+        bits.append(f"net target {float(net_tp):g}%")
+    return " · ".join(bits)
+
+
 def _choose_tp_price(bids: list[list[float]], asks: list[list[float]], avg: float,
                      args: argparse.Namespace, filt: dict,
                      grid_bottom: float | None) -> dict:
     return choose_oco_prices(
-        bids, asks, avg, args.tp, args.sl, args.sl_buffer,
+        bids, asks, avg, effective_tp_pct(args), args.sl, args.sl_buffer,
         filt["tick_size"], args.tp_wall_min_mult, args.tp_wall_pick,
         grid_bottom=grid_bottom,
+        prefer_structure=spot_tp_structure(args),
     )
 
 
@@ -825,10 +954,7 @@ def manage_tp_limit_once(symbol: str, args: argparse.Namespace, filt: dict,
     try:
         resp = place_tp_limit_sell(symbol, qty_str, prices["tp"], filt, api, sec, args.recv_window)
         oid = resp.get("orderId")
-        tp_note = (
-            f"on {qty_fmt(prices['tp_wall_qty'])} wall"
-            if prices["tp_wall_qty"] else "profit floor"
-        )
+        tp_note = _tp_anchor_note(prices, net_tp=float(args.tp))
         print(
             f"{GREEN}✓ TP SELL {qty_str} · {price_fmt(tp)} ({tp_note}) · "
             f"avg {price_fmt(avg)} · no SL · orderId={oid}{RESET}"
@@ -910,9 +1036,7 @@ def manage_oco_once(symbol: str, args: argparse.Namespace, filt: dict,
     avg = average_cost(symbol, float(qty_str), api, sec, args.recv_window)
     if avg <= 0:
         avg = mid  # fallback: no trade history found
-    prices = choose_oco_prices(bids, asks, avg, args.tp, args.sl, args.sl_buffer,
-                               filt["tick_size"], args.tp_wall_min_mult, args.tp_wall_pick,
-                               grid_bottom=grid_bottom)
+    prices = _choose_tp_price(bids, asks, avg, args, filt, grid_bottom)
 
     # Both OCO legs must clear minNotional (the lower SL leg is the binding one).
     leg_min = min(float(prices["tp"]), float(prices["sl_limit"])) * float(qty_str)
@@ -925,7 +1049,7 @@ def manage_oco_once(symbol: str, args: argparse.Namespace, filt: dict,
     try:
         resp = place_oco_sell(symbol, qty_str, prices, filt, api, sec, args.recv_window)
         oid = resp.get("orderListId")
-        tp_note = f"on {qty_fmt(prices['tp_wall_qty'])} wall" if prices["tp_wall_qty"] else "profit floor"
+        tp_note = _tp_anchor_note(prices, net_tp=float(args.tp))
         sl_ref_note = "below grid" if grid_bottom else "risk cap"
         sl_note = (f"under {qty_fmt(prices['sl_wall_qty'])} wall, {sl_ref_note}"
                    if prices["sl_wall_qty"] else sl_ref_note)
@@ -1191,17 +1315,19 @@ def run_oco_manager(args: argparse.Namespace) -> None:
         buys = [float(o.get("price", 0) or 0) for o in open_orders(args.symbol, api, sec, args.recv_window)
                 if str(o.get("side", "")).upper() == "BUY"]
         grid_bottom = min(buys) if buys else None
-        prices = choose_oco_prices(bids, asks, avg, args.tp, args.sl, args.sl_buffer,
-                                   filt["tick_size"], args.tp_wall_min_mult, args.tp_wall_pick,
-                                   grid_bottom=grid_bottom)
-        tp_note = f"on {qty_fmt(prices['tp_wall_qty'])} ask wall" if prices["tp_wall_qty"] else f"profit floor +{args.tp:g}%"
+        prices = _choose_tp_price(bids, asks, avg, args, filt, grid_bottom)
+        tp_note = _tp_anchor_note(prices, net_tp=float(args.tp))
         sl_note = ("below grid" if grid_bottom else f"risk cap -{args.sl:g}%")
         print(f"  SELL {qty_fmt(base_qty)} {filt['base_asset']} · avg {price_fmt(avg)}")
         print(f"  TP {price_fmt(float(prices['tp']))} ({tp_note})  ·  "
               f"SL {price_fmt(float(prices['stop']))} ({sl_note})")
         return
-    print(f"\n{BOLD}{CYAN}Managing OCO on SPOT {args.symbol.upper()} "
-          f"(TP +{args.tp:g}% / SL -{args.sl:g}%, poll {args.poll_sec:g}s). Ctrl+C to stop.{RESET}")
+    print(
+        f"\n{BOLD}{CYAN}Managing OCO on SPOT {args.symbol.upper()} "
+        f"(net TP +{args.tp:g}% · gross ~{effective_tp_pct(args):.2f}% "
+        f"after fees/tax · SL -{args.sl:g}%, poll {args.poll_sec:g}s). "
+        f"Ctrl+C to stop.{RESET}"
+    )
     try:
         while True:
             try:
@@ -1247,18 +1373,51 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--size-mode", choices=["comp", "wall", "scale", "flat"], default="comp",
                    help="comp=distance compensation, wall=∝ wall liquidity, scale=geometric, flat=equal")
     p.add_argument("--base-size", type=float, default=_env_float("BASE_SIZE", 0.0),
-                   help="Base order size in USDT (0 = use --wallet-pct). Env: BASE_SIZE")
+                   help="Fixed base order size in USDT (0 = use --spot-size-mode). Env: BASE_SIZE")
+    p.add_argument(
+        "--spot-size-mode",
+        choices=["min", "wallet"],
+        default=(os.getenv("SPOT_SIZE_MODE", "min") or "min").strip().lower(),
+        help="When --base-size=0: min=exchange minNotional×buffer (default); "
+             "wallet=%% of free quote. Env: SPOT_SIZE_MODE",
+    )
+    p.add_argument(
+        "--spot-min-buffer",
+        type=float,
+        default=_env_float("SPOT_MIN_BUFFER", 1.1),
+        help="Multiply minNotional by this in min mode (default 1.1). Env: SPOT_MIN_BUFFER",
+    )
     p.add_argument("--wallet-pct", type=float, default=_env_float("WALLET_PCT", 10.0),
-                   help="Entry size as %% of free quote (USDT) when --base-size=0. Env: WALLET_PCT")
+                   help="With --spot-size-mode wallet: %% of free quote. Env: WALLET_PCT")
     p.add_argument("--min-base-usdt", type=float, default=_env_float("MIN_BASE_USDT", 10.0),
-                   help="Floor for the wallet-%% entry size: if the %% is below this, use this "
-                        "USDT instead. Env: MIN_BASE_USDT")
+                   help="Wallet mode only: floor if %% is below this USDT. Env: MIN_BASE_USDT")
     p.add_argument("--comp-factor", type=float, default=1.0, help="USDT per %% band per base size (comp mode)")
     p.add_argument("--so-size", type=float, default=58.99, help="First/each DCA size (scale/flat modes)")
     p.add_argument("--volume-scale", type=float, default=1.3, help="Size multiplier per DCA (scale mode)")
-    p.add_argument("--tp", type=float, default=_env_float("SPOT_TP", 1.5),
-                   help="Min take-profit %% above avg (profit floor; TP anchors to an ask wall at/above it). "
-                        "Default 1.5 so spot rounds clear fees. Env: SPOT_TP")
+    p.add_argument("--tp", type=float, default=_env_float("SPOT_TP", 2.0),
+                   help="Desired *net* take-profit %% after fees+tax. Gross floor is "
+                        "raised automatically. TP sits on an ask resistance at/above that "
+                        "floor. Env: SPOT_TP")
+    p.add_argument(
+        "--spot-fee-pct",
+        type=float,
+        default=_env_float("SPOT_FEE_PCT", 0.2),
+        help="Estimated round-trip fee %% baked into the TP floor (default 0.2). "
+             "Env: SPOT_FEE_PCT",
+    )
+    p.add_argument(
+        "--spot-tax-pct",
+        type=float,
+        default=_env_float("SPOT_TAX_PCT", 19.0),
+        help="Tax %% on gains for TP gross-up (default 19; 0=off). Env: SPOT_TAX_PCT",
+    )
+    p.add_argument(
+        "--tp-structure",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Prefer local-max ask walls (resistance / trend flip). Default on. "
+             "Env: SPOT_TP_STRUCTURE",
+    )
     p.add_argument(
         "--with-sl",
         action="store_true",
@@ -1364,12 +1523,6 @@ def main() -> None:
         if base_size is None:
             return
         args.base_size = base_size
-        try:
-            quote_free = get_free(api, sec, args.recv_window, filt["quote_asset"])
-            print(f"{BOLD}{CYAN}Entry size: {args.wallet_pct:g}% of free {filt['quote_asset']}{RESET} "
-                  f"{DIM}({quote_free:,.2f} → {base_size:,.2f} USDT){RESET}")
-        except Exception:
-            print(f"{BOLD}{CYAN}Entry size: {base_size:,.2f} USDT{RESET}")
 
     # Safety: don't stack a new grid on top of existing holding/orders.
     if args.execute and not args.force:
