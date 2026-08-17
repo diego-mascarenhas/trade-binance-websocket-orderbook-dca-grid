@@ -595,6 +595,12 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "margin_ratio_soft": float(g("margin_ratio_soft", 3.0) or 3.0),
         "margin_ratio_hard": float(g("margin_ratio_hard", 5.0) or 5.0),
         "wallet_pct": wallet_pct,
+        "slot_wallet_scale": (
+            0
+            if (os.getenv("SLOT_WALLET_SCALE", "1") or "1").strip().lower()
+            in ("0", "false", "off", "no")
+            else 1
+        ),
         "min_gap": float(g("min_gap", 0.8) or 0.8),
         "so_count": int(g("so_count", 8) or 8),
         "max_trades": _max_trades(

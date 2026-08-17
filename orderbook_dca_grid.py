@@ -709,6 +709,113 @@ def get_wallet_balance(api: str, sec: str, recv: int, asset: str = "USDT") -> fl
     return 0.0
 
 
+def slot_wallet_scale_enabled(args: argparse.Namespace | None = None) -> bool:
+    """Scale WALLET_PCT by open slots (default on). Env: SLOT_WALLET_SCALE=0 to disable."""
+    if args is not None and getattr(args, "slot_wallet_scale", None) is not None:
+        return bool(args.slot_wallet_scale)
+    raw = os.getenv("SLOT_WALLET_SCALE", "1")
+    return str(raw or "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def max_trades_slots(args: argparse.Namespace | None = None) -> int:
+    """Concurrent trade slots for sizing (same source as pumpstall MAX_TRADES)."""
+    raw = os.getenv("MAX_TRADES")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1, int(float(raw)))
+        except (TypeError, ValueError):
+            pass
+    if args is not None:
+        try:
+            v = getattr(args, "max_trades", None)
+            if v is not None:
+                return max(1, int(v))
+        except (TypeError, ValueError):
+            pass
+    return 3
+
+
+def open_futures_symbol_count(
+    api: str,
+    sec: str,
+    recv: int,
+    *,
+    exclude: str | None = None,
+) -> int:
+    """How many distinct symbols currently have a non-zero futures position."""
+    rows = _signed_request("GET", "/fapi/v2/positionRisk", {}, api, sec, recv)
+    skip = (exclude or "").strip().upper()
+    syms: set[str] = set()
+    for r in rows if isinstance(rows, list) else []:
+        try:
+            amt = float(r.get("positionAmt", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if amt == 0:
+            continue
+        sym = str(r.get("symbol") or "").upper()
+        if not sym or (skip and sym == skip):
+            continue
+        syms.add(sym)
+    return len(syms)
+
+
+def slot_scaled_wallet_pct(
+    unit_pct: float,
+    open_count: int,
+    max_trades: int,
+) -> float:
+    """Front-load size when alone: pot=(unit×max) / (open+1).
+
+    Example unit=10, max=3 → pot 30%: 0 open→30%, 1→15%, 2→10%.
+    """
+    unit = max(0.0, float(unit_pct))
+    mx = max(1, int(max_trades))
+    open_n = max(0, int(open_count))
+    return (unit * mx) / max(1, open_n + 1)
+
+
+def resolve_wallet_entry_usdt(
+    args: argparse.Namespace,
+    api: str,
+    sec: str,
+    *,
+    symbol: str | None = None,
+    for_new_entry: bool = True,
+    verbose: bool = False,
+) -> float:
+    """USDT entry base from WALLET_PCT, optionally scaled by open slots."""
+    bal = get_wallet_balance(api, sec, args.recv_window)
+    unit = float(getattr(args, "wallet_pct", 10.0) or 10.0)
+    pct = unit
+    open_n = 0
+    mx = max_trades_slots(args)
+    if for_new_entry and slot_wallet_scale_enabled(args):
+        try:
+            open_n = open_futures_symbol_count(
+                api, sec, args.recv_window, exclude=symbol or getattr(args, "symbol", None),
+            )
+        except Exception:
+            open_n = 0
+        pct = slot_scaled_wallet_pct(unit, open_n, mx)
+    size = bal * pct / 100.0
+    if verbose:
+        if for_new_entry and slot_wallet_scale_enabled(args):
+            pot = unit * mx
+            print(
+                f"{BOLD}{CYAN}Entry size: {pct:g}% of wallet{RESET} "
+                f"{DIM}(slot scale · pot {pot:g}% = {unit:g}%×{mx} · "
+                f"open {open_n} → /{open_n + 1} · "
+                f"wallet {bal:,.2f} USDT → {size:,.2f} USDT){RESET}"
+            )
+        else:
+            print(
+                f"{BOLD}{CYAN}Entry size: {pct:g}% of wallet{RESET} "
+                f"{DIM}(wallet {bal:,.2f} USDT → {size:,.2f} USDT){RESET}"
+            )
+    return float(size)
+
+
 def get_max_leverage(symbol: str, api: str, sec: str, recv: int) -> int:
     """Highest initial leverage allowed for the symbol (from its leverage bracket)."""
     br = _signed_request("GET", "/fapi/v1/leverageBracket", {"symbol": symbol.upper()}, api, sec, recv)
@@ -1303,8 +1410,12 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
     base_size = args.base_size
     if base_size <= 0:
         try:
-            bal = get_wallet_balance(api, sec, args.recv_window)
-            base_size = bal * args.wallet_pct / 100.0
+            base_size = resolve_wallet_entry_usdt(
+                args, api, sec,
+                symbol=args.symbol,
+                for_new_entry=not dca_only,
+                verbose=verbose,
+            )
         except Exception as exc:
             print(f"{RED}Wallet balance read failed: {exc}{RESET}")
             return False
@@ -1555,12 +1666,15 @@ def supervise_loop(args: argparse.Namespace) -> None:
     exit_mode = resolve_exit_mode(args)
     if float(getattr(args, "base_size", 0) or 0) <= 0:
         try:
-            bal = get_wallet_balance(api, sec, args.recv_window)
-            args.base_size = bal * float(args.wallet_pct) / 100.0
+            # Preview size for partial-TP gate; treat as new-entry scale.
+            args.base_size = resolve_wallet_entry_usdt(
+                args, api, sec,
+                symbol=args.symbol,
+                for_new_entry=True,
+                verbose=True,
+            )
             print(
-                f"{BOLD}{CYAN}Entry size: {args.wallet_pct:g}% of wallet{RESET} "
-                f"{DIM}(wallet {bal:,.2f} USDT → {args.base_size:,.2f} USDT) "
-                f"· partial-TP 5× gate uses this, not live wallet{RESET}"
+                f"{DIM}· partial-TP 5× gate uses this, not live wallet{RESET}"
             )
         except Exception as exc:
             print(f"{YELLOW}Wallet size unresolved ({exc}) — partial TP uses fill/burst{RESET}")
@@ -2237,7 +2351,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--base-size", type=float, default=_env_float("BASE_SIZE", 0.0),
                    help="Base order size in USDT (0 = use --wallet-pct). Env: BASE_SIZE")
     p.add_argument("--wallet-pct", type=float, default=_env_float("WALLET_PCT", 10.0),
-                   help="Entry size as %% of wallet balance when --base-size=0. Env: WALLET_PCT")
+                   help="Unit %% of wallet for slot sizing when --base-size=0. "
+                        "With SLOT_WALLET_SCALE (default on): pot=unit×MAX_TRADES, "
+                        "entry%%=pot/(open+1). Env: WALLET_PCT")
+    p.add_argument(
+        "--slot-wallet-scale",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Scale wallet %% by open futures slots (default on). "
+             "Env: SLOT_WALLET_SCALE",
+    )
+    p.add_argument(
+        "--max-trades",
+        type=int,
+        default=None,
+        help="Slot count for wallet scaling (default MAX_TRADES env or 3)",
+    )
     p.add_argument("--comp-factor", type=float, default=1.0, help="USDT per %% band per base size (comp mode)")
     p.add_argument("--so-size", type=float, default=58.99, help="First/each DCA size (scale/flat modes)")
     p.add_argument("--volume-scale", type=float, default=1.3, help="Size multiplier per DCA (scale mode)")
@@ -2625,8 +2754,12 @@ def preview_grid_payload(
         if not api or not sec:
             return {"ok": False, "error": "API keys required to size from wallet %", "levels": []}
         try:
-            bal = get_wallet_balance(api, sec, args.recv_window)
-            args.base_size = bal * args.wallet_pct / 100.0
+            args.base_size = resolve_wallet_entry_usdt(
+                args, api, sec,
+                symbol=args.symbol,
+                for_new_entry=True,
+                verbose=False,
+            )
         except Exception as exc:
             return {"ok": False, "error": f"Wallet balance failed: {exc}", "levels": []}
 
@@ -2961,10 +3094,12 @@ def main() -> None:
             return
         if args.base_size <= 0:
             try:
-                bal = get_wallet_balance(api, sec, args.recv_window)
-                args.base_size = bal * args.wallet_pct / 100.0
-                print(f"{BOLD}{CYAN}Entry size: {args.wallet_pct:g}% of wallet{RESET} "
-                      f"{DIM}(wallet {bal:,.2f} USDT → {args.base_size:,.2f} USDT){RESET}")
+                args.base_size = resolve_wallet_entry_usdt(
+                    args, api, sec,
+                    symbol=args.symbol,
+                    for_new_entry=True,
+                    verbose=True,
+                )
             except Exception as exc:
                 print(f"{RED}Could not read wallet balance: {exc}{RESET}")
                 return

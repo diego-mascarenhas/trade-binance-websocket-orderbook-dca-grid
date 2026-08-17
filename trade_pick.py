@@ -121,6 +121,7 @@ def analyze_grid(symbol: str, api: str, sec: str) -> GridSnapshot | None:
         grid_add_notional,
         load_symbol_filters,
         prepare_orders,
+        resolve_wallet_entry_usdt,
         select_walls,
         _resolve_hedge,
     )
@@ -147,10 +148,18 @@ def analyze_grid(symbol: str, api: str, sec: str) -> GridSnapshot | None:
     base_size = args.base_size
     if base_size <= 0:
         try:
-            bal = get_wallet_balance(api, sec, args.recv_window)
-            base_size = bal * args.wallet_pct / 100.0
+            base_size = resolve_wallet_entry_usdt(
+                args, api, sec,
+                symbol=sym,
+                for_new_entry=True,
+                verbose=False,
+            )
         except Exception:
-            return None
+            try:
+                bal = get_wallet_balance(api, sec, args.recv_window)
+                base_size = bal * args.wallet_pct / 100.0
+            except Exception:
+                return None
 
     blocked = False
     levels = bids if is_long else asks
