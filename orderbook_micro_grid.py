@@ -10,7 +10,8 @@ Fib entry (default):
   3. Place FULL LIMIT grid on retraces toward ORIGIN (no chase / no ext past 1.0)
   4. On first fill → arm TP at avg ± (0.30% net + fees) + SL beyond origin
   5. If no fill before timeout / through origin → disarm and wait
-  6. When all ``--levels`` are filled and position is in profit → replace SL
+  6. When all ``--levels`` are filled **or** the position ages past
+     ``--protect-trail-max-age-h`` (default 6h), and mark is in profit → replace SL
      with TRAILING_STOP_MARKET (default on) so a pullback does not exit at a loss
   7. After flat → cooldown 1h (``--cooldown-sec``) before next arm
 
@@ -30,6 +31,7 @@ Env (optional):
   OB_MG_RAISE_TOP=1  OB_MG_RAISE_MIN_PCT=0.05
   OB_MG_TP_MODE=avg  OB_MG_TP_PCT=0.30  OB_MG_TP_FEE_PCT=0.08
   OB_MG_PROTECT_TRAIL=1  OB_MG_PROTECT_TRAIL_CALLBACK=0.2
+  OB_MG_PROTECT_TRAIL_MAX_AGE_H=6
   OB_MG_COOLDOWN_SEC=3600
   OB_MG_BASE_SIZE=10  OB_MG_LEVEL_SIZE=8  OB_MG_BAR_SEC=15
   TELEGRAM_BOT_TOKEN=  TELEGRAM_CHAT_ID=
@@ -1576,6 +1578,21 @@ def place_protect_trailing(
     return _signed_request("POST", "/fapi/v1/algoOrder", params, api, sec, recv)
 
 
+def protect_trail_max_age_h(args: argparse.Namespace) -> float:
+    """Hours open before time-based protect trail (0 = off). Default 6h."""
+    v = getattr(args, "protect_trail_max_age_h", None)
+    if v is not None:
+        return max(0.0, float(v))
+    return max(0.0, _env_float("OB_MG_PROTECT_TRAIL_MAX_AGE_H", 6.0))
+
+
+def position_age_h(state: "CycleState") -> float | None:
+    opened = float(getattr(state, "opened_at", 0.0) or 0.0)
+    if opened <= 0:
+        return None
+    return max(0.0, (time.time() - opened) / 3600.0)
+
+
 def maybe_arm_full_fill_trail(
     symbol: str,
     state: "CycleState",
@@ -1592,9 +1609,10 @@ def maybe_arm_full_fill_trail(
     recv: int,
     args: argparse.Namespace,
 ) -> bool:
-    """After all grid levels fill, arm trailing once mark profit covers the callback.
+    """Arm protect trailing when the grid is fully filled **or** max age is reached.
 
-    Returns True if trailing was newly armed (or refreshed).
+    Either trigger still requires mark profit ≥ callback (so a trail pullback
+    does not lock in a loss). Returns True if trailing was newly armed.
     """
     if not bool(getattr(args, "protect_trail", True)):
         return False
@@ -1602,7 +1620,12 @@ def maybe_arm_full_fill_trail(
         return False
     if qty <= 0 or entry <= 0:
         return False
-    if not grid_levels_complete(state, open_idxs, filled_idxs):
+
+    full_fill = grid_levels_complete(state, open_idxs, filled_idxs)
+    max_age = protect_trail_max_age_h(args)
+    age_h = position_age_h(state)
+    age_hit = max_age > 0 and age_h is not None and age_h >= max_age
+    if not full_fill and not age_hit:
         return False
 
     callback = float(getattr(args, "protect_trail_callback", 0.2) or 0.2)
@@ -1613,6 +1636,11 @@ def maybe_arm_full_fill_trail(
     )
     profit = mark_profit_pct(state.is_long, entry, mark)
     if upnl < 0 or profit < min_pct:
+        reason = "full-fill" if full_fill else f"age {age_h:.1f}h"
+        print(
+            f"{DIM}Protect trail wait · {reason} · profit {profit:+.3f}% "
+            f"(need ≥{min_pct:g}%){RESET}"
+        )
         return False
 
     # Already have our trailing on the book (e.g. restart) — adopt it.
@@ -1640,14 +1668,20 @@ def maybe_arm_full_fill_trail(
     state.trail_armed = True
     state.trail_callback = callback
     state.sl = entry  # display: trail protects toward avg
+    if full_fill:
+        why = "Full grid filled"
+        why_tag = "full_fill"
+    else:
+        why = f"Max age {age_h:.1f}h ≥ {max_age:g}h"
+        why_tag = f"max_age_{max_age:g}h"
     print(
-        f"{GREEN}✓ Full grid filled · profit {profit:+.2f}% — "
+        f"{GREEN}✓ {why} · profit {profit:+.2f}% — "
         f"SL → TRAILING cb={callback:g}% (algoId={resp.get('algoId')}){RESET}"
     )
     append_journal(
         symbol,
-        f"PROTECT_TRAIL cb={callback:g} profit={profit:.3f}% qty={qty:g} "
-        f"entry={entry:.8g} mark={mark:.8g} upnl={upnl:.4f}",
+        f"PROTECT_TRAIL reason={why_tag} cb={callback:g} profit={profit:.3f}% "
+        f"qty={qty:g} entry={entry:.8g} mark={mark:.8g} upnl={upnl:.4f}",
     )
     tg = _tg()
     if tg is not None:
@@ -2679,7 +2713,8 @@ def run(args: argparse.Namespace) -> int:
         f"{margin_hint} · "
         f"TP={args.tp_mode}+{args.tp_pct:g}%net+{args.tp_fee_pct:g}%fee · SL {args.sl_pct:g}% · "
         f"protect_trail={'ON' if args.protect_trail else 'OFF'}"
-        f"(cb={args.protect_trail_callback:g}%) · "
+        f"(cb={args.protect_trail_callback:g}% · max_age="
+        f"{protect_trail_max_age_h(args):g}h) · "
         f"cooldown={args.cooldown_sec:g}s · "
         f"sweep={'ON' if args.sweep else 'OFF'} · "
         f"dir={args.direction}{RESET}\n"
@@ -2993,13 +3028,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--protect-trail",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("OB_MG_PROTECT_TRAIL", True),
-        help="After all --levels fill, replace SL with trailing once in profit (default on)",
+        help="Replace SL with trailing once in profit after full --levels fill "
+             "or max age (default on)",
     )
     p.add_argument(
         "--protect-trail-callback",
         type=float,
         default=_env_float("OB_MG_PROTECT_TRAIL_CALLBACK", 0.2),
         help="Trailing callbackRate %% (default 0.2; also min profit before arm)",
+    )
+    p.add_argument(
+        "--protect-trail-max-age-h",
+        type=float,
+        default=None,
+        help="Hours open before arming protect trail even if grid is not full "
+             "(default 6; 0=off). Env: OB_MG_PROTECT_TRAIL_MAX_AGE_H",
     )
     p.add_argument(
         "--protect-arm-pnl-pct",

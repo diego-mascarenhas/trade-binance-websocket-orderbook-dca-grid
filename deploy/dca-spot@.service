@@ -1,5 +1,5 @@
 [Unit]
-Description=SPOT DCA autonomous supervisor (%i) — re-arm buy grid + OCO (TP+SL)
+Description=SPOT DCA autonomous supervisor (%i) — re-arm buy grid + TP (no SL by default)
 After=network-online.target
 Wants=network-online.target
 
@@ -10,7 +10,9 @@ User=forge
 # same keys as futures — the key needs "Spot & Margin Trading" permission).
 WorkingDirectory=/opt/trade-binance-websocket-orderbook-dca-grid
 # %i is the spot symbol, e.g. dca-spot@ADAUSDT. Buys DCA on real bid walls
-# (10% of free USDT by default) and maintains an OCO SELL (TP +0.5% / SL -5%).
+# (wider swing ladder; keeps DCA buys while holding until TP) + TP SELL.
+# Default: SPOT_NO_SL=1 (LIMIT_MAKER TP only). Set SPOT_NO_SL=0 for OCO+SL.
+# Defaults: SPOT_TP=1.5, SPOT_MIN_GAP=0.8, GRID_TTL=4h — override in .env.
 ExecStart=/usr/bin/python3 -u /opt/trade-binance-websocket-orderbook-dca-grid/orderbook_dca_grid_spot.py %i --supervise
 Restart=always
 RestartSec=5

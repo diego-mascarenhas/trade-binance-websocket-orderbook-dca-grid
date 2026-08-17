@@ -205,11 +205,14 @@ python3 orderbook_staged_exit.py LINKUSDT
 
 | Flag / env | Default | Description |
 |------------|---------|-------------|
-| `EXIT_MODE` | `staged` | `staged` \| `trailing` \| `structure` \| `be` \| `none` |
+| `EXIT_MODE` | `staged` | `staged` \| `trailing` \| `structure` \| `ob` \| `pullback` \| `ratchet` \| `be` \| `none` |
 | `--exit staged` | *(env default)* | Staged exit plugin |
 | `--exit trailing` | — | Trailing TP @ OB wall |
 | `--exit structure` | — | Soft-close LONG→EQH / SHORT→EQL once already green; **BE protect on by default** |
-| `--protect-be` / `--no-protect-be` | on | With `--exit structure`: arm BE SL when profit ≥ `--be-arm-pct` |
+| `--exit ob` | — | Soft-close on order-book flip (SHORT→OB Long) |
+| `--exit pullback` | — | Soft-close after adverse giveback from favorable extreme |
+| `--exit ratchet` | — | Ratchet SL to previous support/resistance as walls break |
+| `--protect-be` / `--no-protect-be` | on | BE SL addon for structure/ob/trailing/pullback (not stacked with ratchet) |
 | `--be-arm-pct` / `BE_ARM_PCT` | `1.0` | Arm BE when unrealized profit % ≥ this |
 | `--be-profit-pct` / `BE_PROFIT_PCT` | `0.3` (structure/be) / `0.1` (staged) | SL lock % from entry (no fee buffer) |
 | `--exit be` | — | BE protect only (no TP) |
@@ -228,9 +231,10 @@ python3 orderbook_staged_exit.py LINKUSDT
 ```bash
 dca ZAMAUSDT short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 \
   --partial-tp --tp-partial-pct 70 \
-  --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once
-# 70% TAKE_PROFIT @ +0.3% gross (only if notional ≥ 500 USDT) · BE @ +1% → entry+0.3%
-# · trail from +2% · TP resto = EQL
+  --post-be trail --post-be-arm-pct 1.5 --post-be-callback 0.6 --once
+# 70% TAKE_PROFIT @ +0.3% gross (only if notional ≥ 500% of entry ≈ 5× / mid-grid)
+# · auto-DCA freezes at 12×; a new ★ may place one more grid
+# · BE @ +1% → entry+0.3% · trail from +1.5% (cb 0.6%) · TP resto = EQL
 ```
 
 Add new exit strategies under `exits/` and register them in `exits/__init__.py`.
@@ -246,7 +250,7 @@ Finds 1D blow-off → stall shorts with enough **ask** walls for a SHORT DCA gri
 | One-shot table | `./pump-stall` | No |
 | Live table | `./pump-stall-watch` | No |
 | Auto-trade (strict) | `./pump-stall-watch --auto-trade` | **Yes** |
-| Early profile (TEST) | `./pump-stall-watch-early` | **Yes** (looser filters + auto-trade) |
+| Early profile (prod) | `./pump-stall-watch-early` | **Yes** (looser filters + `--trade-exit ratchet` + 5× partial TP) |
 | Early one-shot | `./pump-stall-early` | No |
 
 ```bash
@@ -266,23 +270,30 @@ python3 pump_stall_scan.py --help
 1. Keeps scanning; picks the top **`--max-trades`** ★ symbols (default **3**) by score  
 2. Slots are **only for this bot’s ★ list** — other open pairs on the account do not count  
 3. Launches:  
-   `dca SYMBOL short --exit structure --protect-be --partial-tp --tp-partial-pct 70 --be-arm-pct 1 --be-profit-pct 0.3 --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once`  
-4. Exits: **70% TP @ +0.3% gross** (only if notional ≥ **500 USDT**); **BE** at +1% → SL entry+0.3%; **trail** from +2%; resto **EQL**  
+   `dca SYMBOL short --exit structure --protect-be --partial-tp --tp-partial-pct 70 --be-arm-pct 1 --be-profit-pct 0.3 --post-be trail --post-be-arm-pct 1.5 --post-be-callback 0.6 --once`  
+4. Exits: **70% TP @ +0.3% gross** (only if notional ≥ **500% of entry** ≈ 5× / mid-grid); **BE** at +1% → SL entry+0.3%; **trail** from +1.5% (cb 0.6%); resto **EQL**  
 5. `--once` = one cycle then exit (no re-arm)  
 6. When a slot frees, rescans and may take the next best ★  
 7. Losing close → **`--loss-cooldown-min`** (default **1440 = 24h**) on that symbol (`.state/loss_cooldown.json`)
+8. Weekend block (default **on**): no new ★ from **Fri 21:00 UTC → Sun 23:00 UTC** (`PUMPSTALL_WEEKEND_BLOCK=0` to disable). Open positions are left alone.
+
+**Exit composition:** `--trade-exit ratchet` (early default) is BE floor + SL to the previous wall. A 5× partial TP (70% @ 0.3%+fees) can take profit first. `--also-structure` lets EQL/EQH close earlier so `/stats` Reason shows which condition won. CLI `--trade-exit` wins over `TRADE_EXIT` / `EXIT_MODE`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--watch` | off | Refresh table live |
 | `--auto-trade` | off | Launch trades (requires `--watch`) |
-| `--max-trades` | `3` | How many top ★ to run |
+| `--trade-exit` | `ratchet` | Primary: `ratchet` (BE+walls) · `structure` · `ob` · `pullback` |
+| `--protect-be` | on | Optional BE SL addon (ignored by ratchet, which owns BE) |
+| `--also-structure` | off | On ratchet: also allow EQL/EQH to close earlier |
+| `--max-trades` / `MAX_TRADES` | `3` | How many top ★ to run (`.env` wins after restart) |
 | `--interval` | `60` | Refresh seconds (min 15) |
 | `--ideal-near` | `92` | near% ≥ this → ★ (early profile: 90) |
 | `--loss-cooldown-min` | `1440` | Skip symbol after loss (minutes) |
-| `--post-be-arm-pct` | `2` | Arm post-BE trail at this profit % |
-| `--post-be-callback` | `0.8` | Trailing `callbackRate` % |
+| `--post-be-arm-pct` | `1.5` | Arm post-BE trail at this profit % |
+| `--post-be-callback` | `0.6` | Trailing `callbackRate` % |
 | `--why [N]` | off | Show top N blocked seeds by failing filter |
+| `PUMPSTALL_WEEKEND_BLOCK` | `1` | Env: block new ★ Fri 21:00→Sun 23:00 UTC |
 
 Trade logs: `logs/pump-stall-SYMBOL.log`. Stop one child: `dca SYMBOL stop`.
 
@@ -448,6 +459,7 @@ GRID_TTL=3600
 REARM_BACKOFF=60
 # TP1_PROFIT_PCT=0.3
 # TP_PARTIAL_PCT=70
+# PARTIAL_TP_MIN_ENTRY_PCT=500
 # TELEGRAM_MIN_OPEN_VOL=5
 # BOTCTL_MODE=auto
 # FUTURES_UNIT=dca-futures
@@ -474,7 +486,10 @@ REARM_BACKOFF=60
 | `REARM_BACKOFF` | `60` | both | Wait when flat but grid can't be armed |
 | `TP1_PROFIT_PCT` | `0.3` | futures staged | First partial trigger (%) |
 | `BE_PROFIT_PCT` | `0.1` | futures staged | Runner SL profit lock after TP1 (%) |
-| `TP_PARTIAL_PCT` | `70` | futures staged | First partial size (%) |
+| `TP_PARTIAL_PCT` | `70` | futures staged/structure | First partial size (%) |
+| `PARTIAL_TP_MIN_ENTRY_PCT` | `500` | futures structure | Arm partial when notional ≥ this % of entry (5×). Notional is qty×entry, not × leverage |
+| `PARTIAL_TP_BURST_PCT` | `2` | futures structure | Skip the 5× gate when favorable move ≥ this % (ráfaga on a 1× fill) |
+| `PARTIAL_TP_MIN_NOTIONAL` | — | futures structure | Absolute USDT override (skips entry-%) |
 | `TELEGRAM_BOT_TOKEN` | — | telegram | Bot token for alerts + remote control |
 | `TELEGRAM_CHAT_ID` | — | telegram | Allowed chat for alerts + commands |
 | `TELEGRAM_MIN_OPEN_VOL` | `5` | telegram | Min notional USDT to send `#OPEN` alert |

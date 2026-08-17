@@ -60,8 +60,22 @@ def run_once(
         return
 
     gross = profit_pct(entry, mark, side_is_long)
-    # Must already be in profit (gross > 0) and estimated net stay green.
-    in_profit = gross > 0 and estimated_net_pct(gross, fee_buf) > 0
+    # Must already be in profit; after risk-reduce, cover RR loss on the runner.
+    need = 0.0
+    try:
+        from exits.risk_reduce import recovery_pct_for
+
+        need = float(recovery_pct_for(symbol) or 0)
+    except Exception:
+        need = 0.0
+    in_profit = gross >= max(need, 0.0) and estimated_net_pct(gross, fee_buf) > 0
+    if need > 0 and gross < need:
+        side = "LONG" if side_is_long else "SHORT"
+        print(
+            f"{grid.DIM}Structure TP wait · {side} recovering RR "
+            f"(pnl={gross:+.3f}% · need ≥+{need:.2f}%){grid.RESET}"
+        )
+        return
     cfg = structure_config_from_args(args)
     try:
         snap = fetch_structure(symbol, cfg=cfg)

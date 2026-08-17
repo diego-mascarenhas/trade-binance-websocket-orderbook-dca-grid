@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""SPOT DCA grid anchored to REAL order book levels, with OCO (TP + SL) exits.
+"""SPOT DCA grid anchored to REAL order book levels, with TP exit (optional SL).
 
 Sibling of orderbook_dca_grid.py, but for Binance **Spot** (api.binance.com):
   - Spot is LONG-only: the grid places BUY LIMIT orders on real BID walls below
     the entry price to accumulate the base asset (DCA on dips).
-  - When the position is held, it maintains a single **OCO** SELL order
-    (LIMIT_MAKER take-profit above + STOP_LOSS_LIMIT stop-loss below), so one
-    leg cancels the other automatically.
+  - While holding, ``--supervise`` keeps those DCA buys visible/re-armed below
+    until the take-profit leg fills (wider defaults: TP 1.5%, min-gap 0.8%).
+  - Default exit: a single **LIMIT_MAKER** SELL take-profit (no stop-loss).
+    Opt into classic **OCO** (TP + STOP_LOSS_LIMIT) with ``--sl`` / ``SPOT_NO_SL=0``.
   - No leverage, no shorting, no hedge mode (none exist on Spot).
 
 Uses the SAME .env as the futures bot (BINANCE_API_KEY / BINANCE_SECRET_KEY);
@@ -16,9 +17,9 @@ Self-contained: Python standard library only.
 
 Usage:
     python orderbook_dca_grid_spot.py ADAUSDT --dry-run   # preview (recommended first)
-    python orderbook_dca_grid_spot.py ADAUSDT             # place grid + auto-manage OCO
-    python orderbook_dca_grid_spot.py ADAUSDT --supervise # autonomous: re-arm + OCO
-    python orderbook_dca_grid_spot.py ADAUSDT --tp-only   # only (re)place the OCO exit
+    python orderbook_dca_grid_spot.py ADAUSDT             # place grid + auto-manage TP
+    python orderbook_dca_grid_spot.py ADAUSDT --supervise # autonomous: re-arm + TP
+    python orderbook_dca_grid_spot.py ADAUSDT --tp-only   # only (re)place the exit
 """
 
 from __future__ import annotations
@@ -99,6 +100,23 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "off", "no")
+
+
+def spot_use_sl(args: argparse.Namespace) -> bool:
+    """True → OCO with STOP_LOSS_LIMIT; False → TP LIMIT_MAKER only (default)."""
+    if bool(getattr(args, "no_sl", True)):
+        return False
+    try:
+        return float(getattr(args, "sl", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 # --- HTTP ----------------------------------------------------------------
@@ -437,9 +455,14 @@ def build_fit_prepare_grid(entry: float, walls: list, base_size: float,
 def render(symbol: str, args: argparse.Namespace, orders: list[dict], entry: float, found: int) -> str:
     lines: list[str] = []
     lines.append(f"{BOLD}{CYAN}SPOT OB DCA Grid · {symbol} · {GREEN}BUY{CYAN}{RESET}")
+    exit_note = (
+        f"TP +{args.tp:g}% / SL -{args.sl:g}% from avg"
+        if spot_use_sl(args)
+        else f"TP +{args.tp:g}% (no SL)"
+    )
     lines.append(
         f"{DIM}entry {price_fmt(entry)}  ·  {found} DCA on BID walls below  ·  "
-        f"size-mode {args.size_mode}  ·  TP +{args.tp:g}% / SL -{args.sl:g}% from avg  ·  "
+        f"size-mode {args.size_mode}  ·  {exit_note}  ·  "
         f"depth {args.limit}, min-gap {args.min_gap:g}%{RESET}"
     )
     lines.append("")
@@ -463,10 +486,17 @@ def render(symbol: str, args: argparse.Namespace, orders: list[dict], entry: flo
         f"{BOLD}Full grid{RESET}  qty {qty_fmt(last['cum_qty'])}  ·  "
         f"cost {last['cum_usdt']:,.2f} USDT  ·  full-fill avg {price_fmt(last['avg'])}"
     )
-    lines.append(
-        f"{BOLD}Full-fill TP{RESET} {price_fmt(last['avg'] * (1 + args.tp / 100))} (+{args.tp:g}%)  ·  "
-        f"{BOLD}SL{RESET} {price_fmt(last['avg'] * (1 - args.sl / 100))} (-{args.sl:g}%)"
+    tp_line = (
+        f"{BOLD}Full-fill TP{RESET} {price_fmt(last['avg'] * (1 + args.tp / 100))} (+{args.tp:g}%)"
     )
+    if spot_use_sl(args):
+        tp_line += (
+            f"  ·  {BOLD}SL{RESET} {price_fmt(last['avg'] * (1 - args.sl / 100))} "
+            f"(-{args.sl:g}%)"
+        )
+    else:
+        tp_line += f"  ·  {DIM}no stop-loss{RESET}"
+    lines.append(tp_line)
     cap = f" (cap {args.so_count})" if args.so_count > 0 else ""
     lines.append(
         f"{DIM}{found} DCA detected from real bid walls{cap} "
@@ -510,9 +540,30 @@ def existing_oco_sell(symbol: str, api: str, sec: str, recv: int) -> dict | None
     return None
 
 
+def existing_tp_limit_sell(symbol: str, api: str, sec: str, recv: int) -> dict | None:
+    """Standalone SELL LIMIT / LIMIT_MAKER (not part of an OCO list)."""
+    for o in open_orders(symbol, api, sec, recv):
+        if str(o.get("side", "")).upper() != "SELL":
+            continue
+        if int(o.get("orderListId", -1) or -1) != -1:
+            continue
+        typ = str(o.get("type", "")).upper()
+        if typ in ("LIMIT", "LIMIT_MAKER"):
+            return o
+    return None
+
+
 def cancel_oco(symbol: str, order_list_id: int, api: str, sec: str, recv: int) -> None:
     _signed_request("DELETE", "/api/v3/orderList",
                     {"symbol": symbol.upper(), "orderListId": order_list_id}, api, sec, recv)
+
+
+def cancel_order(symbol: str, order_id: int, api: str, sec: str, recv: int) -> None:
+    _signed_request(
+        "DELETE", "/api/v3/order",
+        {"symbol": symbol.upper(), "orderId": int(order_id)},
+        api, sec, recv,
+    )
 
 
 def cancel_all_open_orders(symbol: str, api: str, sec: str, recv: int) -> int:
@@ -686,9 +737,113 @@ def place_oco_sell(symbol: str, qty_str: str, prices: dict, filt: dict,
     return _signed_request("POST", "/api/v3/orderList/oco", params, api, sec, recv)
 
 
+def place_tp_limit_sell(symbol: str, qty_str: str, tp_price: Decimal, filt: dict,
+                        api: str, sec: str, recv: int) -> dict:
+    """Standalone LIMIT_MAKER take-profit (no stop-loss leg)."""
+    price_dp = _dec_places(filt["tick_size"])
+    params = {
+        "symbol": symbol.upper(),
+        "side": "SELL",
+        "type": "LIMIT_MAKER",
+        "quantity": qty_str,
+        "price": f"{tp_price:.{price_dp}f}",
+    }
+    return _signed_request("POST", "/api/v3/order", params, api, sec, recv)
+
+
+def _choose_tp_price(bids: list[list[float]], asks: list[list[float]], avg: float,
+                     args: argparse.Namespace, filt: dict,
+                     grid_bottom: float | None) -> dict:
+    return choose_oco_prices(
+        bids, asks, avg, args.tp, args.sl, args.sl_buffer,
+        filt["tick_size"], args.tp_wall_min_mult, args.tp_wall_pick,
+        grid_bottom=grid_bottom,
+    )
+
+
+def manage_tp_limit_once(symbol: str, args: argparse.Namespace, filt: dict,
+                         api: str, sec: str, verbose: bool = True) -> None:
+    """Keep one LIMIT_MAKER TP sell synced to the held qty (no SL)."""
+    step = filt["step_size"]
+    qty_dp = _dec_places(step)
+    base_qty = get_total(api, sec, args.recv_window, filt["base_asset"])
+    best_bid, best_ask = best_book(symbol)
+    mid = (best_bid + best_ask) / 2
+    min_notional = float(filt["min_notional"])
+    holding_usdt = base_qty * mid
+    if holding_usdt < min_notional:
+        if verbose:
+            print(f"{DIM}No sellable position yet ({qty_fmt(base_qty)} {filt['base_asset']} "
+                  f"≈ {holding_usdt:,.2f} USDT).{RESET}")
+        return
+
+    qty_d = _round_to(base_qty, step, ROUND_DOWN)
+    qty_str = f"{qty_d:.{qty_dp}f}"
+
+    # Drop any leftover OCO (previous SL mode) so we only keep a TP limit.
+    oco = existing_oco_sell(symbol, api, sec, args.recv_window)
+    if oco:
+        try:
+            cancel_oco(symbol, int(oco.get("orderListId")), api, sec, args.recv_window)
+            print(f"{DIM}Cancelled OCO (TP-only mode — no SL){RESET}")
+        except Exception as exc:
+            print(f"{RED}Cancel OCO failed: {exc}{RESET}")
+
+    existing = existing_tp_limit_sell(symbol, api, sec, args.recv_window)
+    if existing and not oco:
+        try:
+            same_qty = abs(float(existing.get("origQty", 0) or 0) - float(qty_str)) < float(step) / 2
+        except (TypeError, ValueError):
+            same_qty = False
+        if same_qty:
+            return  # TP already covers holding — skip deep book
+
+    depth = fetch_depth(symbol, args.limit)
+    bids = [[float(p), float(q)] for p, q in depth["bids"]]
+    asks = [[float(p), float(q)] for p, q in depth["asks"]]
+    buys = [float(o.get("price", 0) or 0) for o in open_orders(symbol, api, sec, args.recv_window)
+            if str(o.get("side", "")).upper() == "BUY"]
+    grid_bottom = min(buys) if buys else None
+    avg = average_cost(symbol, float(qty_str), api, sec, args.recv_window)
+    if avg <= 0:
+        avg = mid
+    prices = _choose_tp_price(bids, asks, avg, args, filt, grid_bottom)
+    tp = float(prices["tp"])
+    if tp * float(qty_str) < min_notional:
+        if verbose:
+            print(f"{YELLOW}TP notional {tp * float(qty_str):,.2f} < minNotional "
+                  f"{min_notional:g} — raise size.{RESET}")
+        return
+
+    if existing:
+        try:
+            cancel_order(symbol, int(existing["orderId"]), api, sec, args.recv_window)
+            print(f"{DIM}Holding changed → replacing TP SELL qty {qty_str} @ {price_fmt(tp)}{RESET}")
+        except Exception as exc:
+            print(f"{RED}Cancel old TP failed: {exc}{RESET}")
+
+    try:
+        resp = place_tp_limit_sell(symbol, qty_str, prices["tp"], filt, api, sec, args.recv_window)
+        oid = resp.get("orderId")
+        tp_note = (
+            f"on {qty_fmt(prices['tp_wall_qty'])} wall"
+            if prices["tp_wall_qty"] else "profit floor"
+        )
+        print(
+            f"{GREEN}✓ TP SELL {qty_str} · {price_fmt(tp)} ({tp_note}) · "
+            f"avg {price_fmt(avg)} · no SL · orderId={oid}{RESET}"
+        )
+    except Exception as exc:
+        print(f"{RED}✗ Place TP failed: {exc}{RESET}")
+
+
 def manage_oco_once(symbol: str, args: argparse.Namespace, filt: dict,
                     api: str, sec: str, verbose: bool = True) -> None:
-    """Keep one SELL OCO (TP + SL) synced to the held base-asset quantity."""
+    """Keep exit synced: TP-only LIMIT_MAKER (default) or OCO TP+SL."""
+    if not spot_use_sl(args):
+        manage_tp_limit_once(symbol, args, filt, api, sec, verbose=verbose)
+        return
+
     step = filt["step_size"]
     qty_dp = _dec_places(step)
     # Use total (free + locked) so an active OCO doesn't look like a smaller holding.
@@ -718,6 +873,15 @@ def manage_oco_once(symbol: str, args: argparse.Namespace, filt: dict,
 
     qty_d = _round_to(base_qty, step, ROUND_DOWN)
     qty_str = f"{qty_d:.{qty_dp}f}"
+
+    # Drop standalone TP if switching into OCO mode
+    lone = existing_tp_limit_sell(symbol, api, sec, args.recv_window)
+    if lone:
+        try:
+            cancel_order(symbol, int(lone["orderId"]), api, sec, args.recv_window)
+            print(f"{DIM}Cancelled standalone TP (OCO mode){RESET}")
+        except Exception as exc:
+            print(f"{RED}Cancel TP failed: {exc}{RESET}")
 
     existing = existing_oco_sell(symbol, api, sec, args.recv_window)
     if existing:
@@ -902,7 +1066,8 @@ def rearm_grid(args: argparse.Namespace) -> bool:
     mid = (best_bid + best_ask) / 2
     held = get_total(api, sec, args.recv_window, filt["base_asset"]) * mid
     if held >= min_n:
-        print(f"{DIM}Holding detected → syncing OCO…{RESET}")
+        print(f"{DIM}Holding detected → syncing exit "
+              f"({'OCO' if spot_use_sl(args) else 'TP only'})…{RESET}")
         manage_oco_once(args.symbol, args, filt, api, sec, verbose=True)
     elif not placed:
         return False
@@ -910,6 +1075,11 @@ def rearm_grid(args: argparse.Namespace) -> bool:
 
 
 # --- Loops ---------------------------------------------------------------
+
+def _open_buy_orders(symbol: str, api: str, sec: str, recv_window: int) -> list[dict]:
+    oo = open_orders(symbol, api, sec, recv_window)
+    return [o for o in oo if str(o.get("side", "")).upper() == "BUY"]
+
 
 def supervise_loop(args: argparse.Namespace) -> None:
     api, sec = load_keys(args.env_file)
@@ -921,8 +1091,11 @@ def supervise_loop(args: argparse.Namespace) -> None:
     except Exception as exc:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
+    keep_dca = bool(getattr(args, "keep_dca", True))
+    exit_lbl = "OCO TP+SL" if spot_use_sl(args) else "TP only (no SL)"
     print(f"\n{BOLD}{CYAN}Supervising SPOT {args.symbol.upper()} "
-          f"(auto re-arm buy grid + OCO exit, poll {args.poll_sec:g}s). Ctrl+C to stop.{RESET}")
+          f"(buy grid until TP · {exit_lbl} · poll {args.poll_sec:g}s"
+          f"{'' if keep_dca else ' · keep-dca OFF'}). Ctrl+C to stop.{RESET}")
     armed_log_state: str | None = None
     try:
         while True:
@@ -932,14 +1105,39 @@ def supervise_loop(args: argparse.Namespace) -> None:
                 mid = (best_bid + best_ask) / 2
                 base_qty = get_total(api, sec, args.recv_window, filt["base_asset"])
                 holding_usdt = base_qty * mid
+                min_n = float(filt["min_notional"])
 
-                if holding_usdt >= float(filt["min_notional"]):
-                    armed_log_state = None
-                    # We hold the asset → keep the OCO (TP + SL) synced.
+                if holding_usdt >= min_n:
+                    # Holding → TP (or OCO if --sl) + keep DCA buys below until TP fills.
                     manage_oco_once(args.symbol, args, filt, api, sec, verbose=True)
+                    if keep_dca:
+                        buys = _open_buy_orders(
+                            args.symbol, api, sec, args.recv_window,
+                        )
+                        if buys:
+                            state = f"hold-dca:{len(buys)}"
+                            if state != armed_log_state:
+                                print(f"{DIM}Holding · {len(buys)} DCA buy(s) below "
+                                      f"until TP (+{args.tp:g}%)…{RESET}")
+                                armed_log_state = state
+                        else:
+                            armed_log_state = None
+                            print(f"{BOLD}Holding · no DCA buys left → "
+                                  f"placing ladder below (until TP)…{RESET}")
+                            placed = build_and_place_grid(
+                                args, api, sec, filt, verbose=True,
+                                dca_only=True, force=True,
+                            )
+                            if not placed:
+                                sleep_s = max(args.poll_sec, args.rearm_backoff)
+                                print(f"{DIM}Could not place hold-DCA "
+                                      f"(budget/cap?) → retry in {sleep_s:g}s.{RESET}")
+                    else:
+                        armed_log_state = None
                 else:
-                    oo = open_orders(args.symbol, api, sec, args.recv_window)
-                    buys = [o for o in oo if str(o.get("side", "")).upper() == "BUY"]
+                    buys = _open_buy_orders(
+                        args.symbol, api, sec, args.recv_window,
+                    )
                     if buys and args.grid_ttl > 0 and grid_age_sec(buys) >= args.grid_ttl:
                         armed_log_state = None
                         age_h = grid_age_sec(buys) / 3600
@@ -1029,7 +1227,9 @@ def parse_args() -> argparse.Namespace:
             env_file = a.split("=", 1)[1]
     load_env_file(env_file)
 
-    p = argparse.ArgumentParser(description="SPOT DCA buy-grid anchored to real order-book walls, with OCO (TP+SL) exit")
+    p = argparse.ArgumentParser(
+        description="SPOT DCA buy-grid on real order-book walls; TP exit (optional OCO SL)",
+    )
     p.add_argument("symbol", help="Spot symbol, e.g. ADAUSDT")
     p.add_argument("--price", type=float, default=None, help="Entry price (default: live mid)")
     p.add_argument("--so-count", type=int, default=_env_int("SO_MAX", 15),
@@ -1038,10 +1238,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--so-wall-mult", type=float, default=_env_float("SO_WALL_MULT", 2.0),
                    help="A bid level counts as a wall (DCA) if its size ≥ this × median book size. Env: SO_WALL_MULT")
     p.add_argument("--limit", type=int, default=5000, help="Order book depth to fetch (deep = reaches walls on pricey/liquid coins)")
-    p.add_argument("--min-gap", type=float, default=0.2,
-                   help="Min %% spacing between chosen walls (lower = more DCA on dense books like BTC/ETH)")
+    p.add_argument("--min-gap", type=float, default=_env_float("SPOT_MIN_GAP", 0.8),
+                   help="Min %% spacing between chosen walls (higher = wider swing ladder). "
+                        "Env: SPOT_MIN_GAP")
     p.add_argument("--min-dist", type=float, default=0.1, help="Min %% distance of first wall from entry")
-    p.add_argument("--max-range", type=float, default=15.0, help="Only DCA walls within this %% of entry (0=off)")
+    p.add_argument("--max-range", type=float, default=_env_float("SPOT_MAX_RANGE", 15.0),
+                   help="Only DCA walls within this %% of entry (0=off). Env: SPOT_MAX_RANGE")
     p.add_argument("--size-mode", choices=["comp", "wall", "scale", "flat"], default="comp",
                    help="comp=distance compensation, wall=∝ wall liquidity, scale=geometric, flat=equal")
     p.add_argument("--base-size", type=float, default=_env_float("BASE_SIZE", 0.0),
@@ -1054,12 +1256,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--comp-factor", type=float, default=1.0, help="USDT per %% band per base size (comp mode)")
     p.add_argument("--so-size", type=float, default=58.99, help="First/each DCA size (scale/flat modes)")
     p.add_argument("--volume-scale", type=float, default=1.3, help="Size multiplier per DCA (scale mode)")
-    p.add_argument("--tp", type=float, default=_env_float("SPOT_TP", 0.5),
-                   help="Min take-profit %% above avg (profit floor; TP anchors to an ask wall at/above it). Env: SPOT_TP")
+    p.add_argument("--tp", type=float, default=_env_float("SPOT_TP", 1.5),
+                   help="Min take-profit %% above avg (profit floor; TP anchors to an ask wall at/above it). "
+                        "Default 1.5 so spot rounds clear fees. Env: SPOT_TP")
+    p.add_argument(
+        "--with-sl",
+        action="store_true",
+        help="Enable OCO stop-loss (default off: TP LIMIT_MAKER only). "
+             "Also enabled when SPOT_NO_SL=0 in .env.",
+    )
     p.add_argument("--sl", type=float, default=_env_float("SPOT_SL", 5.0),
-                   help="Fallback stop-loss %% below avg when the grid is fully filled (no open DCA). Env: SPOT_SL")
+                   help="With SL enabled: fallback stop %% below avg when grid is fully filled. Env: SPOT_SL")
     p.add_argument("--sl-buffer", type=float, default=_env_float("SPOT_SL_BUFFER", 0.5),
-                   help="Extra %% below the deepest DCA (grid bottom) for the stop trigger. Env: SPOT_SL_BUFFER")
+                   help="With SL enabled: extra %% below deepest DCA for the stop trigger. Env: SPOT_SL_BUFFER")
     p.add_argument("--tp-wall-min-mult", type=float, default=3.0,
                    help="Min wall size vs median book qty to count as a wall for TP/SL anchoring")
     p.add_argument("--tp-wall-pick", choices=["nearest", "strongest"], default="nearest",
@@ -1082,15 +1291,24 @@ def parse_args() -> argparse.Namespace:
                    help="Cancel open orders; DCA-only + OCO if holding, full grid if flat")
     p.add_argument("--rearm-flat", action="store_true",
                    help="With --rearm: market-sell the holding first so the symbol starts flat")
-    p.add_argument("--supervise", action="store_true", help="Autonomous: re-arm grid when flat + manage OCO (loop)")
+    p.add_argument("--supervise", action="store_true",
+                   help="Autonomous: keep buy grid until TP + manage OCO (loop)")
+    p.add_argument("--keep-dca", action=argparse.BooleanOptionalAction, default=True,
+                   help="While holding, keep/re-place DCA buys below until TP hits "
+                        "(default on). Use --no-keep-dca for old OCO-only behaviour.")
     p.add_argument("--poll-sec", type=float, default=5.0, help="Position/OCO re-sync interval")
     p.add_argument("--rearm-backoff", type=float, default=_env_float("REARM_BACKOFF", 60.0),
                    help="When flat but a grid can't be armed, wait this long before retrying. Env: REARM_BACKOFF")
-    p.add_argument("--grid-ttl", type=float, default=_env_float("GRID_TTL", 3600.0),
+    p.add_argument("--grid-ttl", type=float, default=_env_float("GRID_TTL", 14400.0),
                    help="Refresh a flat armed grid after this many seconds (cancel + re-arm). "
-                        "0=off. Default 1h. Env: GRID_TTL")
+                        "0=off. Default 4h. Does not cancel DCA while holding. Env: GRID_TTL")
     args = p.parse_args()
     args.execute = not args.dry_run
+    # Default: no SL. --with-sl or SPOT_NO_SL=0 enables OCO stop-loss.
+    if args.with_sl:
+        args.no_sl = False
+    else:
+        args.no_sl = _env_bool("SPOT_NO_SL", True)
     return args
 
 

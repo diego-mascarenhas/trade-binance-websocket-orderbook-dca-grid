@@ -62,7 +62,7 @@ fib SYMBOL
 | Leverage | symbol **max** | Unless `--set-leverage` / `--no-max-leverage` |
 | TP | `avg` + **0.30% net** (+0.08% fees) | Refreshed from live avg on every DCA |
 | SL | `0.50%` / Fib origin | Fixed until protect trail |
-| Protect trail | **ON** | After full fill + profit ≥ callback |
+| Protect trail | **ON** | After full fill **or** 6h open + profit ≥ callback |
 | Cooldown | **3600 s (1h)** | After flat before next arm |
 | Direction | `auto` | 15s order-book signal |
 
@@ -169,8 +169,9 @@ fib LTCUSDT --cooldown-sec 300
 | `--tp-pct` | `0.30` | **Net** take-profit % from average (after fees) |
 | `--tp-fee-pct` | `0.08` | Round-trip fee % added on top of `--tp-pct` (gross ≈ 0.38%) |
 | `--sl-pct` | `0.50` | SL % from entry/mark |
-| `--protect-trail` / `--no-protect-trail` | **on** | Full `--levels` filled + in profit → trailing SL |
+| `--protect-trail` / `--no-protect-trail` | **on** | Full `--levels` filled **or** max age + in profit → trailing SL |
 | `--protect-trail-callback` | `0.2` | Trailing `callbackRate` % (also min profit before arm) |
+| `--protect-trail-max-age-h` | `6` | Hours open before time-based trail (even if grid not full; `0`=off) |
 | `--protect-arm-pnl-pct` | `0` | Extra min mark profit % (effective min = max(this, callback)) |
 | `--sweep` / `--no-sweep` | off | Re-place filled rung further (barrido) |
 

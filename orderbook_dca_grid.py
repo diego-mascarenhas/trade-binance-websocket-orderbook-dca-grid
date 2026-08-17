@@ -818,12 +818,58 @@ def liq_distance_pct(amt: float, mark: float, liq_price: float) -> float | None:
 
 
 def account_margin_snapshot(api: str, sec: str, recv: int) -> dict[str, float]:
+    """Futures account margin snapshot.
+
+    ``margin_ratio_pct`` matches the Binance UI: maint / equity × 100
+    (liquidation approaches 100%).
+    """
     acc = _signed_request("GET", "/fapi/v2/account", {}, api, sec, recv)
+    margin_balance = float(acc.get("totalMarginBalance", 0) or 0)
+    maint = float(acc.get("totalMaintMargin", 0) or 0)
+    ratio = (maint / margin_balance * 100.0) if margin_balance > 0 else 0.0
     return {
-        "margin_balance": float(acc.get("totalMarginBalance", 0) or 0),
+        "margin_balance": margin_balance,
         "initial_margin": float(acc.get("totalInitialMargin", 0) or 0),
         "available": float(acc.get("availableBalance", 0) or 0),
+        "maint_margin": maint,
+        "margin_ratio_pct": ratio,
     }
+
+
+def get_margin_ratio_pct(api: str, sec: str, recv: int) -> float | None:
+    """Binance UI margin ratio %%, or None if the account cannot be read."""
+    try:
+        return float(account_margin_snapshot(api, sec, recv)["margin_ratio_pct"])
+    except Exception:
+        return None
+
+
+def account_margin_ratio_blocks(
+    args: argparse.Namespace, api: str, sec: str, verbose: bool = True,
+) -> bool:
+    """True if Binance margin ratio ≥ --margin-ratio-soft (block new grids / ★)."""
+    soft = float(getattr(args, "margin_ratio_soft", 0) or 0)
+    if soft <= 0:
+        return False
+    try:
+        ratio = get_margin_ratio_pct(api, sec, args.recv_window)
+    except Exception as exc:
+        if verbose:
+            print(f"{YELLOW}Could not read margin ratio ({exc}); skipping.{RESET}")
+        return False
+    if ratio is None:
+        return False
+    if ratio < soft:
+        return False
+    if verbose:
+        if getattr(args, "force", False):
+            print(f"{YELLOW}Margin ratio {ratio:.2f}% ≥ soft {soft:g}% "
+                  f"— continuing due to --force.{RESET}")
+        else:
+            print(f"{RED}Margin ratio {ratio:.2f}% ≥ soft {soft:g}% "
+                  f"— skipping new grid / entries "
+                  f"(hard strip DCA at --margin-ratio-hard).{RESET}")
+    return not getattr(args, "force", False)
 
 
 def account_liq_distance_blocks(
@@ -948,6 +994,8 @@ def account_risk_blocks(
     lev = leverage if leverage and leverage > 0 else getattr(args, "leverage", 10.0)
     if account_imbalance_blocks(args, is_long, add_notional, api, sec, verbose):
         return True
+    if account_margin_ratio_blocks(args, api, sec, verbose):
+        return True
     if account_liq_distance_blocks(args, api, sec, verbose):
         return True
     if account_margin_blocks(args, add_notional, lev, api, sec, verbose):
@@ -966,9 +1014,10 @@ def get_position(symbol: str, is_long: bool, hedge: bool, api: str, sec: str, re
 def get_position_meta(
     symbol: str, is_long: bool, hedge: bool, api: str, sec: str, recv: int,
 ) -> dict[str, float | int]:
-    """Return qty, entry, notional (USDT), leverage for the open position side."""
+    """Return qty, entry, mark, notional (USDT), leverage for the open position side."""
     empty: dict[str, float | int] = {
-        "qty": 0.0, "entry": 0.0, "notional": 0.0, "leverage": 0, "unrealized_pnl": 0.0,
+        "qty": 0.0, "entry": 0.0, "mark": 0.0, "notional": 0.0,
+        "leverage": 0, "unrealized_pnl": 0.0,
     }
     rows = _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol.upper()}, api, sec, recv)
     want_side = ("LONG" if is_long else "SHORT") if hedge else "BOTH"
@@ -989,6 +1038,7 @@ def get_position_meta(
         return {
             "qty": abs(amt),
             "entry": entry,
+            "mark": mark,
             "notional": notional,
             "leverage": lev,
             "unrealized_pnl": float(r.get("unRealizedProfit", 0) or 0),
@@ -1214,6 +1264,41 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
     if gate_price_blocks(getattr(args, "gate_price", None), is_long, mid, verbose=verbose):
         return False
 
+    # ATH entry gate (SHORT): block new opens within RISK_ATH_ENTRY_MIN_GAP_PCT of ATH.
+    # Skip on dca_only re-arms — position already exists.
+    if not dca_only and not is_long:
+        try:
+            from exits.risk_reduce import entry_blocked_near_ath
+
+            blocked, why = entry_blocked_near_ath(args.symbol, mid, args)
+            if blocked:
+                if verbose:
+                    print(
+                        f"{YELLOW}ATH entry gate — skip arm {args.symbol.upper()}: "
+                        f"{why}{RESET}"
+                    )
+                return False
+        except Exception as exc:
+            if verbose:
+                print(f"{DIM}ATH entry gate check skipped: {exc}{RESET}")
+
+    # Funding guard: skip new opens when we would pay expensive funding this window.
+    if not dca_only:
+        try:
+            from exits.funding import entry_blocked_by_funding
+
+            blocked, why = entry_blocked_by_funding(args.symbol, is_long, args)
+            if blocked:
+                if verbose:
+                    print(
+                        f"{YELLOW}Funding gate — skip arm {args.symbol.upper()}: "
+                        f"{why}{RESET}"
+                    )
+                return False
+        except Exception as exc:
+            if verbose:
+                print(f"{DIM}Funding gate check skipped: {exc}{RESET}")
+
     entry = args.price if args.price is not None else mid
     base_size = args.base_size
     if base_size <= 0:
@@ -1223,8 +1308,24 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
         except Exception as exc:
             print(f"{RED}Wallet balance read failed: {exc}{RESET}")
             return False
+        if base_size > 0:
+            args.base_size = float(base_size)
+
+    try:
+        from size_boost import apply_boost
+
+        base_size, boost_mult = apply_boost(args.symbol, base_size)
+        if boost_mult is not None and verbose:
+            print(
+                f"{BOLD}{CYAN}Size boost {boost_mult:g}×{RESET} "
+                f"{DIM}→ entry {base_size:,.2f} USDT "
+                f"(.state/boost/{args.symbol.upper()}.json){RESET}"
+            )
+    except Exception:
+        pass
 
     prev_force = args.force
+    star_bypass = False
     if force:
         args.force = True
     try:
@@ -1238,6 +1339,59 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
                             args.comp_factor, args.so_size, args.volume_scale)
         if dca_only:
             orders = orders[1:]
+            if not orders:
+                print(f"{RED}No DCA levels to place.{RESET}")
+                return False
+            try:
+                from exits.partial_tp import (
+                    dca_adds_blocked,
+                    dca_cap_threshold,
+                    position_notional,
+                    trim_orders_to_dca_cap,
+                )
+                import star_rearm as sr
+
+                side_now, qty_now, entry_now = _detect_open_side(
+                    args.symbol, _resolve_hedge(args, api, sec),
+                    api, sec, args.recv_window,
+                )
+                star_bypass = sr.pending(args.symbol)
+                blocked, why = dca_adds_blocked(
+                    args.symbol, args, qty_now, entry_now,
+                    api=api, sec=sec, recv=args.recv_window,
+                )
+                if blocked:
+                    if verbose:
+                        print(f"{YELLOW}DCA cap — skip re-arm: {why}{RESET}")
+                    return False
+                if star_bypass:
+                    if verbose:
+                        print(
+                            f"{BOLD}{CYAN}★ re-arm — one more grid "
+                            f"(bypass 12× cap){RESET}"
+                        )
+                else:
+                    cap, label = dca_cap_threshold(
+                        args, api=api, sec=sec, recv=args.recv_window,
+                    )
+                    current = position_notional(qty_now, entry_now)
+                    before = len(orders)
+                    orders = trim_orders_to_dca_cap(orders, current, cap)
+                    if not orders:
+                        if verbose:
+                            print(
+                                f"{YELLOW}DCA cap — no room under {label} "
+                                f"(position {current:,.0f} USDT){RESET}"
+                            )
+                        return False
+                    if len(orders) < before and verbose:
+                        print(
+                            f"{DIM}DCA cap · trimmed {before}→{len(orders)} "
+                            f"(room {cap - current:,.0f} USDT of {label}){RESET}"
+                        )
+            except Exception as exc:
+                if verbose:
+                    print(f"{DIM}DCA cap check skipped: {exc}{RESET}")
             if not orders:
                 print(f"{RED}No DCA levels to place.{RESET}")
                 return False
@@ -1258,7 +1412,16 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
         args.force = prev_force
 
     prepared = prepare_orders(orders, args.symbol, is_long, filt)
-    return place_orders(args.symbol, is_long, prepared, args, force=force, dca_only=dca_only)
+    placed = place_orders(args.symbol, is_long, prepared, args, force=force, dca_only=dca_only)
+    if placed and star_bypass:
+        try:
+            import star_rearm as sr
+
+            sr.consume(args.symbol)
+            sr.mark_grid_active(args.symbol)
+        except Exception:
+            pass
+    return placed
 
 
 def market_close_position(symbol: str, is_long: bool, qty: float, hedge: bool,
@@ -1374,6 +1537,9 @@ def supervise_loop(args: argparse.Namespace) -> None:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
     from exits import (
+        EXIT_OB,
+        EXIT_PULLBACK,
+        EXIT_RATCHET,
         EXIT_STAGED,
         EXIT_STRUCTURE,
         clear_exit_presets,
@@ -1387,6 +1553,17 @@ def supervise_loop(args: argparse.Namespace) -> None:
 
     hedge = _resolve_hedge(args, api, sec)
     exit_mode = resolve_exit_mode(args)
+    if float(getattr(args, "base_size", 0) or 0) <= 0:
+        try:
+            bal = get_wallet_balance(api, sec, args.recv_window)
+            args.base_size = bal * float(args.wallet_pct) / 100.0
+            print(
+                f"{BOLD}{CYAN}Entry size: {args.wallet_pct:g}% of wallet{RESET} "
+                f"{DIM}(wallet {bal:,.2f} USDT → {args.base_size:,.2f} USDT) "
+                f"· partial-TP 5× gate uses this, not live wallet{RESET}"
+            )
+        except Exception as exc:
+            print(f"{YELLOW}Wallet size unresolved ({exc}) — partial TP uses fill/burst{RESET}")
     ttl_note = f", grid refresh {args.grid_ttl:g}s" if args.grid_ttl > 0 else ""
     gate = getattr(args, "gate_price", None)
     gate_note = ""
@@ -1399,9 +1576,14 @@ def supervise_loop(args: argparse.Namespace) -> None:
             gate_note = f", gate {float(gate):g} (long mid< · short mid>)"
     once = bool(getattr(args, "once", False))
     once_note = ", once (no re-arm after close)" if once else ""
+    soft_mr = float(getattr(args, "margin_ratio_soft", 0) or 0)
+    hard_mr = float(getattr(args, "margin_ratio_hard", 0) or 0)
+    mr_note = ""
+    if soft_mr > 0 or hard_mr > 0:
+        mr_note = f", margin soft {soft_mr:g}% / hard {hard_mr:g}%"
     print(f"\n{BOLD}{CYAN}Supervising {args.symbol.upper()} "
           f"(auto re-arm grid + exit: {exit_mode_label(exit_mode)}, poll {args.tp_poll_sec:g}s"
-          f"{ttl_note}{gate_note}{once_note}). "
+          f"{ttl_note}{gate_note}{once_note}{mr_note}). "
           f"Ctrl+C to stop.{RESET}")
     import telegram_notify as telegram
     import trade_sounds
@@ -1413,6 +1595,13 @@ def supervise_loop(args: argparse.Namespace) -> None:
     dca_missing_retry_at: float = 0.0
     exit_preset_armed: bool = False
     seen_position = False  # --once: true after any open qty this cycle
+    # --once flat: stop after N failed arms so pump-stall slots don't stick forever
+    # (e.g. imbalance / margin blocks). Env: ONCE_MAX_ARM_FAILS (default 5).
+    once_max_arm_fails = max(0, int(_env_float("ONCE_MAX_ARM_FAILS", 5.0)))
+    once_arm_fails = 0
+    margin_dca_frozen = False  # True after hard strip until ratio < hard
+    dca_size_frozen = False  # True after 12× (or custom) size cap / partial TP
+    last_mr_log: str | None = None
     sym = args.symbol.upper()
     try:
         while True:
@@ -1450,6 +1639,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             vol_usdt=notional,
                             leverage=lev,
                             pnl_usdt=pnl,
+                            mark=float(pos_meta.get("mark", 0) or 0),
                         )
                         trade_sounds.play_sound("dca")
                     last_position_qty = qty
@@ -1483,10 +1673,111 @@ def supervise_loop(args: argparse.Namespace) -> None:
                         ) or []
                     except Exception:
                         oo_pos = []
+                    try:
+                        import star_rearm as sr
+
+                        sr.note_grid_empty(sym, count_dca_orders(oo_pos, sym) > 0)
+                    except Exception:
+                        pass
+
+                    # Account Margin Ratio (Binance UI): hard → strip DCA; below hard → re-arm.
+                    ratio_now: float | None = None
+                    if hard_mr > 0:
+                        ratio_now = get_margin_ratio_pct(api, sec, args.recv_window)
+                        if ratio_now is not None:
+                            mr_state = (
+                                f"hard:{ratio_now:.2f}" if ratio_now >= hard_mr
+                                else f"ok:{ratio_now:.2f}"
+                            )
+                            if ratio_now >= hard_mr:
+                                n_dca = count_dca_orders(oo_pos, sym)
+                                if n_dca > 0:
+                                    print(
+                                        f"{YELLOW}Margin ratio {ratio_now:.2f}% ≥ hard "
+                                        f"{hard_mr:g}% → cancelling {n_dca} DCA "
+                                        f"limit(s) (TP/BE/trail kept)…{RESET}"
+                                    )
+                                    cancel_dca_grid_orders(
+                                        sym, api, sec, args.recv_window,
+                                    )
+                                    try:
+                                        oo_pos = _signed_request(
+                                            "GET", "/fapi/v1/openOrders",
+                                            {"symbol": sym}, api, sec, args.recv_window,
+                                        ) or []
+                                    except Exception:
+                                        oo_pos = []
+                                elif not margin_dca_frozen and mr_state != last_mr_log:
+                                    print(
+                                        f"{DIM}Margin ratio {ratio_now:.2f}% ≥ hard "
+                                        f"{hard_mr:g}% · DCA frozen "
+                                        f"(no re-arm){RESET}"
+                                    )
+                                margin_dca_frozen = True
+                            elif margin_dca_frozen:
+                                print(
+                                    f"{GREEN}Margin ratio {ratio_now:.2f}% < hard "
+                                    f"{hard_mr:g}% → thaw DCA re-arm{RESET}"
+                                )
+                                margin_dca_frozen = False
+                                dca_missing_retry_at = 0.0
+                            last_mr_log = mr_state
+
+                    dca_blocked = margin_dca_frozen or (
+                        hard_mr > 0 and ratio_now is not None and ratio_now >= hard_mr
+                    )
+                    size_why = ""
+                    try:
+                        from exits.partial_tp import dca_adds_blocked
+
+                        size_capped, size_why = dca_adds_blocked(
+                            sym, args, qty, entry,
+                            api=api, sec=sec, recv=args.recv_window,
+                        )
+                    except Exception:
+                        size_capped, size_why = False, ""
+                    if size_capped:
+                        n_cap = count_dca_orders(oo_pos, sym)
+                        if n_cap > 0:
+                            print(
+                                f"{YELLOW}DCA size cap · {size_why} → "
+                                f"cancelling {n_cap} leftover limit(s) "
+                                f"(TP/BE/trail kept)…{RESET}"
+                            )
+                            cancel_dca_grid_orders(
+                                sym, api, sec, args.recv_window,
+                            )
+                            try:
+                                oo_pos = _signed_request(
+                                    "GET", "/fapi/v1/openOrders",
+                                    {"symbol": sym}, api, sec, args.recv_window,
+                                ) or []
+                            except Exception:
+                                oo_pos = []
+                        elif not dca_size_frozen:
+                            print(
+                                f"{DIM}DCA size cap · {size_why} · "
+                                f"no more adds{RESET}"
+                            )
+                        dca_size_frozen = True
+                    elif dca_size_frozen:
+                        print(f"{GREEN}DCA size cap cleared → thaw re-arm{RESET}")
+                        dca_size_frozen = False
+                        dca_missing_retry_at = 0.0
+                    dca_blocked = dca_blocked or size_capped
+                    risk_rearm_ok = True
+                    try:
+                        from exits.risk_reduce import allow_dca_rearm as _risk_rearm_ok
+
+                        risk_rearm_ok = _risk_rearm_ok(sym)
+                    except Exception:
+                        risk_rearm_ok = True
                     if (
-                        count_dca_orders(oo_pos, sym) == 0
+                        not dca_blocked
+                        and count_dca_orders(oo_pos, sym) == 0
                         and time.time() >= dca_missing_retry_at
                         and (exit_mode != EXIT_STAGED or dca_rearm_allowed(sym))
+                        and risk_rearm_ok
                     ):
                         print(f"{YELLOW}Position open, no DCA grid → DCA-only re-arm…{RESET}")
                         placed = build_and_place_grid(
@@ -1519,9 +1810,32 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             sym, api, sec, args.recv_window,
                         )
                         close_reason = None
-                        if exit_mode == EXIT_STRUCTURE:
+                        try:
+                            from exits.funding import pop_close_reason as pop_fund_reason
+
+                            close_reason = pop_fund_reason(sym)
+                        except Exception:
+                            close_reason = None
+                        if not close_reason and exit_mode == EXIT_STRUCTURE:
                             close_reason = pop_close_reason(sym)
-                        elif after_runner:
+                        elif not close_reason and exit_mode == EXIT_OB:
+                            from exits.ob_long import pop_close_reason as pop_ob_reason
+                            close_reason = pop_ob_reason(sym)
+                        elif not close_reason and exit_mode == EXIT_PULLBACK:
+                            from exits.pullback import pop_close_reason as pop_pb_reason
+                            close_reason = pop_pb_reason(sym)
+                        elif not close_reason and exit_mode == EXIT_RATCHET:
+                            from exits.structure import pop_close_reason as pop_st_reason
+                            from exits.ratchet import pop_close_reason as pop_rt_reason
+                            import orderbook_staged_exit as staged
+
+                            close_reason = pop_st_reason(sym) or pop_rt_reason(sym) or "ratchet SL"
+                            try:
+                                if bool((staged.load_state(sym) or {}).get("partial_tp_filled")):
+                                    close_reason = f"{close_reason} · after partial TP"
+                            except Exception:
+                                pass
+                        elif not close_reason and after_runner:
                             close_reason = "runner / trail"
                         close_pnl = float(last_pos_meta.get("unrealized_pnl", 0) or 0)
                         telegram.notify_position_closed(
@@ -1530,7 +1844,10 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             vol_usdt=float(last_pos_meta.get("notional", 0) or 0),
                             leverage=lev,
                             pnl_usdt=close_pnl,
+                            entry=float(last_pos_meta.get("entry", 0) or 0),
+                            mark=float(last_pos_meta.get("mark", 0) or 0),
                             reason=close_reason,
+                            exit_mode=exit_mode,
                         )
                         trade_sounds.play_close_sound(close_pnl)
                         cd_min = float(getattr(args, "loss_cooldown_min", 0) or 0)
@@ -1550,6 +1867,15 @@ def supervise_loop(args: argparse.Namespace) -> None:
                     elif exit_mode == EXIT_STRUCTURE:
                         # Drop stale reason if we somehow flattened without notifying.
                         pop_close_reason(sym)
+                    elif exit_mode == EXIT_OB:
+                        from exits.ob_long import pop_close_reason as pop_ob_reason
+                        pop_ob_reason(sym)
+                    elif exit_mode == EXIT_PULLBACK:
+                        from exits.pullback import pop_close_reason as pop_pb_reason
+                        pop_pb_reason(sym)
+                    elif exit_mode == EXIT_RATCHET:
+                        from exits.ratchet import pop_close_reason as pop_rt_reason
+                        pop_rt_reason(sym)
                     last_position_qty = 0.0
                     last_direction = None
                     last_pos_meta = {}
@@ -1595,7 +1921,21 @@ def supervise_loop(args: argparse.Namespace) -> None:
                                 leverage=get_symbol_leverage(sym, api, sec, args.recv_window),
                                 pnl_usdt=float(pos_chk.get("unrealized_pnl", 0) or 0),
                             )
-                            if exit_mode != EXIT_STAGED or dca_rearm_allowed(sym):
+                            orphan_ok = exit_mode != EXIT_STAGED or dca_rearm_allowed(sym)
+                            if orphan_ok:
+                                try:
+                                    from exits.partial_tp import dca_adds_blocked
+
+                                    blocked, why = dca_adds_blocked(
+                                        sym, args, qty_chk, entry_chk,
+                                        api=api, sec=sec, recv=args.recv_window,
+                                    )
+                                    if blocked:
+                                        print(f"{YELLOW}DCA cap — skip orphan re-arm: {why}{RESET}")
+                                        orphan_ok = False
+                                except Exception:
+                                    pass
+                            if orphan_ok:
                                 placed = build_and_place_grid(
                                     args, api, sec, filt, verbose=True,
                                     dca_only=True, force=True,
@@ -1728,6 +2068,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             print(f"{BOLD}Flat and no orders → re-arming grid…{RESET}")
                             placed = build_and_place_grid(args, api, sec, filt, verbose=True)
                             if placed:
+                                once_arm_fails = 0
                                 oo_new = _signed_request(
                                     "GET", "/fapi/v1/openOrders", {"symbol": sym}, api, sec, args.recv_window,
                                 ) or []
@@ -1745,8 +2086,20 @@ def supervise_loop(args: argparse.Namespace) -> None:
                                     leverage=lev,
                                 )
                             elif not placed:
+                                once_arm_fails += 1
                                 sleep_s = max(args.tp_poll_sec, args.rearm_backoff)
                                 print(f"{DIM}Could not arm grid → retrying in {sleep_s:g}s.{RESET}")
+                                if (
+                                    once
+                                    and not seen_position
+                                    and once_max_arm_fails > 0
+                                    and once_arm_fails >= once_max_arm_fails
+                                ):
+                                    print(
+                                        f"{BOLD}{YELLOW}--once: {once_arm_fails} failed arm(s) "
+                                        f"without a fill → stopping (free slot).{RESET}",
+                                    )
+                                    return
             except Exception as exc:
                 print(f"{RED}Supervisor pass error: {exc}{RESET}")
                 telegram.notify_supervisor_error(sym, str(exc))
@@ -1850,6 +2203,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-margin-pct", type=float, default=_env_float("MAX_MARGIN_PCT", 50.0),
                    help="Skip new grid if projected initial margin / balance exceeds this %% "
                         "(0=off). Env: MAX_MARGIN_PCT")
+    p.add_argument("--margin-ratio-soft", type=float,
+                   default=_env_float("MARGIN_RATIO_SOFT", 3.0),
+                   help="Binance Margin Ratio %% (maint/equity). ≥ this → no new grids / ★ "
+                        "(default 3; 0=off). Env: MARGIN_RATIO_SOFT")
+    p.add_argument("--margin-ratio-hard", type=float,
+                   default=_env_float("MARGIN_RATIO_HARD", 5.0),
+                   help="Binance Margin Ratio %%. ≥ this → cancel open DCA limits (keep TP/BE/trail); "
+                        "when it drops back below, re-arm DCA (default 5; 0=off). "
+                        "Env: MARGIN_RATIO_HARD")
     p.add_argument("--min-liq-distance-pct", type=float, default=_env_float("MIN_LIQ_DISTANCE_PCT", 20.0),
                    help="Skip new grid if any open position is closer to liquidation than this %% "
                         "(0=off). Env: MIN_LIQ_DISTANCE_PCT")
@@ -1901,63 +2263,253 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Exit strategy (plugins in exits/ — default staged TP1 + trail)
     p.add_argument(
         "--exit", dest="exit_mode",
-        choices=["trailing", "staged", "structure", "be", "none"],
+        choices=[
+            "trailing", "staged", "structure", "be", "ob",
+            "pullback", "ratchet", "none",
+        ],
         default=None,
-        help="Exit strategy: trailing | staged | structure (TP=EQH/EQL; BE protect on by default) "
-             "| be (protect only, no TP) | none (default: staged; EXIT_MODE env)",
+        help="Primary exit: trailing | staged | structure (EQL/EQH) | ob (OB flip) "
+             "| pullback (giveback from extreme) | ratchet (SL→prev wall) "
+             "| be (BE only) | none. BE addon via --protect-be (not stacked with ratchet). "
+             "Default: staged (EXIT_MODE env)",
     )
     p.add_argument("--no-tp", action="store_true",
                    help="Legacy alias for --exit none (skip automatic exit management)")
     p.add_argument("--tp1-profit-pct", type=float, default=None,
-                   help="[--exit staged|structure] Partial TP profit %% from entry (gross). "
+                   help="[--exit staged|structure] Partial TP net profit %% from entry "
+                        "(fees added via --tp-fee-buffer). "
                         "With --exit structure default 0.3. Env: TP1_PROFIT_PCT")
     p.add_argument(
         "--partial-tp",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="[--exit structure] Arm TAKE_PROFIT on --tp-partial-pct when notional "
-             "≥ --partial-tp-min-notional (default on). Use --no-partial-tp to disable",
+        help="[--exit structure|ratchet] Arm TAKE_PROFIT on --tp-partial-pct when position "
+             "notional ≥ --partial-tp-min-entry-pct of entry (default on). "
+             "Use --no-partial-tp to disable",
+    )
+    p.add_argument(
+        "--partial-tp-min-entry-pct",
+        type=float,
+        default=None,
+        help="[--exit structure|ratchet] Arm partial TP when position notional ≥ this %% of "
+             "entry base size (default 500 = 5× entry, ~mid-grid). "
+             "Env: PARTIAL_TP_MIN_ENTRY_PCT",
+    )
+    p.add_argument(
+        "--dca-max-entry-pct",
+        type=float,
+        default=None,
+        help="Cancel leftover DCA and skip auto re-arm when filled notional ≥ this %% of "
+             "entry base (default 1200 = 12×). A new ★ may place one more grid. "
+             "0 = unlimited. Env: DCA_MAX_ENTRY_PCT",
     )
     p.add_argument(
         "--partial-tp-min-notional",
         type=float,
         default=None,
-        help="[--exit structure] Min position notional USDT to arm partial TP "
-             "(default 500). Env: PARTIAL_TP_MIN_NOTIONAL",
+        help="[--exit structure] Absolute USDT floor override for partial TP "
+             "(if set, ignores --partial-tp-min-entry-pct). "
+             "Env: PARTIAL_TP_MIN_NOTIONAL",
+    )
+    p.add_argument(
+        "--partial-tp-burst-pct",
+        type=float,
+        default=None,
+        help="[--exit structure|ratchet] Favorable move %% that arms partial TP even if "
+             "the 5× size gate is not met (default 2; 0=off). "
+             "Env: PARTIAL_TP_BURST_PCT",
+    )
+    p.add_argument(
+        "--also-structure",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="[--exit ratchet] Also soft-close on EQL/EQH while green (evaluate vs "
+             "ratchet SL). Default off. Env: ALSO_STRUCTURE=1",
     )
     p.add_argument(
         "--protect-be",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="[--exit structure] Also arm BE protect SL (default on). "
-             "Use --no-protect-be for structure TP only",
+        help="Optional BE protect SL addon for --exit structure|ob|trailing|pullback "
+             "(default on; ignored by --exit ratchet which owns the SL). "
+             "Use --no-protect-be to wait only for the primary exit",
+    )
+    p.add_argument(
+        "--risk-reduce",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="SHORT: place one full-size STOP at historical ATH + RISK_ATH_SL_PCT "
+             "(default +2%%). Also blocks new opens within "
+             "RISK_ATH_ENTRY_MIN_GAP_PCT of ATH (default 12%%). "
+             "Default on via RISK_REDUCE=1. Env: RISK_REDUCE",
+    )
+    p.add_argument(
+        "--risk-ath-sl-pct",
+        type=float,
+        default=None,
+        help="%% above historical ATH for the ATH stop (default 2). "
+             "Env: RISK_ATH_SL_PCT",
+    )
+    p.add_argument(
+        "--risk-ath-entry-min-gap-pct",
+        type=float,
+        default=None,
+        help="Block new SHORT opens when last is below the prior swing and "
+             "within this %% of it (default 12). Current 90d high is not an "
+             "entry block. Env: RISK_ATH_ENTRY_MIN_GAP_PCT",
+    )
+    p.add_argument(
+        "--risk-ath-prior",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Also block new SHORT opens within the entry gap of the prior ATH "
+             "(previous 1D peak, not a 7-day high). Default on. Env: RISK_ATH_PRIOR",
+    )
+    p.add_argument(
+        "--funding-guard",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Block new opens / flatten before funding when we would pay "
+             "≥ FUNDING_PAY_MAX_PCT (default on). Env: FUNDING_GUARD",
+    )
+    p.add_argument(
+        "--funding-pay-max-pct",
+        type=float,
+        default=None,
+        help="Funding %% we would pay that triggers block/close (default 0.3). "
+             "Env: FUNDING_PAY_MAX_PCT",
+    )
+    p.add_argument(
+        "--funding-close-lead-min",
+        type=float,
+        default=None,
+        help="Minutes before nextFundingTime to market-close when paying "
+             "(default 10). Env: FUNDING_CLOSE_LEAD_MIN",
+    )
+    # Legacy flags kept so old unit/env lines still parse; ignored by ATH SL logic.
+    p.add_argument(
+        "--risk-reduce-pct",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--risk-reduce-buffer-pct",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--risk-reduce-swing-bars",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--risk-full-buffer-pct",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--risk-full-swing-lookback",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--risk-full-swing-min-gap-pct",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     p.add_argument("--be-arm-pct", type=float, default=None,
-                   help="[--exit structure|be] Arm BE SL when unrealized profit %% ≥ this "
+                   help="[--protect-be] Arm BE SL when unrealized profit %% ≥ this "
                         "(default 1.0). Env: BE_ARM_PCT")
     p.add_argument("--be-profit-pct", type=float, default=None,
-                   help="[--exit structure|be|staged] SL profit lock %% from entry "
-                        "(structure/be default 0.3, staged default 0.1; no fee buffer). "
+                   help="[--protect-be / --exit staged] SL profit lock %% from entry "
+                        "(protect-be default 0.3, staged default 0.1; no fee buffer). "
                         "Env: BE_PROFIT_PCT")
     p.add_argument(
         "--post-be",
         choices=["none", "trail"],
         default=None,
-        help="[--exit structure|be] After BE is armed: none (default) or trail "
-             "(arm trailing at --post-be-arm-pct). Env: POST_BE",
+        help="[--protect-be with --exit structure|be] After BE: none (default) or trail. "
+             "For trail-as-primary-exit use --exit trailing. Env: POST_BE",
+    )
+    p.add_argument(
+        "--imb-long",
+        type=float,
+        default=None,
+        help="[--exit ob] OB Long imbalance threshold 0..1 (default 0.55). Env: IMB_LONG",
+    )
+    p.add_argument(
+        "--imb-short",
+        type=float,
+        default=None,
+        help="[--exit ob] OB Short imbalance threshold 0..1 (default 0.45). Env: IMB_SHORT",
+    )
+    p.add_argument(
+        "--ob-band-pct",
+        type=float,
+        default=None,
+        help="[--exit ob] Depth band %% around mid for imbalance (default 1.0). "
+             "Env: OB_BAND_PCT",
+    )
+    p.add_argument(
+        "--ob-min-profit-pct",
+        type=float,
+        default=None,
+        help="[--exit ob] Min gross profit %% before OB-flip close (default 0.3). "
+             "Also requires net>0 after --tp-fee-buffer. Env: OB_MIN_PROFIT_PCT",
+    )
+    p.add_argument(
+        "--pullback-pct",
+        type=float,
+        default=None,
+        help="[--exit pullback] Adverse giveback %% from favorable extreme to close "
+             "(default 0.4). Env: PULLBACK_PCT",
+    )
+    p.add_argument(
+        "--pullback-min-profit-pct",
+        type=float,
+        default=None,
+        help="[--exit pullback] Min gross profit %% before pullback close "
+             "(default 0.3). Env: PULLBACK_MIN_PROFIT_PCT",
+    )
+    p.add_argument(
+        "--ratchet-break-pct",
+        type=float,
+        default=None,
+        help="[--exit ratchet] How far %% beyond a wall counts as a break "
+             "(default 0.15). Env: RATCHET_BREAK_PCT",
+    )
+    p.add_argument(
+        "--ratchet-min-profit-pct",
+        type=float,
+        default=None,
+        help="[--exit ratchet] Min gross profit %% before arming entry-floor SL "
+             "(default 1.0, same as --be-arm-pct). Env: RATCHET_MIN_PROFIT_PCT",
+    )
+    p.add_argument(
+        "--ratchet-wall-min-mult",
+        type=float,
+        default=None,
+        help="[--exit ratchet] Min wall size as multiple of median book qty "
+             "(default 1.0). Env: RATCHET_WALL_MIN_MULT",
     )
     p.add_argument(
         "--post-be-arm-pct",
         type=float,
         default=None,
         help="[--post-be trail] Arm trailing when unrealized profit %% ≥ this "
-             "(default 2.0). Env: POST_BE_ARM_PCT",
+             "(default 1.5). Env: POST_BE_ARM_PCT",
     )
     p.add_argument(
         "--post-be-callback",
         type=float,
         default=None,
-        help="[--post-be trail] TRAILING_STOP callbackRate %% (default 0.8). "
+        help="[--post-be trail] TRAILING_STOP callbackRate %% (default 0.6). "
              "Env: POST_BE_CALLBACK",
     )
     p.add_argument("--tp-partial-pct", type=float, default=None,
@@ -2077,6 +2629,13 @@ def preview_grid_payload(
             args.base_size = bal * args.wallet_pct / 100.0
         except Exception as exc:
             return {"ok": False, "error": f"Wallet balance failed: {exc}", "levels": []}
+
+    try:
+        from size_boost import apply_boost
+
+        args.base_size, _boost_mult = apply_boost(args.symbol, args.base_size)
+    except Exception:
+        pass
 
     if not args.no_max_leverage and args.set_leverage <= 0 and api and sec:
         try:
@@ -2414,6 +2973,20 @@ def main() -> None:
                 args.leverage = get_max_leverage(args.symbol, api, sec, args.recv_window)
             except Exception:
                 pass
+
+    try:
+        from size_boost import apply_boost
+
+        sized, boost_mult = apply_boost(args.symbol, args.base_size)
+        if boost_mult is not None:
+            args.base_size = sized
+            print(
+                f"{BOLD}{CYAN}Size boost {boost_mult:g}×{RESET} "
+                f"{DIM}→ entry {args.base_size:,.2f} USDT "
+                f"(.state/boost/{args.symbol.upper()}.json){RESET}"
+            )
+    except Exception:
+        pass
 
     levels = bids if is_long else asks
     walls = select_walls(

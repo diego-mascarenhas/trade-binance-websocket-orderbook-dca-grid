@@ -9,10 +9,14 @@
   5. Enough ask-side order-book walls for a SHORT DCA grid
 
 Display-only by default. With --watch --auto-trade: run the top
-`--max-trades` ★ from this list (default 3) via
-`dca SYMBOL short --exit structure` (TP=EQL) + BE protect (arm 1% → lock 0.3%)
-+ post-BE trail (arm 2% → callback 0.8%).
+`--max-trades` ★ from this list (default 3) via `dca SYMBOL short --once`.
+Primary exit via `--trade-exit` / .env TRADE_EXIT|EXIT_MODE
+  (structure|ob|trailing|pullback|ratchet…); BE is optional
+via `--protect-be` / `--no-protect-be` (orthogonal).
+Early profile: `--trade-exit ratchet` (BE floor + wall SL + 5× partial TP).
 Other open pairs on the account do not consume these slots.
+Account Margin Ratio (Binance UI): ≥ soft (default 5%) → no new ★;
+≥ hard (default 8%) → cancel DCA limits (keep exits); below hard → re-arm DCA.
 
   python3 pump_stall_scan.py
   ./pump-stall --top 15 --min-near-regime 80 --min-sharp 35
@@ -21,7 +25,7 @@ Other open pairs on the account do not consume these slots.
 Profiles (wrappers; defaults of ./pump-stall-watch stay strict):
   ./pump-stall-watch          # stall≥35 · near≥85 · ★≥92
   ./pump-stall-watch-early    # TEST: stall≥25 · near≥82 · ★≥90
-                              # + auto-trade · BE + trail@2%/0.8%
+                              # + auto-trade · BE + trail@1.5%/0.6%
   ./pump-stall-early          # one-shot scan with the early profile
 """
 
@@ -35,6 +39,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from futures_scan import (
@@ -91,6 +96,12 @@ class PumpStallHit:
     wall_prices: list[float]
     score: float
     note: str
+    ath: float | None = None
+    ath_gap_pct: float | None = None
+    ath_block: bool = False
+    ath_min_gap_pct: float | None = None
+    prior_ath: float | None = None
+    prior_ath_gap_pct: float | None = None
 
 
 @dataclass
@@ -428,6 +439,57 @@ def _block_tag(reason: str) -> str:
     return f"{c}{BOLD}{reason:<6}{RESET}"
 
 
+def annotate_ath_gates(
+    hits: list[PumpStallHit],
+    args: argparse.Namespace | None = None,
+) -> list[str]:
+    """Fill prior-swing gap on rows; entry block is prior-only (not 90d high)."""
+    if not hits:
+        return []
+    try:
+        from exits.risk_reduce import (
+            ath_entry_min_gap_pct,
+            cached_ath_levels,
+            distance_to_ath_pct,
+            enabled,
+        )
+    except Exception:
+        return []
+    if not enabled(args):
+        return []
+    min_gap = ath_entry_min_gap_pct(args)
+    if min_gap <= 0:
+        return []
+    notes: list[str] = []
+    for h in hits:
+        try:
+            ath, prior = cached_ath_levels(
+                h.symbol, last=float(h.last or 0), args=args,
+            )
+        except Exception:
+            continue
+        if h.last <= 0:
+            continue
+        if ath and ath > 0:
+            h.ath = float(ath)
+            h.ath_gap_pct = distance_to_ath_pct(float(h.last), float(ath))
+        h.ath_min_gap_pct = min_gap
+        h.ath_block = False
+        if not prior or prior <= 0:
+            continue
+        h.prior_ath = float(prior)
+        gap_p = distance_to_ath_pct(float(h.last), float(prior))
+        h.prior_ath_gap_pct = gap_p
+        # Only block when still below the prior swing and too close to it.
+        if float(h.last) < float(prior) and gap_p < min_gap:
+            h.ath_block = True
+            notes.append(
+                f"skip {h.symbol} — prior swing {float(prior):g} · "
+                f"{gap_p:.1f}% off < min {min_gap:g}%"
+            )
+    return notes
+
+
 def _hit_to_dict(h: PumpStallHit) -> dict:
     return {
         "symbol": h.symbol,
@@ -443,6 +505,12 @@ def _hit_to_dict(h: PumpStallHit) -> dict:
         "note": h.note,
         "wall_prices": list(h.wall_prices[:6]),
         "flag": "",
+        "ath": h.ath,
+        "ath_gap_pct": h.ath_gap_pct,
+        "ath_block": bool(h.ath_block),
+        "ath_min_gap_pct": h.ath_min_gap_pct,
+        "prior_ath": h.prior_ath,
+        "prior_ath_gap_pct": h.prior_ath_gap_pct,
     }
 
 
@@ -461,6 +529,147 @@ def _blocked_to_dict(r: AnalyzeRow) -> dict:
     }
 
 
+def stack_params(args: argparse.Namespace | None = None) -> dict:
+    """Live exit/stack knobs for Pumpstall web (help + scanner)."""
+    def g(name: str, default):
+        if args is None:
+            return default
+        v = getattr(args, name, default)
+        return default if v is None else v
+
+    be_arm = 1.0
+    be_profit = 0.3
+    tp_partial = 70.0
+    tp1_profit = 0.3
+    partial_entry_pct = 500.0
+    post_arm = float(g("post_be_arm_pct", 1.5) or 1.5)
+    post_cb = float(g("post_be_callback", 0.6) or 0.6)
+    try:
+        wallet_pct = float(os.getenv("WALLET_PCT", "10") or 10)
+    except (TypeError, ValueError):
+        wallet_pct = 10.0
+    try:
+        imb_long = float(g("imb_long", 0.55) or 0.55)
+    except (TypeError, ValueError):
+        imb_long = 0.55
+    trade_exit = "ratchet"
+    protect_be = True
+    if args is not None:
+        trade_exit = _trade_exit_mode(args)
+        protect_be = _protect_be_for_trade(args)
+    # Size-boost auto knobs (see size_boost.py) — for Help page
+    try:
+        import size_boost as sb
+
+        boost_mult = float(sb.default_mult())
+        boost_dwell = int(sb.auto_dwell_cycles())
+        boost_ttl_h = float(sb.auto_ttl_hours())
+        boost_auto = bool(sb.auto_enabled())
+        boost_strict_stall = float(sb.STRICT_MIN_STALL)
+        boost_strict_near = float(sb.STRICT_MIN_NEAR)
+        boost_strict_ideal = float(sb.STRICT_IDEAL_NEAR)
+    except Exception:  # noqa: BLE001
+        boost_mult = 1.5
+        boost_dwell = 2
+        boost_ttl_h = 5.0
+        boost_auto = True
+        boost_strict_stall = 35.0
+        boost_strict_near = 85.0
+        boost_strict_ideal = 92.0
+
+    return {
+        "trade_exit": trade_exit,
+        "protect_be": protect_be,
+        "also_structure": 1 if bool(g("also_structure", False)) else 0,
+        "ratchet_min_profit_pct": 1.0,
+        "be_arm_pct": be_arm,
+        "be_profit_pct": be_profit,
+        "post_be_arm_pct": post_arm,
+        "post_be_callback": post_cb,
+        "tp_partial_pct": tp_partial,
+        "tp1_profit_pct": tp1_profit,
+        "partial_tp_min_entry_pct": partial_entry_pct,
+        "dca_max_entry_pct": 1200.0,
+        "imb_long": imb_long,
+        "loss_cooldown_min": float(g("loss_cooldown_min", 1440.0) or 1440.0),
+        "margin_ratio_soft": float(g("margin_ratio_soft", 3.0) or 3.0),
+        "margin_ratio_hard": float(g("margin_ratio_hard", 5.0) or 5.0),
+        "wallet_pct": wallet_pct,
+        "min_gap": float(g("min_gap", 0.8) or 0.8),
+        "so_count": int(g("so_count", 8) or 8),
+        "max_trades": _max_trades(
+            args if args is not None else argparse.Namespace(max_trades=3),
+        ),
+        "boost_mult": boost_mult,
+        "boost_dwell": boost_dwell,
+        "boost_ttl_h": boost_ttl_h,
+        "boost_auto": 1 if boost_auto else 0,
+        "boost_strict_stall": boost_strict_stall,
+        "boost_strict_near": boost_strict_near,
+        "boost_strict_ideal": boost_strict_ideal,
+        # ATH SL addon (SHORT) — Help page
+        "risk_reduce": (
+            0
+            if (os.getenv("RISK_REDUCE", "1") or "1").strip().lower()
+            in ("0", "false", "off", "no")
+            else 1
+        ),
+        "risk_ath_sl_pct": float(os.getenv("RISK_ATH_SL_PCT", "2") or 2),
+        "risk_ath_entry_min_gap_pct": float(
+            os.getenv("RISK_ATH_ENTRY_MIN_GAP_PCT", "12") or 12
+        ),
+        "risk_ath_prior": (
+            0
+            if (os.getenv("RISK_ATH_PRIOR", "1") or "1").strip().lower()
+            in ("0", "false", "off", "no")
+            else 1
+        ),
+        # Funding guard — Help page
+        "funding_guard": (
+            0
+            if (os.getenv("FUNDING_GUARD", "1") or "1").strip().lower()
+            in ("0", "false", "off", "no")
+            else 1
+        ),
+        "funding_pay_max_pct": float(os.getenv("FUNDING_PAY_MAX_PCT", "0.3") or 0.3),
+        "funding_close_lead_min": float(
+            os.getenv("FUNDING_CLOSE_LEAD_MIN", "10") or 10
+        ),
+    }
+
+
+def format_dca_hint(args: argparse.Namespace | None = None) -> str:
+    """Display hint matching the flags this watch actually passes to `dca`."""
+    s = stack_params(args)
+    exit_mode = str(s.get("trade_exit") or "ratchet")
+    gap = f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
+    be = " --protect-be" if s.get("protect_be", True) else " --no-protect-be"
+    if exit_mode == "ob":
+        return (
+            f"Hint: dca SYMBOL short --exit ob{be} "
+            f"--imb-long {s['imb_long']:g} {gap}"
+        )
+    if exit_mode == "trailing":
+        return f"Hint: dca SYMBOL short --exit trailing{be} {gap}"
+    if exit_mode == "pullback":
+        return f"Hint: dca SYMBOL short --exit pullback{be} {gap}"
+    if exit_mode == "ratchet":
+        overlay = " + also-structure" if int(s.get("also_structure") or 0) else ""
+        times = float(s.get("partial_tp_min_entry_pct") or 500) / 100.0
+        dca_x = float(s.get("dca_max_entry_pct") or 1200) / 100.0
+        return (
+            f"Hint: dca SYMBOL short --exit ratchet · "
+            f"BE floor@+{s['ratchet_min_profit_pct']:g}%→{s['be_profit_pct']:g}% "
+            f"+ TP{s['tp_partial_pct']:g}%@+{s['tp1_profit_pct']:g}%"
+            f"(≥{times:g}×) · DCA≤{dca_x:g}× · +grid if ★{overlay} {gap} --once"
+        )
+    return (
+        f"Hint: dca SYMBOL short --exit structure{be} "
+        f"--post-be trail --post-be-arm-pct {s['post_be_arm_pct']:g} "
+        f"--post-be-callback {s['post_be_callback']:g} {gap}"
+    )
+
+
 def build_snapshot(
     *,
     hits: list[PumpStallHit],
@@ -472,6 +681,9 @@ def build_snapshot(
     next_s: float,
     mode: str,
     why_limit: int,
+    hint: str | None = None,
+    stack: dict | None = None,
+    auto_notes: list[str] | None = None,
 ) -> dict:
     """Payload for Pumpstall web (same keys as DemoScanSnapshot)."""
     ranked = sorted(
@@ -494,7 +706,10 @@ def build_snapshot(
         "hits": [_hit_to_dict(h) for h in ranked],
         "blocked": [_blocked_to_dict(r) for r in blocked[:show_n]],
         "block_counts": block_counts,
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "hint": hint or format_dca_hint(),
+        "stack": stack or stack_params(),
+        "auto_notes": list(auto_notes or []),
     }
 
 
@@ -521,6 +736,7 @@ def maybe_write_snapshot(
     time_s: str,
     scan_s: float,
     mode: str,
+    auto_notes: list[str] | None = None,
 ) -> None:
     if getattr(args, "no_snapshot", False):
         return
@@ -537,6 +753,9 @@ def maybe_write_snapshot(
         next_s=float(getattr(args, "interval", 60.0) or 60.0),
         mode=mode,
         why_limit=int(getattr(args, "why", 15) or 0),
+        hint=format_dca_hint(args),
+        stack=stack_params(args),
+        auto_notes=auto_notes,
     )
     write_snapshot(path, payload)
 
@@ -584,6 +803,7 @@ def print_hits(
     prev: dict[str, float] | None = None,
     blocked: list[AnalyzeRow] | None = None,
     why_limit: int = 0,
+    hint: str | None = None,
 ) -> dict[str, float]:
     """Render table. Returns symbol→score map for the next refresh diff."""
     if not hits:
@@ -641,11 +861,17 @@ def print_hits(
             if gone:
                 print(f"{DIM}left: {', '.join(gone)}{RESET}")
         print()
-        print(
-        f"{DIM}Hint: dca SYMBOL short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 "
-        f"--post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 "
-        f"--min-gap … --so-count …{RESET}"
-    )
+        print(f"{DIM}{hint or format_dca_hint()}{RESET}")
+        ath_skips = [h.symbol for h in ranked if h.ath_block]
+        if ath_skips:
+            min_g = next(
+                (h.ath_min_gap_pct for h in ranked if h.ath_min_gap_pct),
+                12.0,
+            )
+            print(
+                f"{YELLOW}skip {', '.join(ath_skips)} — too close below "
+                f"prior swing (need ≥{min_g:g}% off){RESET}"
+            )
         if why_limit > 0 and blocked is not None:
             print()
             print_blocked(blocked, limit=why_limit)
@@ -657,6 +883,73 @@ def print_hits(
     elif why_limit > 0:
         print(f"{DIM}(no blocked rows){RESET}")
     return {}
+
+def _maybe_telegram_notify(
+    hits: list[PumpStallHit],
+    *,
+    ideal_near: float,
+    prev_map: dict[str, float] | None,
+    enabled: bool,
+    bootstrap: bool = False,
+) -> None:
+    """Post ★ candidates (setup only — not #OPEN) to the public Pumpstall channel."""
+    if not enabled:
+        return
+    try:
+        import pumpstall_telegram as pst
+    except ImportError:
+        print(f"{DIM}Telegram: pumpstall_telegram not available{RESET}")
+        return
+    if not pst.is_configured():
+        print(f"{DIM}Telegram: Pumpstall channel not configured — skip{RESET}")
+        return
+    if prev_map is None and not bootstrap:
+        return
+
+    sent = 0
+    for h in hits:
+        if h.near_high_pct < ideal_near:
+            continue
+        if prev_map is not None and h.symbol in prev_map and not bootstrap:
+            continue
+        if pst.notify_open_hit(h):
+            sent += 1
+            print(f"{GREEN}Telegram ★ {h.symbol}{RESET}")
+        else:
+            print(f"{YELLOW}Telegram failed {h.symbol}{RESET}")
+    if sent:
+        print(f"{DIM}Telegram: posted {sent} ★ setup(s){RESET}")
+    elif bootstrap:
+        print(f"{DIM}Telegram: no ★ ideals to post{RESET}")
+
+
+def _maybe_daily_orphan_sweep() -> None:
+    """Cancel bot limit/algo orphans on flat symbols (same cadence as #REPORT)."""
+    try:
+        import botctl
+    except ImportError as exc:
+        print(f"{DIM}Daily sweep skipped: botctl unavailable ({exc}){RESET}")
+        return
+    try:
+        result = botctl.sweep(None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{YELLOW}Daily orphan sweep failed: {exc}{RESET}")
+        return
+    for line in str(result).splitlines():
+        print(f"{DIM}Sweep: {line}{RESET}")
+
+
+def _maybe_daily_summary(enabled: bool) -> None:
+    if not enabled:
+        return
+    try:
+        import pumpstall_telegram as pst
+    except ImportError:
+        return
+    if pst.maybe_send_daily_summary():
+        print(f"{GREEN}Telegram: daily PnL summary sent{RESET}")
+        _maybe_daily_orphan_sweep()
+
 
 def _clear_screen() -> None:
     # Keep scrollback usable; full clear each refresh
@@ -704,6 +997,52 @@ def _dca_supervisor_running() -> list[str]:
         return []
 
 
+def _open_position_symbols(
+    api: str,
+    sec: str,
+    recv: int = 15000,
+) -> set[str]:
+    """USDT-M symbols with a non-flat futures position (survives watch restarts)."""
+    try:
+        from orderbook_dca_grid import _signed_request
+
+        rows = _signed_request("GET", "/fapi/v2/positionRisk", {}, api, sec, recv)
+    except Exception:
+        return set()
+    out: set[str] = set()
+    for r in rows if isinstance(rows, list) else []:
+        try:
+            amt = float(r.get("positionAmt", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(amt) <= 0:
+            continue
+        sym = str(r.get("symbol", "") or "").upper()
+        if sym.endswith("USDT"):
+            out.add(sym)
+    return out
+
+
+def _occupied_trade_slots(
+    active: dict[str, subprocess.Popen],
+    *,
+    api: str | None = None,
+    sec: str | None = None,
+) -> set[str]:
+    """Symbols that already consume a MAX_TRADES slot.
+
+    Counts: this watcher's children + any live --supervise process + open
+    Binance positions (so a restart cannot open past the cap).
+    """
+    occupied = {s.upper() for s in active} | {s.upper() for s in _dca_supervisor_running()}
+    if api and sec:
+        try:
+            occupied |= _open_position_symbols(api, sec)
+        except Exception:
+            pass
+    return occupied
+
+
 def _pick_ideals(
     hits: list[PumpStallHit],
     ideal_near: float,
@@ -738,43 +1077,259 @@ def _reap_active(
     return alive
 
 
+def _weekend_block_enabled() -> bool:
+    flag = (os.getenv("PUMPSTALL_WEEKEND_BLOCK", "1") or "1").strip().lower()
+    return flag not in ("0", "false", "off", "no")
+
+
+def _weekend_block_active() -> bool:
+    """True during Fri 21:00 UTC → Sun 23:00 UTC (no new ★).
+
+    Override with PUMPSTALL_WEEKEND_BLOCK=0 to disable (default: on).
+    """
+    if not _weekend_block_enabled():
+        return False
+    now = datetime.now(timezone.utc)
+    wd = now.weekday()  # Mon=0 … Sun=6
+    hm = (now.hour, now.minute)
+    if wd == 4 and hm >= (21, 0):  # Friday after 21:00 UTC
+        return True
+    if wd == 5:  # Saturday
+        return True
+    if wd == 6 and hm < (23, 0):  # Sunday before 23:00 UTC
+        return True
+    return False
+
+
+def _weekend_block_state_path() -> str:
+    return os.path.join(_repo_root(), ".state", "weekend_block.json")
+
+
+def _maybe_notify_weekend_block(*, telegram: bool) -> None:
+    """On transition into/out of the US weekend window, announce in English."""
+    if not _weekend_block_enabled():
+        return
+    active = _weekend_block_active()
+    path = _weekend_block_state_path()
+    prev: bool | None = None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if isinstance(raw, dict) and "active" in raw:
+            prev = bool(raw["active"])
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        prev = None
+
+    if prev is not None and prev == active:
+        return
+
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "active": active,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                fh,
+            )
+    except OSError:
+        pass
+
+    # First boot: seed state without spamming Telegram mid-weekend/weekday.
+    if prev is None:
+        print(
+            f"{DIM}Weekend block state seeded · "
+            f"{'ON (no new ★)' if active else 'OFF'}{RESET}"
+        )
+        return
+
+    if active:
+        print(
+            f"{YELLOW}AUTO: weekend block ON · Fri 21:00→Sun 23:00 UTC "
+            f"— no new ★{RESET}"
+        )
+    else:
+        print(
+            f"{GREEN}AUTO: weekend block OFF · US session open again "
+            f"— new ★ allowed{RESET}"
+        )
+
+    if not telegram:
+        return
+    try:
+        import telegram_notify as tg
+
+        tg.notify_us_session_weekend(blocked=active)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{DIM}Weekend block Telegram skipped: {exc}{RESET}")
+
+
+def _trade_exit_mode(args: argparse.Namespace) -> str:
+    """Primary exit for auto-trade children.
+
+    Preference: explicit ``--trade-exit`` → TRADE_EXIT → EXIT_MODE → ratchet.
+    Early default is BE+ratchet. CLI wins over .env so a leftover EXIT_MODE
+    cannot silently replace the unit flag.
+    """
+    cli = getattr(args, "trade_exit", None)
+    raw = (
+        cli
+        or os.getenv("TRADE_EXIT")
+        or os.getenv("EXIT_MODE")
+        or "ratchet"
+    )
+    raw = str(raw).strip().lower()
+    if raw in ("be-ob", "be_ob", "beob", "ob-long", "ob_long", "oblong", "ob"):
+        return "ob"
+    if raw in ("trailing", "trail"):
+        return "trailing"
+    if raw in ("pullback", "pb", "pull", "giveback"):
+        return "pullback"
+    if raw in ("ratchet", "support-be", "support_be", "ratchet-be", "ratchet_be", "levels"):
+        return "ratchet"
+    if raw in ("eql", "eq", "structure"):
+        return "structure"
+    if raw in ("be", "staged", "none"):
+        return raw
+    return "ratchet"
+
+
+def _protect_be_for_trade(args: argparse.Namespace) -> bool:
+    """Whether child dca gets --protect-be (default on)."""
+    return bool(getattr(args, "protect_be", True))
+
+
+def _max_trades(args: argparse.Namespace) -> int:
+    """Concurrent ★ slots for auto-trade.
+
+    Preference: MAX_TRADES in .env → --max-trades → 3.
+    """
+    raw = os.getenv("MAX_TRADES")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1, int(float(raw)))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, int(getattr(args, "max_trades", 3) or 3))
+    except (TypeError, ValueError):
+        return 3
+
+
 def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.Popen | None:
-    """Start `dca SYMBOL short --exit structure` (EQL TP + BE protect) --once."""
+    """Start `dca SYMBOL short` with the configured trade exit --once."""
     root = _repo_root()
     dca_bin = os.path.join(root, "dca")
     log_dir = os.path.join(root, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, f"pump-stall-{hit.symbol}.log")
+    exit_mode = _trade_exit_mode(args)
+    use_be = _protect_be_for_trade(args)
     cmd = [
         dca_bin,
         hit.symbol,
         "short",
-        "--exit", "structure",
-        "--protect-be",
-        "--be-arm-pct", "1",
-        "--be-profit-pct", "0.3",
-        "--partial-tp",
-        "--tp-partial-pct", "70",
-        "--tp1-profit-pct", "0.3",
-        "--partial-tp-min-notional", "500",
-        "--post-be", "trail",
-        "--post-be-arm-pct", str(getattr(args, "post_be_arm_pct", 2.0) or 2.0),
-        "--post-be-callback", str(getattr(args, "post_be_callback", 0.8) or 0.8),
+        "--exit", exit_mode,
+        "--protect-be" if use_be else "--no-protect-be",
         "--once",
         "--loss-cooldown-min", str(getattr(args, "loss_cooldown_min", 1440)),
+        "--margin-ratio-soft", str(getattr(args, "margin_ratio_soft", 3.0)),
+        "--margin-ratio-hard", str(getattr(args, "margin_ratio_hard", 5.0)),
+        # Short-only book: default imbalance gate (20–30%) blocks every new ★
+        # once a large SHORT (e.g. PUMP) is open. Env PUMPSTALL_MAX_IMBALANCE
+        # (default 0 = disable) overrides MAX_IMBALANCE for auto-trade children.
+        "--max-imbalance",
+        str(float(os.getenv("PUMPSTALL_MAX_IMBALANCE", os.getenv("MAX_IMBALANCE", "0")) or 0)),
         "--so-count", str(args.so_count),
         "--min-gap", str(args.min_gap),
         "--min-dist", str(args.min_dist),
         "--max-range", str(args.max_range),
         "--limit", str(args.limit),
     ]
-    if getattr(args, "structure_interval", None):
-        cmd.extend(["--structure-interval", str(args.structure_interval)])
+    if use_be:
+        cmd.extend(["--be-arm-pct", "1", "--be-profit-pct", "0.3"])
+    be_note = " + BE@1%→0.3%" if use_be else ""
+    if exit_mode == "structure":
+        cmd.extend([
+            "--partial-tp",
+            "--tp-partial-pct", "70",
+            "--tp1-profit-pct", "0.3",
+            "--partial-tp-min-entry-pct", "500",
+            "--dca-max-entry-pct", "1200",
+        ])
+        # post-BE trail only when BE is on and caller asked for it
+        if use_be and float(getattr(args, "post_be_arm_pct", 0) or 0) > 0:
+            cmd.extend([
+                "--post-be", "trail",
+                "--post-be-arm-pct", str(getattr(args, "post_be_arm_pct", 1.5) or 1.5),
+                "--post-be-callback", str(getattr(args, "post_be_callback", 0.6) or 0.6),
+            ])
+            trail_note = (
+                f" + post-BE trail@"
+                f"{float(getattr(args, 'post_be_arm_pct', 1.5) or 1.5):g}%/"
+                f"{float(getattr(args, 'post_be_callback', 0.6) or 0.6):g}%"
+            )
+        else:
+            trail_note = ""
+        if getattr(args, "structure_interval", None):
+            cmd.extend(["--structure-interval", str(args.structure_interval)])
+        launch_note = (
+            f"dca short --exit structure{be_note}{trail_note} "
+            f"+ TP70%@+0.3%(≥500% entry) · DCA≤12× --once"
+        )
+    elif exit_mode == "trailing":
+        launch_note = f"dca short --exit trailing{be_note} --once"
+    elif exit_mode == "pullback":
+        launch_note = f"dca short --exit pullback{be_note} --once"
+    elif exit_mode == "ratchet":
+        # Ratchet owns the BE algo tag — do not stack classic protect-be
+        if "--protect-be" in cmd:
+            cmd[cmd.index("--protect-be")] = "--no-protect-be"
+        elif "--no-protect-be" not in cmd:
+            cmd.append("--no-protect-be")
+        for flag in ("--be-arm-pct", "--be-profit-pct"):
+            if flag in cmd:
+                i = cmd.index(flag)
+                del cmd[i:i + 2]
+        cmd.extend([
+            "--be-profit-pct", "0.3",
+            "--ratchet-min-profit-pct", "1",
+            "--partial-tp",
+            "--tp-partial-pct", "70",
+            "--tp1-profit-pct", "0.3",
+            "--partial-tp-min-entry-pct", "500",
+            "--dca-max-entry-pct", "1200",
+        ])
+        overlay = ""
+        if bool(getattr(args, "also_structure", False)):
+            cmd.append("--also-structure")
+            overlay = " + also-structure"
+            if getattr(args, "structure_interval", None):
+                cmd.extend(["--structure-interval", str(args.structure_interval)])
+        launch_note = (
+            f"dca short --exit ratchet · BE floor@+1%→0.3% "
+            f"+ TP70%@+0.3%(≥5×) · DCA≤12×{overlay} --once"
+        )
+    elif exit_mode == "ob":
+        imb = getattr(args, "imb_long", None)
+        if imb is not None:
+            cmd.extend(["--imb-long", str(imb)])
+        band = getattr(args, "ob_band_pct", None)
+        if band is not None:
+            cmd.extend(["--ob-band-pct", str(band)])
+        launch_note = (
+            f"dca short --exit ob{be_note} · OB Long "
+            f"(imb≥{float(imb if imb is not None else 0.55):g}) --once"
+        )
+    else:
+        launch_note = f"dca short --exit {exit_mode}{be_note} --once"
     try:
         log_f = open(log_path, "a", encoding="utf-8")
         log_f.write(
             f"\n--- launch {time.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"score={hit.score:.1f} near={hit.near_high_pct:.0f}% ---\n"
+            f"score={hit.score:.1f} near={hit.near_high_pct:.0f}% "
+            f"exit={exit_mode} ---\n"
         )
         log_f.flush()
         proc = subprocess.Popen(
@@ -786,14 +1341,58 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         )
         print(
             f"{BOLD}{GREEN}AUTO ★ {hit.symbol}{RESET}  "
-            f"{DIM}pid={proc.pid} · dca short --exit structure "
-            f"+ TP70%@+0.3%(≥500U) + BE@1%→0.3% + trail@2%/0.8% --once · "
-            f"log {log_path}{RESET}"
+            f"{DIM}pid={proc.pid} · {launch_note} · log {log_path}{RESET}"
         )
         return proc
     except Exception as exc:  # noqa: BLE001
         print(f"{RED}Failed to launch dca for {hit.symbol}: {exc}{RESET}")
         return None
+
+
+def _print_auto_account_status(
+    args: argparse.Namespace,
+    *,
+    api: str | None,
+    sec: str | None,
+    occupied: set[str],
+    max_trades: int,
+) -> None:
+    """Always-on strip under the table so soft/hard gates are not invisible."""
+    soft_mr = float(getattr(args, "margin_ratio_soft", 3.0) or 0)
+    hard_mr = float(getattr(args, "margin_ratio_hard", 5.0) or 5.0)
+    bits: list[str] = []
+
+    if _weekend_block_active():
+        bits.append(f"{YELLOW}weekend block (Fri 21:00→Sun 23:00 UTC){RESET}")
+    elif not _weekend_block_enabled():
+        bits.append(f"{DIM}weekend off{RESET}")
+
+    if soft_mr <= 0:
+        bits.append(f"{DIM}margin soft off{RESET}")
+    elif not api or not sec:
+        bits.append(f"{YELLOW}margin unread (no API keys){RESET}")
+    else:
+        from orderbook_dca_grid import get_margin_ratio_pct
+
+        ratio = get_margin_ratio_pct(api, sec, 15000)
+        if ratio is None:
+            bits.append(f"{YELLOW}margin unread (API error){RESET}")
+        elif ratio >= soft_mr:
+            bits.append(
+                f"{YELLOW}margin {ratio:.2f}% ≥ soft {soft_mr:g}% "
+                f"(hard {hard_mr:g}%) — no new ★{RESET}"
+            )
+        else:
+            bits.append(
+                f"{DIM}margin {ratio:.2f}% < soft {soft_mr:g}% "
+                f"(hard {hard_mr:g}%){RESET}"
+            )
+
+    occ = ", ".join(sorted(occupied)) or "—"
+    bits.append(
+        f"{DIM}slots {len(occupied)}/{max_trades} · occupied {occ}{RESET}"
+    )
+    print("AUTO · " + " · ".join(bits))
 
 
 def _maybe_auto_trade(
@@ -802,62 +1401,171 @@ def _maybe_auto_trade(
     *,
     active: dict[str, subprocess.Popen],
 ) -> dict[str, subprocess.Popen]:
-    """Keep the top --max-trades ★ from this scan running (this bot only).
+    """Keep up to --max-trades ★ running, respecting already-open exposure.
 
-    Other account positions / unrelated supervisors do not consume slots.
-    We never launch outside the current top-N ★ list.
+    Slots are consumed by this watcher's children, any live --supervise
+    process, and open Binance futures positions — so a watch restart cannot
+    exceed MAX_TRADES when orphans are still open.
     """
     active = _reap_active(active)
-    max_trades = max(1, int(getattr(args, "max_trades", 3) or 3))
+    max_trades = _max_trades(args)
+
+    # Size boost each cycle (even if weekend/margin blocks new ★ launches)
+    try:
+        import size_boost as sb
+
+        boost_note = sb.sync_auto_boost(hits, ideal_near=float(args.ideal_near))
+        if boost_note:
+            print(f"{BOLD}{CYAN}{boost_note}{RESET}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"{DIM}AUTO boost skipped: {exc}{RESET}")
+    try:
+        import star_rearm as sr
+
+        running_now = {s.upper() for s in _dca_supervisor_running()} | {
+            s.upper() for s in active
+        }
+        pulse = sr.sync_from_scan(
+            hits, float(args.ideal_near), running_now,
+        )
+        if pulse:
+            print(f"{BOLD}{CYAN}{pulse}{RESET}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"{DIM}AUTO ★ re-arm pulse skipped: {exc}{RESET}")
 
     import loss_cooldown as lcd
+    from orderbook_dca_grid import get_margin_ratio_pct, load_keys
+
+    api, sec = load_keys(None)
+    occupied = _occupied_trade_slots(active, api=api or None, sec=sec or None)
+    _print_auto_account_status(
+        args,
+        api=api or None,
+        sec=sec or None,
+        occupied=occupied,
+        max_trades=max_trades,
+    )
+
+    if _weekend_block_active():
+        print(
+            f"{YELLOW}AUTO: weekend block Fri 21:00→Sun 23:00 UTC "
+            f"— no new ★{RESET}"
+        )
+        return active
+
+    soft_mr = float(getattr(args, "margin_ratio_soft", 3.0) or 0)
+    if soft_mr > 0:
+        if not api or not sec:
+            print(
+                f"{YELLOW}AUTO: cannot enforce soft margin "
+                f"{soft_mr:g}% — missing API keys{RESET}"
+            )
+        else:
+            ratio = get_margin_ratio_pct(api, sec, 15000)
+            if ratio is None:
+                print(
+                    f"{YELLOW}AUTO: cannot read margin ratio — "
+                    f"soft {soft_mr:g}% not enforced this cycle{RESET}"
+                )
+            elif ratio >= soft_mr:
+                print(
+                    f"{YELLOW}AUTO: margin ratio {ratio:.2f}% ≥ soft "
+                    f"{soft_mr:g}% — no new ★ "
+                    f"(DCA strip at hard "
+                    f"{getattr(args, 'margin_ratio_hard', 5):g}%){RESET}"
+                )
+                return active
 
     cooling = lcd.cooling_map()
     if cooling:
         bits = [f"{s} {lcd.fmt_remaining(t)}" for s, t in sorted(cooling.items())]
         print(f"{DIM}AUTO: loss cooldown · {', '.join(bits)}{RESET}")
 
-    # Target set: first N ★ by score, skipping symbols in loss cooldown
+    slots_left = max(0, max_trades - len(occupied))
+    if slots_left <= 0:
+        print(
+            f"{DIM}AUTO: at --max-trades={max_trades} · occupied "
+            f"{', '.join(sorted(occupied)) or '—'} — no new ★{RESET}"
+        )
+        return active
+
+    # Target set: first N free ★ by score (N = remaining slots)
     target = _pick_ideals(
-        hits, args.ideal_near, exclude=set(cooling), limit=max_trades,
+        hits,
+        args.ideal_near,
+        exclude=set(cooling) | occupied,
+        limit=slots_left,
     )
     target_syms = [h.symbol.upper() for h in target]
     if not target_syms:
         if cooling:
-            print(f"{DIM}AUTO: no ★ ideal outside cooldown — skip{RESET}")
+            print(f"{DIM}AUTO: no ★ ideal outside cooldown/slots — skip{RESET}")
         else:
             print(f"{DIM}AUTO: no ★ ideal this round — skip{RESET}")
         return active
 
-    running = {s.upper() for s in _dca_supervisor_running()}
     ours = {s.upper() for s in active}
+    running = {s.upper() for s in _dca_supervisor_running()}
 
     print(
-        f"{DIM}AUTO: target ★ top-{max_trades}: {', '.join(target_syms)}"
-        f" · ours {', '.join(sorted(ours)) or '—'} · "
+        f"{DIM}AUTO: target ★ slots {slots_left}/{max_trades}: "
+        f"{', '.join(target_syms)}"
+        f" · occupied {', '.join(sorted(occupied)) or '—'} · "
+        f"ours {', '.join(sorted(ours)) or '—'} · "
         f"supervise {', '.join(sorted(running)) or '—'}{RESET}"
     )
 
     for hit in target:
         sym = hit.symbol.upper()
-        if sym in ours or sym in running:
-            continue  # already covered (ours or any supervise on this symbol)
-        if len(active) >= max_trades:
+        if sym in occupied:
+            continue  # already covered (position / supervise / ours)
+        if len(occupied) >= max_trades:
             print(
-                f"{DIM}AUTO: at --max-trades={max_trades} "
-                f"(this bot) — wait for a slot{RESET}"
+                f"{DIM}AUTO: at --max-trades={max_trades} · occupied "
+                f"{', '.join(sorted(occupied))} — wait for a slot{RESET}"
             )
             break
+        # ATH entry gate: skip ★ closer than RISK_ATH_ENTRY_MIN_GAP_PCT to ATH
+        try:
+            from exits.risk_reduce import entry_blocked_near_ath
+
+            # Prefer last from ticker via near_high isn't ATH — fetch mid via last print
+            last_px = 0.0
+            try:
+                from futures_scan import FAPI_BASE, fetch_klines
+
+                kl = fetch_klines(FAPI_BASE, sym, "1d", 2)
+                if kl:
+                    last_px = float(kl[-1][4])
+            except Exception:
+                last_px = 0.0
+            blocked, why = entry_blocked_near_ath(sym, last_px, args)
+            if blocked:
+                print(f"{YELLOW}skip {sym} — {why}{RESET}")
+                continue
+        except Exception as exc:  # noqa: BLE001
+            print(f"{DIM}ATH gate check skipped for {sym}: {exc}{RESET}")
+        # Funding gate: skip ★ when we would pay expensive funding this window
+        try:
+            from exits.funding import entry_blocked_by_funding
+
+            blocked, why = entry_blocked_by_funding(sym, False, args)  # pumpstall = SHORT
+            if blocked:
+                print(f"{YELLOW}skip {sym} — funding ({why}){RESET}")
+                continue
+        except Exception as exc:  # noqa: BLE001
+            print(f"{DIM}funding gate check skipped for {sym}: {exc}{RESET}")
         proc = _launch_dca_once(hit, args)
         if proc is not None:
             active[sym] = proc
             ours.add(sym)
+            occupied.add(sym)
 
-    missing = [s for s in target_syms if s not in ours and s not in running]
-    covered = [s for s in target_syms if s in ours or s in running]
+    missing = [s for s in target_syms if s not in occupied]
+    covered = [s for s in target_syms if s in occupied]
     if covered and not missing:
         print(f"{DIM}AUTO: top ★ covered ({', '.join(covered)}){RESET}")
-    elif missing and len(active) >= max_trades:
+    elif missing and len(occupied) >= max_trades:
         pass  # already logged slot wait
     elif missing:
         print(f"{DIM}AUTO: still need {', '.join(missing)}{RESET}")
@@ -872,7 +1580,7 @@ def watch_loop(args: argparse.Namespace) -> int:
     round_n = 0
     active: dict[str, subprocess.Popen] = {}
     auto = bool(getattr(args, "auto_trade", False))
-    max_trades = max(1, int(getattr(args, "max_trades", 3) or 3))
+    max_trades = _max_trades(args)
     mode = (
         f"AUTO-TRADE · --once · top {max_trades} ★"
         if auto else "display only"
@@ -887,6 +1595,7 @@ def watch_loop(args: argparse.Namespace) -> int:
             t0 = time.time()
             try:
                 hits, blocked = scan(args)
+                auto_notes = annotate_ath_gates(hits, args)
             except Exception as exc:  # noqa: BLE001
                 _clear_screen()
                 print(f"{RED}Scan failed: {exc}{RESET}")
@@ -903,13 +1612,24 @@ def watch_loop(args: argparse.Namespace) -> int:
             )
             print()
             why_n = int(getattr(args, "why", 15) or 0)
+            prev_before = prev
             prev = print_hits(
                 hits,
                 ideal_near=args.ideal_near,
                 prev=prev,
                 blocked=blocked,
                 why_limit=why_n,
+                hint=format_dca_hint(args),
             )
+            tg_on = bool(getattr(args, "telegram", False))
+            _maybe_telegram_notify(
+                hits,
+                ideal_near=args.ideal_near,
+                prev_map=prev_before,
+                enabled=tg_on,
+            )
+            _maybe_daily_summary(tg_on)
+            _maybe_notify_weekend_block(telegram=tg_on)
             maybe_write_snapshot(
                 args,
                 hits=hits,
@@ -918,6 +1638,7 @@ def watch_loop(args: argparse.Namespace) -> int:
                 time_s=now,
                 scan_s=elapsed,
                 mode=mode,
+                auto_notes=auto_notes,
             )
             if auto:
                 print()
@@ -956,7 +1677,7 @@ Examples:
 Auto-trade launches per ★:
   dca SYMBOL short --exit structure --protect-be \\
     --be-arm-pct 1 --be-profit-pct 0.3 \\
-    --post-be trail --post-be-arm-pct 2 --post-be-callback 0.8 --once
+    --post-be trail --post-be-arm-pct 1.5 --post-be-callback 0.6 --once
 
   TP = EQL (short) / EQH (long).
   BE protect arms at +1% → SL @ entry+0.3%; trail from +2% (cb 0.8%).
@@ -1017,15 +1738,50 @@ Production (VPS):
         "--auto-trade",
         action="store_true",
         help="With --watch: run the top ★ from this list via "
-             "`dca SYMBOL short --exit structure` + BE protect --once "
-             "(up to --max-trades)",
+             "`dca SYMBOL short` + --trade-exit --once (up to --max-trades)",
+    )
+    p.add_argument(
+        "--trade-exit",
+        choices=["structure", "ob", "trailing", "pullback", "ratchet", "be", "staged", "none"],
+        default=None,
+        help="Primary exit for auto-trade children (default: ratchet). "
+             "Wins over TRADE_EXIT / EXIT_MODE in .env. "
+             "Env is used only when this flag is omitted",
+    )
+    p.add_argument(
+        "--protect-be",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pass --protect-be to dca children (default on; ignored by ratchet). "
+             "Use --no-protect-be for exit-only (no BE SL)",
+    )
+    p.add_argument(
+        "--also-structure",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="With --trade-exit ratchet: also pass --also-structure so EQL/EQH "
+             "can close earlier (evaluate vs ratchet SL). Default off. "
+             "Env on the dca child: ALSO_STRUCTURE=1",
+    )
+    p.add_argument(
+        "--imb-long",
+        type=float,
+        default=None,
+        help="With --trade-exit ob: OB Long imbalance threshold (default 0.55)",
+    )
+    p.add_argument(
+        "--ob-band-pct",
+        type=float,
+        default=None,
+        help="With --trade-exit ob: depth band %% for imbalance (default 1.0)",
     )
     p.add_argument(
         "--max-trades",
         type=int,
         default=3,
         help="With --auto-trade: how many top ★ from this scan to run "
-             "(this bot only; other account pairs do not count; default 3)",
+             "(this bot only; other account pairs do not count; default 3). "
+             ".env MAX_TRADES overrides after restart",
     )
     p.add_argument(
         "--loss-cooldown-min",
@@ -1042,14 +1798,28 @@ Production (VPS):
     p.add_argument(
         "--post-be-arm-pct",
         type=float,
-        default=2.0,
-        help="With --auto-trade: arm post-BE trail at this profit %% (default 2)",
+        default=1.5,
+        help="With --auto-trade: arm post-BE trail at this profit %% (default 1.5)",
     )
     p.add_argument(
         "--post-be-callback",
         type=float,
-        default=0.8,
-        help="With --auto-trade: post-BE trailing callbackRate %% (default 0.8)",
+        default=0.6,
+        help="With --auto-trade: post-BE trailing callbackRate %% (default 0.6)",
+    )
+    p.add_argument(
+        "--margin-ratio-soft",
+        type=float,
+        default=float(os.getenv("MARGIN_RATIO_SOFT", "3") or 3),
+        help="Binance Margin Ratio %% ≥ this → no new ★ (default 3; 0=off). "
+             "Env: MARGIN_RATIO_SOFT",
+    )
+    p.add_argument(
+        "--margin-ratio-hard",
+        type=float,
+        default=float(os.getenv("MARGIN_RATIO_HARD", "5") or 5),
+        help="Passed to dca: %% ≥ this → cancel DCA limits; below → re-arm "
+             "(default 5; 0=off). Env: MARGIN_RATIO_HARD",
     )
     p.add_argument(
         "--why",
@@ -1072,6 +1842,13 @@ Production (VPS):
         action="store_true",
         help="Do not write the web snapshot JSON (trading unchanged either way)",
     )
+    p.add_argument(
+        "--telegram",
+        action="store_true",
+        help="Post ★ opens + daily PnL %% summary to the public Pumpstall channel "
+             "(TELEGRAM_BOT_TOKEN + TELEGRAM_PUMPSTALL_CHAT_ID=@pumpstall). "
+             "Closes with %% only are mirrored whenever the channel is configured.",
+    )
     return p.parse_args(argv)
 
 
@@ -1088,12 +1865,22 @@ def main(argv: list[str] | None = None) -> int:
         f"{DIM}(1D blow-off filter · display only){RESET}"
     )
     hits, blocked = scan(args)
+    annotate_ath_gates(hits, args)
     print_hits(
         hits,
         ideal_near=args.ideal_near,
         blocked=blocked,
         why_limit=int(getattr(args, "why", 15) or 0),
+        hint=format_dca_hint(args),
     )
+    if getattr(args, "telegram", False):
+        _maybe_telegram_notify(
+            hits,
+            ideal_near=args.ideal_near,
+            prev_map=None,
+            enabled=True,
+            bootstrap=True,
+        )
     maybe_write_snapshot(
         args,
         hits=hits,

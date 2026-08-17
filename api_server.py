@@ -513,6 +513,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
+            if method == "GET" and path == "/pump-stall-stats":
+                self._handle_pump_stall_stats()
+                return
             if method == "GET" and path == "/scan":
                 self._handle_scan(qs)
                 return
@@ -608,6 +611,36 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not isinstance(data, dict):
             _json_response(self, 500, {"ok": False, "error": "Snapshot must be an object"})
+            return
+        _json_response(self, 200, {"ok": True, **data})
+
+    def _handle_pump_stall_stats(self) -> None:
+        """Private trade/exit stats JSON (requires API_TOKEN)."""
+        raw = _env("PUMPSTALL_STATS_PATH", "")
+        path = Path(raw) if raw else ROOT / ".state" / "pumpstall_stats.json"
+        if not path.is_file():
+            # Build on the fly from the trade log if snapshot missing
+            try:
+                import pumpstall_telegram as pst
+
+                path = pst.write_stats_snapshot()
+            except Exception as exc:  # noqa: BLE001
+                _json_response(
+                    self,
+                    404,
+                    {
+                        "ok": False,
+                        "error": f"Stats not found ({exc}) — expected {path}",
+                    },
+                )
+                return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _json_response(self, 500, {"ok": False, "error": f"Bad stats: {exc}"})
+            return
+        if not isinstance(data, dict):
+            _json_response(self, 500, {"ok": False, "error": "Stats must be an object"})
             return
         _json_response(self, 200, {"ok": True, **data})
 

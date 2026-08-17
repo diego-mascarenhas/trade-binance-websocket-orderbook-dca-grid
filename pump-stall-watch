@@ -8,7 +8,7 @@
 #   ./pump-stall-watch-early                   # TEST early profile + auto-trade
 #   ./pump-stall-watch --help
 #
-# Auto-trade → dca short --exit structure + BE@1%→0.3% + trail@2%/0.8% --once
+# Auto-trade → dca short --exit structure + BE@1%→0.3% + trail@1.5%/0.6% --once
 # Production: sudo systemctl enable --now pump-stall-watch
 # Docs: README.md → Pump→stall scanner
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
