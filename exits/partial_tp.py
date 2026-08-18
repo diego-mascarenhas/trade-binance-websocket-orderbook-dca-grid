@@ -15,7 +15,9 @@ A favorable burst (``--partial-tp-burst-pct``, default 2%) can skip the 5×
 TP gate so a 1× fill that explodes still gets the partial. The DCA cap
 still applies (burst does not authorize more size).
 
-Does **not** cancel BE / post-BE trail. On TP1 fill: cancel leftover DCA.
+On TP1 fill: cancel the management SL (BE / ratchet / trail / ATH),
+and place a fresh DCA-only grid on the runner. Do not re-arm those SLs
+for the rest of this position.
 """
 
 from __future__ import annotations
@@ -213,11 +215,24 @@ def trim_orders_to_dca_cap(
 
 
 def partial_tp_already_filled(symbol: str) -> bool:
-    """Runner after the 70% TP — do not add more DCA."""
+    """True after the 70% TP on this position (no second partial until flat)."""
     try:
         import orderbook_staged_exit as staged
 
         return bool((staged.load_state(symbol.upper()) or {}).get("partial_tp_filled"))
+    except Exception:
+        return False
+
+
+def sl_paused_after_partial(symbol: str) -> bool:
+    """True after TP1: do not re-arm BE / ratchet SL on the runner."""
+    try:
+        import orderbook_staged_exit as staged
+
+        state = staged.load_state(symbol.upper()) or {}
+        if bool(state.get("sl_paused_after_partial")):
+            return True
+        return bool(state.get("partial_tp_filled"))
     except Exception:
         return False
 
@@ -232,9 +247,11 @@ def dca_adds_blocked(
     sec: str,
     recv: int,
 ) -> tuple[bool, str]:
-    """Whether to freeze DCA (cancel leftovers + skip re-arm)."""
-    if partial_tp_already_filled(symbol):
-        return True, "after partial TP"
+    """Whether to freeze DCA (cancel leftovers + skip re-arm).
+
+    After partial TP the runner *should* get a new grid — only the 12× cap
+    (and the ★ one-grid bypass) freeze adds.
+    """
     try:
         import star_rearm as sr
 
@@ -247,6 +264,149 @@ def dca_adds_blocked(
         notional = position_notional(qty, entry)
         return True, f"notional {notional:,.0f} USDT ≥ {label}"
     return False, ""
+
+
+def _cancel_management_sl(
+    symbol: str,
+    _side_is_long: bool,
+    api: str,
+    sec: str,
+    recv: int,
+) -> int:
+    """Drop BE / ratchet / trail / leftover TP1 / ATH SL after partial TP."""
+    import orderbook_staged_exit as staged
+
+    killed = 0
+    for tag in ("BE", "TR", "SL", "TP1", "RR", "RF"):
+        try:
+            killed += staged.cancel_our_algos(symbol, tag, api, sec, recv)
+        except Exception:
+            pass
+    return killed
+
+
+def _place_fresh_grid(
+    symbol: str,
+    side_is_long: bool,
+    args: argparse.Namespace,
+    api: str,
+    sec: str,
+    filt: dict,
+    *,
+    dry: bool,
+) -> bool:
+    import orderbook_dca_grid as grid
+
+    recv = int(getattr(args, "recv_window", 15000) or 15000)
+    try:
+        grid.cancel_dca_grid_orders(symbol, api, sec, recv)
+    except Exception as exc:
+        print(f"{grid.YELLOW}Cancel DCA after partial TP: {exc}{grid.RESET}")
+    if dry:
+        print(f"{grid.DIM}DRY-RUN · would place a new DCA grid after partial TP{grid.RESET}")
+        return False
+    direction = "long" if side_is_long else "short"
+    print(
+        f"{grid.BOLD}{grid.CYAN}Partial TP → new DCA grid "
+        f"({direction.upper()} runner){grid.RESET}"
+    )
+    try:
+        placed = grid.build_and_place_grid(
+            args, api, sec, filt, verbose=True,
+            dca_only=True, force=True, direction=direction,
+        )
+    except Exception as exc:
+        print(f"{grid.YELLOW}New grid after partial TP failed: {exc}{grid.RESET}")
+        return False
+    if placed:
+        try:
+            import telegram_notify as telegram
+
+            oo = grid._signed_request(
+                "GET", "/fapi/v1/openOrders",
+                {"symbol": symbol.upper()}, api, sec, recv,
+            ) or []
+            lev = grid.get_symbol_leverage(symbol, api, sec, recv)
+            telegram.notify_grid_armed(
+                symbol.upper(), direction.upper(),
+                grid.count_dca_orders(oo, symbol),
+                dca_only=True,
+                grid_vol_usdt=grid.sum_dca_notional(oo, symbol),
+                leverage=lev,
+            )
+        except Exception:
+            pass
+    else:
+        print(
+            f"{grid.YELLOW}No walls for a new grid after partial TP — "
+            f"supervisor will retry{grid.RESET}"
+        )
+    return bool(placed)
+
+
+def _on_partial_tp_fill(
+    symbol: str,
+    side_is_long: bool,
+    qty: float,
+    entry: float,
+    args: argparse.Namespace,
+    hedge: bool,
+    api: str,
+    sec: str,
+    filt: dict,
+    state: dict,
+    *,
+    tp1_qty: float,
+    partial_pct: float,
+) -> None:
+    """SL off + fresh grid on the runner. ``qty`` is remaining size."""
+    import orderbook_dca_grid as grid
+    import orderbook_staged_exit as staged
+
+    recv = int(getattr(args, "recv_window", 15000) or 15000)
+    dry = bool(getattr(args, "dry_run", False))
+    side = "LONG" if side_is_long else "SHORT"
+    print(
+        f"{grid.GREEN}✓ Partial TP filled · {side} ~{partial_pct:g}% closed "
+        f"→ runner {qty:g} (SL off, new grid){grid.RESET}"
+    )
+    if dry:
+        print(f"{grid.DIM}DRY-RUN · would cancel SL/trail and place a new grid{grid.RESET}")
+        killed = 0
+    else:
+        killed = _cancel_management_sl(symbol, side_is_long, api, sec, recv)
+    if killed:
+        print(f"{grid.YELLOW}Cancelled {killed} SL/trail/TP1 algo(s) after partial TP{grid.RESET}")
+
+    algo_ids = dict(state.get("algo_ids") or {})
+    for key in ("tp1", "be", "trail", "sl", "rf", "rr"):
+        algo_ids.pop(key, None)
+    state.update({
+        "partial_tp_armed": False,
+        "partial_tp_filled": True,
+        "sl_paused_after_partial": True,
+        "be_protect_armed": False,
+        "post_be_trail_armed": False,
+        "ratchet_sl": None,
+        "be_price": None,
+        "algo_ids": algo_ids,
+    })
+    staged.save_state(symbol.upper(), state)
+
+    try:
+        import telegram_notify as telegram
+
+        lev = grid.get_symbol_leverage(symbol, api, sec, recv)
+        _, upnl = staged.position_pnl(symbol, side_is_long, hedge, api, sec, recv)
+        telegram.notify_tp1_filled(
+            symbol.upper(), side, tp1_qty, qty, entry,
+            tp1_price=float(state.get("partial_tp_price", entry) or entry),
+            leverage=lev, pnl_usdt=upnl,
+        )
+    except Exception:
+        pass
+
+    _place_fresh_grid(symbol, side_is_long, args, api, sec, filt, dry=dry)
 
 
 def run_once(
@@ -307,37 +467,24 @@ def run_once(
         and qty < armed - tol
         and qty <= (armed - tp1_qty) + tol
     ):
-        print(
-            f"{grid.GREEN}✓ Partial TP filled · {side} ~{partial:g}% closed "
-            f"→ runner {qty:g} (cancel DCA, keep BE/structure){grid.RESET}"
+        _on_partial_tp_fill(
+            sym, side_is_long, qty, entry, args, hedge, api, sec, filt, state,
+            tp1_qty=tp1_qty, partial_pct=partial,
         )
-        try:
-            grid.cancel_dca_grid_orders(sym, api, sec, recv)
-        except Exception as exc:
-            print(f"{grid.YELLOW}Cancel DCA after partial TP: {exc}{grid.RESET}")
-        try:
-            import telegram_notify as telegram
-
-            lev = grid.get_symbol_leverage(sym, api, sec, recv)
-            _, upnl = staged.position_pnl(sym, side_is_long, hedge, api, sec, recv)
-            telegram.notify_tp1_filled(
-                sym, side, tp1_qty, qty, entry,
-                tp1_price=float(state.get("partial_tp_price", entry) or entry),
-                leverage=lev, pnl_usdt=upnl,
-            )
-        except Exception:
-            pass
-        state["partial_tp_armed"] = False
-        state["partial_tp_filled"] = True
-        staged.cancel_our_algos(sym, "TP1", api, sec, recv)
-        algo_ids = dict(state.get("algo_ids") or {})
-        algo_ids.pop("tp1", None)
-        state["algo_ids"] = algo_ids
-        staged.save_state(sym, state)
         return
 
     if bool(state.get("partial_tp_filled")):
-        # Already took the 70% — do not re-arm on the runner
+        # Already took the 70% — keep SL off; supervisor re-arms the grid.
+        if not bool(state.get("sl_paused_after_partial")):
+            state["sl_paused_after_partial"] = True
+            staged.save_state(sym, state)
+        if not dry:
+            killed = _cancel_management_sl(sym, side_is_long, api, sec, recv)
+            if killed:
+                print(
+                    f"{grid.YELLOW}Partial TP runner · cancelled {killed} leftover "
+                    f"SL/trail algo(s){grid.RESET}"
+                )
         return
 
     already_armed = bool(state.get("partial_tp_armed"))
@@ -387,22 +534,36 @@ def run_once(
             f"{grid.YELLOW}Partial TP already hit (mark) — "
             f"{close_side} MARKET {tp1_str} ({partial:g}%){grid.RESET}"
         )
+        runner_qty = qty
         if not dry:
             staged._market_reduce_qty(
                 sym, side_is_long, tp1_d, hedge, filt, api, sec, recv,
             )
-            try:
-                grid.cancel_dca_grid_orders(sym, api, sec, recv)
-            except Exception:
-                pass
+            refreshed = grid._detect_open_side(
+                sym, hedge, api, sec, recv, prefer_is_long=side_is_long,
+            )
+            if refreshed[0] is None or refreshed[1] <= 0:
+                state.update({
+                    "partial_tp_armed": False,
+                    "partial_tp_filled": True,
+                    "partial_tp_qty": float(tp1_d),
+                    "partial_tp_price": tp1_trig_f,
+                    "partial_tp_armed_qty": float(grid._round_to(qty, step, ROUND_DOWN)),
+                    "sl_paused_after_partial": True,
+                })
+                staged.save_state(sym, state)
+                return
+            runner_qty = refreshed[1]
+            entry = refreshed[2] or entry
         state.update({
-            "partial_tp_armed": False,
-            "partial_tp_filled": True,
             "partial_tp_qty": float(tp1_d),
             "partial_tp_price": tp1_trig_f,
             "partial_tp_armed_qty": float(grid._round_to(qty, step, ROUND_DOWN)),
         })
-        staged.save_state(sym, state)
+        _on_partial_tp_fill(
+            sym, side_is_long, runner_qty, entry, args, hedge, api, sec, filt, state,
+            tp1_qty=float(tp1_d), partial_pct=partial,
+        )
         return
 
     print(
@@ -423,18 +584,30 @@ def run_once(
             staged._market_reduce_qty(
                 sym, side_is_long, tp1_d, hedge, filt, api, sec, recv,
             )
-            try:
-                grid.cancel_dca_grid_orders(sym, api, sec, recv)
-            except Exception:
-                pass
+            refreshed = grid._detect_open_side(
+                sym, hedge, api, sec, recv, prefer_is_long=side_is_long,
+            )
+            if refreshed[0] is None or refreshed[1] <= 0:
+                state.update({
+                    "partial_tp_armed": False,
+                    "partial_tp_filled": True,
+                    "partial_tp_qty": float(tp1_d),
+                    "partial_tp_price": tp1_trig_f,
+                    "partial_tp_armed_qty": float(grid._round_to(qty, step, ROUND_DOWN)),
+                    "sl_paused_after_partial": True,
+                })
+                staged.save_state(sym, state)
+                return
             state.update({
-                "partial_tp_armed": False,
-                "partial_tp_filled": True,
                 "partial_tp_qty": float(tp1_d),
                 "partial_tp_price": tp1_trig_f,
                 "partial_tp_armed_qty": float(grid._round_to(qty, step, ROUND_DOWN)),
             })
-            staged.save_state(sym, state)
+            _on_partial_tp_fill(
+                sym, side_is_long, refreshed[1], refreshed[2] or entry,
+                args, hedge, api, sec, filt, state,
+                tp1_qty=float(tp1_d), partial_pct=partial,
+            )
             return
         raise
 

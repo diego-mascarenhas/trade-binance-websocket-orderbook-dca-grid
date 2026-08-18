@@ -538,6 +538,14 @@ def run_once(
     if entry <= 0 or qty <= 0:
         return
 
+    try:
+        from exits.partial_tp import sl_paused_after_partial
+
+        if sl_paused_after_partial(symbol):
+            return
+    except Exception:
+        pass
+
     import orderbook_dca_grid as grid
     import orderbook_staged_exit as staged
 

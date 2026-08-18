@@ -516,7 +516,8 @@ def notify_tp1_filled(
         f"TP1 filled\n"
         f"Closed {tp1_qty:g} · {fmt_vol(tp1_qty, price, leverage)}\n"
         f"Runner {remain_qty:g} · {fmt_vol(remain_qty, entry, leverage)}"
-        f"{pnl_suffix(pnl_usdt, notional, leverage)}",
+        f"{pnl_suffix(pnl_usdt, notional, leverage)}\n"
+        f"SL off · new grid",
     )
 
 

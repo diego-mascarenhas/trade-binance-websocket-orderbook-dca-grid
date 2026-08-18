@@ -1714,7 +1714,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
     once_max_arm_fails = max(0, int(_env_float("ONCE_MAX_ARM_FAILS", 5.0)))
     once_arm_fails = 0
     margin_dca_frozen = False  # True after hard strip until ratio < hard
-    dca_size_frozen = False  # True after 12× (or custom) size cap / partial TP
+    dca_size_frozen = False  # True after 12× (or custom) size cap
     last_mr_log: str | None = None
     sym = args.symbol.upper()
     try:
@@ -2414,6 +2414,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="[--exit structure|ratchet] Arm TAKE_PROFIT on --tp-partial-pct when position "
              "notional ≥ --partial-tp-min-entry-pct of entry (default on). "
+             "On fill: cancel BE/ratchet SL and place a new DCA grid on the runner. "
              "Use --no-partial-tp to disable",
     )
     p.add_argument(

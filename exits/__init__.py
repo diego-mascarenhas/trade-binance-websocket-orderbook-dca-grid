@@ -3,7 +3,8 @@
 Composition model:
   --exit <eql|trailing|ob|pullback|ratchet|…>   primary close method
   --protect-be / --no-protect-be   optional BE SL addon (not stacked with ratchet)
-  --partial-tp                     5× / burst partial (structure + ratchet)
+  --partial-tp                     5× / burst partial (structure + ratchet);
+                                   on fill: SL off + new grid on the runner
   --also-structure                 overlay EQL/EQH close on top of ratchet
   --post-be trail                  optional trail *after* BE (structure/be only)
   --risk-reduce / --no-risk-reduce optional SHORT full SL at ATH + RISK_ATH_SL_PCT
@@ -129,6 +130,13 @@ def clear_exit_presets(
     from exits.structure import cancel_close_algos
 
     sym = symbol.upper()
+    prev = {}
+    try:
+        prev = staged.load_state(sym) or {}
+    except Exception:
+        prev = {}
+    filled = bool(prev.get("partial_tp_filled"))
+    paused = bool(prev.get("sl_paused_after_partial")) or filled
     staged_n = staged.cancel_all_staged_algos(sym, api, sec, recv)
     try:
         staged.save_state(
@@ -138,6 +146,9 @@ def clear_exit_presets(
                 "symbol": sym,
                 "remain_qty": 0.0,
                 "algo_ids": {},
+                "partial_tp_filled": filled,
+                "partial_tp_armed": False,
+                "sl_paused_after_partial": paused,
             },
         )
     except Exception:
@@ -431,6 +442,9 @@ def run_exit_when_flat(
                 "ratchet_seen_levels": [],
                 "ratchet_broken": [],
                 "ratchet_extreme": None,
+                "partial_tp_filled": False,
+                "partial_tp_armed": False,
+                "sl_paused_after_partial": False,
             },
         )
         if n:
