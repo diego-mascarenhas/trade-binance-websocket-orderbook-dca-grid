@@ -137,9 +137,9 @@ def _maybe_post_be_trail(
     try:
         from exits.risk_reduce import recovery_pct_for
 
-        rec = float(recovery_pct_for(symbol) or 0)
+        rec = float(recovery_pct_for(symbol, qty, entry) or 0)
         if rec > 0:
-            arm = max(arm, rec)
+            arm = arm + rec
     except Exception:
         pass
     cb = post_be_callback(args)
@@ -248,10 +248,10 @@ def run_once(
     try:
         from exits.risk_reduce import recovery_pct_for
 
-        rec = float(recovery_pct_for(symbol) or 0)
+        rec = float(recovery_pct_for(symbol, qty, entry) or 0)
         if rec > 0:
-            arm_pct = max(arm_pct, rec)
-            lock_pct = max(lock_pct, rec)
+            lock_pct = lock_pct + rec
+            arm_pct = max(arm_pct, lock_pct)
     except Exception:
         pass
     side = "LONG" if side_is_long else "SHORT"

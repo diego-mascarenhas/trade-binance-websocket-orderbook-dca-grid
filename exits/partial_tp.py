@@ -371,6 +371,14 @@ def run_once(
     net_pct = tp1_profit_pct(args)
     fee_pct = tp_fee_buffer_pct(args)
     profit_pct = tp1_gross_pct(args)
+    try:
+        from exits.recovery import recovery_pct
+
+        rec = float(recovery_pct(symbol, qty=qty, entry=entry) or 0)
+        if rec > 0:
+            profit_pct = profit_pct + rec
+    except Exception:
+        rec = 0.0
     min_notional, thr_label = partial_tp_threshold(
         args, api=api, sec=sec, recv=recv,
     )
@@ -452,7 +460,8 @@ def run_once(
             print(
                 f"{grid.DIM}Partial TP armed · {side} {partial:g}% "
                 f"notional {notional:,.0f} USDT · "
-                f"TAKE_PROFIT @ {tp1_trig} (+{net_pct:g}% net + {fee_pct:g}% fees){grid.RESET}"
+                f"TAKE_PROFIT @ {tp1_trig} (+{net_pct:g}% net + {fee_pct:g}% fees"
+                f"{f' + recover {rec:.2f}%' if rec > 0 else ''}){grid.RESET}"
             )
             return
 
@@ -498,7 +507,9 @@ def run_once(
 
     print(
         f"{close_side} TAKE_PROFIT_MARKET {tp1_str} ({partial:g}%) @ {tp1_trig} "
-        f"(+{net_pct:g}% net + {fee_pct:g}% fees · notional {notional:,.0f} USDT ≥ {thr_label})"
+        f"(+{net_pct:g}% net + {fee_pct:g}% fees"
+        f"{f' + recover {rec:.2f}%' if rec > 0 else ''}"
+        f" · notional {notional:,.0f} USDT ≥ {thr_label})"
     )
     if dry:
         return

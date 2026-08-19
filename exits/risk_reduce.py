@@ -130,9 +130,18 @@ def allow_dca_rearm(symbol: str) -> bool:
     return True
 
 
-def recovery_pct_for(symbol: str) -> float:
-    """Legacy hook — no RR recovery floor after ATH-only change."""
-    return 0.0
+def recovery_pct_for(
+    symbol: str,
+    qty: float | None = None,
+    entry: float | None = None,
+) -> float:
+    """%% the runner must make to cover realized debt from prior reduces."""
+    try:
+        from exits.recovery import recovery_pct
+
+        return float(recovery_pct(symbol, qty=qty, entry=entry) or 0)
+    except Exception:
+        return 0.0
 
 
 def _ath_cache_path(symbol: str) -> Path:
@@ -514,6 +523,8 @@ def sync_flat(
         "risk_recovery_active",
         "risk_reduce_pct",
         "risk_ath_sl_pct",
+        "recovery_realized_usdt",
+        "recovery_qty",
     ):
         st.pop(k, None)
     staged.save_state(symbol.upper(), st)

@@ -138,20 +138,24 @@ def clear_exit_presets(
         prev = {}
     filled = bool(prev.get("partial_tp_filled"))
     paused = bool(prev.get("sl_paused_after_partial")) or filled
+    realized = prev.get("recovery_realized_usdt")
+    rec_qty = prev.get("recovery_qty")
     staged_n = staged.cancel_all_staged_algos(sym, api, sec, recv)
     try:
-        staged.save_state(
-            sym,
-            {
-                "phase": staged.PHASE_IDLE,
-                "symbol": sym,
-                "remain_qty": 0.0,
-                "algo_ids": {},
-                "partial_tp_filled": filled,
-                "partial_tp_armed": False,
-                "sl_paused_after_partial": paused,
-            },
-        )
+        keep: dict = {
+            "phase": staged.PHASE_IDLE,
+            "symbol": sym,
+            "remain_qty": 0.0,
+            "algo_ids": {},
+            "partial_tp_filled": filled,
+            "partial_tp_armed": False,
+            "sl_paused_after_partial": paused,
+        }
+        if realized is not None:
+            keep["recovery_realized_usdt"] = realized
+        if rec_qty is not None:
+            keep["recovery_qty"] = rec_qty
+        staged.save_state(sym, keep)
     except Exception:
         pass
     close_n = cancel_close_algos(sym, side_is_long, api, sec, recv)
@@ -449,6 +453,8 @@ def run_exit_when_flat(
                 "partial_tp_filled": False,
                 "partial_tp_armed": False,
                 "sl_paused_after_partial": False,
+                "recovery_realized_usdt": 0.0,
+                "recovery_qty": 0.0,
             },
         )
         if n:

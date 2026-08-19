@@ -65,7 +65,7 @@ def run_once(
     try:
         from exits.risk_reduce import recovery_pct_for
 
-        need = float(recovery_pct_for(symbol) or 0)
+        need = float(recovery_pct_for(symbol, qty, entry) or 0)
     except Exception:
         need = 0.0
     in_profit = gross >= max(need, 0.0) and estimated_net_pct(gross, fee_buf) > 0

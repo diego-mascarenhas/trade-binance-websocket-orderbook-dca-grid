@@ -340,6 +340,15 @@ def run_once(
     pierce = break_pct(args)
     min_pct = min_profit_pct(args)
     lock_pct = be_lock_pct(args)
+    try:
+        from exits.recovery import recovery_pct
+
+        rec = float(recovery_pct(symbol, qty=qty, entry=entry) or 0)
+        if rec > 0:
+            lock_pct = lock_pct + rec
+            min_pct = max(min_pct, lock_pct)
+    except Exception:
+        rec = 0.0
     min_mult = wall_min_mult(args)
 
     try:
@@ -397,7 +406,8 @@ def run_once(
     if pnl < min_pct and old_sl_f is None:
         print(
             f"{grid.DIM}Ratchet wait · {side} pnl={pnl:+.3f}% "
-            f"(need ≥{min_pct:g}% to arm entry floor) · "
+            f"(need ≥{min_pct:g}% to arm entry floor"
+            f"{f' · recover {rec:.2f}%' if rec > 0 else ''}) · "
             f"seen={len(levels)} live={len(live)}{grid.RESET}"
         )
         staged.save_state(symbol.upper(), state)

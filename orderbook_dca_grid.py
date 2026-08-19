@@ -1740,6 +1740,35 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             pnl_usdt=pnl,
                         )
                         trade_sounds.play_sound("entry")
+                    elif last_position_qty > 0 and qty + float(filt["step_size"]) / 2 < last_position_qty:
+                        try:
+                            from exits.recovery import note_slice, debt_usdt
+
+                            closed = last_position_qty - qty
+                            prev_entry = float(last_pos_meta.get("entry") or entry or 0)
+                            fill_px = float(pos_meta.get("mark") or 0) or prev_entry
+                            total = note_slice(
+                                sym,
+                                closed_qty=closed,
+                                entry=prev_entry,
+                                fill_price=fill_px,
+                                is_long=side_is_long,
+                                remain_qty=qty,
+                            )
+                            hole = debt_usdt(sym)
+                            if hole > 0:
+                                print(
+                                    f"{YELLOW}Recovery · reduce {closed:g} booked "
+                                    f"{total:+.2f} USDT realized · "
+                                    f"runner must cover {hole:.2f} USDT{RESET}"
+                                )
+                            elif total > 0:
+                                print(
+                                    f"{DIM}Recovery · reduce {closed:g} booked "
+                                    f"{total:+.2f} USDT realized (no debt){RESET}"
+                                )
+                        except Exception:
+                            pass
                     elif last_position_qty > 0 and qty > last_position_qty + float(filt["step_size"]) / 2:
                         dca_qty = qty - last_position_qty
                         old_notional = float(last_pos_meta.get("notional", 0) or 0)
