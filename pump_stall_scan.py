@@ -13,7 +13,7 @@ Display-only by default. With --watch --auto-trade: run the top
 Primary exit via `--trade-exit` / .env TRADE_EXIT|EXIT_MODE
   (structure|ob|trailing|pullback|ratchet…); BE is optional
 via `--protect-be` / `--no-protect-be` (orthogonal).
-Early profile: `--trade-exit ratchet` (BE floor + wall SL + 5× partial TP).
+Early profile: `--trade-exit ratchet` (BE floor + wall SL + 5× partial TP; --exit stays after TP1).
 Other open pairs on the account do not consume these slots.
 Account Margin Ratio (Binance UI): ≥ soft (default 5%) → no new ★;
 ≥ hard (default 8%) → cancel DCA limits (keep exits); below hard → re-arm DCA.
@@ -650,6 +650,14 @@ def format_dca_hint(args: argparse.Namespace | None = None) -> str:
     exit_mode = str(s.get("trade_exit") or "ratchet")
     gap = f"--min-gap {s['min_gap']:g} --so-count {s['so_count']}"
     be = " --protect-be" if s.get("protect_be", True) else " --no-protect-be"
+    if exit_mode == "none":
+        times = float(s.get("partial_tp_min_entry_pct") or 500) / 100.0
+        dca_x = float(s.get("dca_max_entry_pct") or 1200) / 100.0
+        return (
+            f"Hint: dca SYMBOL short --exit none · ATH SL "
+            f"+ TP{s['tp_partial_pct']:g}%@+{s['tp1_profit_pct']:g}%"
+            f"(≥{times:g}×) · DCA≤{dca_x:g}× {gap} --once"
+        )
     if exit_mode == "ob":
         return (
             f"Hint: dca SYMBOL short --exit ob{be} "
@@ -1175,8 +1183,8 @@ def _trade_exit_mode(args: argparse.Namespace) -> str:
     """Primary exit for auto-trade children.
 
     Preference: explicit ``--trade-exit`` → TRADE_EXIT → EXIT_MODE → ratchet.
-    Early default is BE+ratchet. CLI wins over .env so a leftover EXIT_MODE
-    cannot silently replace the unit flag.
+    CLI wins over .env so a leftover EXIT_MODE cannot silently replace the
+    unit flag.
     """
     cli = getattr(args, "trade_exit", None)
     raw = (
@@ -1316,6 +1324,26 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         launch_note = (
             f"dca short --exit ratchet · BE floor@+1%→0.3% "
             f"+ TP70%@+0.3%(≥5×) · DCA≤12×{overlay} --once"
+        )
+    elif exit_mode == "none":
+        if "--protect-be" in cmd:
+            cmd[cmd.index("--protect-be")] = "--no-protect-be"
+        elif "--no-protect-be" not in cmd:
+            cmd.append("--no-protect-be")
+        for flag in ("--be-arm-pct", "--be-profit-pct"):
+            if flag in cmd:
+                i = cmd.index(flag)
+                del cmd[i:i + 2]
+        cmd.extend([
+            "--partial-tp",
+            "--tp-partial-pct", "70",
+            "--tp1-profit-pct", "0.3",
+            "--partial-tp-min-entry-pct", "500",
+            "--dca-max-entry-pct", "1200",
+        ])
+        launch_note = (
+            "dca short --exit none · ATH SL "
+            "+ TP70%@+0.3%(≥5×) · DCA≤12× --once"
         )
     elif exit_mode == "ob":
         imb = getattr(args, "imb_long", None)
@@ -1751,8 +1779,8 @@ Production (VPS):
         choices=["structure", "ob", "trailing", "pullback", "ratchet", "be", "staged", "none"],
         default=None,
         help="Primary exit for auto-trade children (default: ratchet). "
-             "Wins over TRADE_EXIT / EXIT_MODE in .env. "
-             "Env is used only when this flag is omitted",
+             "Stays on the runner after TP1. Wins over TRADE_EXIT / EXIT_MODE "
+             "in .env. Env is used only when this flag is omitted",
     )
     p.add_argument(
         "--protect-be",

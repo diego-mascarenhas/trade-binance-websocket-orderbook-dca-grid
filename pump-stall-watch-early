@@ -5,10 +5,9 @@
 #   stall ≥ 25 (default 35) · near ≥ 82 (default 85) · ★ near ≥ 90 (default 92)
 #
 # Exit composition on auto-trade ★:
-#   --trade-exit ratchet  → BE floor + SL to previous wall
-#   --partial-tp          → 5× / 70% @ 0.3%+fees; on fill: SL off + new grid
-#                            (auto-DCA still caps at 12×; ★ may add one more)
-#   --also-structure      → optional: EQL/EQH may close earlier (evaluate)
+#   --trade-exit ratchet  → BE floor + SL to previous wall (stays after TP1)
+#   --partial-tp          → 5× / 70% @ 0.3%+fees; on fill: wipe LIMITs,
+#                            keep --exit + ATH SL, re-arm grid
 #
 # Usage:
 #   ./pump-stall-watch-early

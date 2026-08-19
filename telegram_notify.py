@@ -501,6 +501,7 @@ def notify_tp1_filled(
     tp1_price: float | None = None,
     leverage: float | int | None = None,
     pnl_usdt: float | None = None,
+    note: str | None = None,
 ) -> None:
     price = tp1_price if tp1_price and tp1_price > 0 else entry
     notional = abs(remain_qty) * abs(entry)
@@ -517,7 +518,7 @@ def notify_tp1_filled(
         f"Closed {tp1_qty:g} · {fmt_vol(tp1_qty, price, leverage)}\n"
         f"Runner {remain_qty:g} · {fmt_vol(remain_qty, entry, leverage)}"
         f"{pnl_suffix(pnl_usdt, notional, leverage)}\n"
-        f"SL off · new grid",
+        f"{note or 'SL off · new grid'}",
     )
 
 

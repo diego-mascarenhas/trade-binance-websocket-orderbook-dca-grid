@@ -1648,6 +1648,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
         print(f"{RED}Could not load symbol filters: {exc}{RESET}")
         return
     from exits import (
+        EXIT_NONE,
         EXIT_OB,
         EXIT_PULLBACK,
         EXIT_RATCHET,
@@ -1947,6 +1948,15 @@ def supervise_loop(args: argparse.Namespace) -> None:
                             try:
                                 if bool((staged.load_state(sym) or {}).get("partial_tp_filled")):
                                     close_reason = f"{close_reason} · after partial TP"
+                            except Exception:
+                                pass
+                        elif not close_reason and exit_mode == EXIT_NONE:
+                            import orderbook_staged_exit as staged
+
+                            close_reason = "ATH SL"
+                            try:
+                                if bool((staged.load_state(sym) or {}).get("partial_tp_filled")):
+                                    close_reason = "ATH SL · after partial TP"
                             except Exception:
                                 pass
                         elif not close_reason and after_runner:

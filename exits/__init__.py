@@ -3,11 +3,12 @@
 Composition model:
   --exit <eql|trailing|ob|pullback|ratchet|…>   primary close method
   --protect-be / --no-protect-be   optional BE SL addon (not stacked with ratchet)
-  --partial-tp                     5× / burst partial (structure + ratchet);
-                                   on fill: SL off + new grid on the runner
+  --partial-tp                     5× / burst partial (structure / ratchet / none);
+                                   on fill: wipe leftover TP1 + LIMITs; keep --exit
+                                   + ATH SL; re-arm fresh grid
   --also-structure                 overlay EQL/EQH close on top of ratchet
   --post-be trail                  optional trail *after* BE (structure/be only)
-  --risk-reduce / --no-risk-reduce optional SHORT full SL at ATH + RISK_ATH_SL_PCT
+  --risk-reduce / --no-risk-reduce SHORT catastrophe SL at ATH + RISK_ATH_SL_PCT
 
 Ratchet owns the BE algo tag (entry-floor SL, then walls). Partial TP and
 structure overlays may close earlier when they would be the better trade.
@@ -69,7 +70,7 @@ _LABELS = {
     EXIT_OB: "soft-close on OB flip (SHORT→OB Long) + optional BE",
     EXIT_PULLBACK: "soft-close on adverse pullback from favorable extreme (+ optional BE)",
     EXIT_RATCHET: "ratchet SL to previous support/resistance as walls break",
-    EXIT_NONE: "none",
+    EXIT_NONE: "ATH catastrophe SL + optional partial TP",
 }
 
 _VALID = {
@@ -288,16 +289,19 @@ def run_exit_once(
     except Exception as exc:  # noqa: BLE001
         print(f"Funding guard skip: {exc}")
 
-    if mode == EXIT_NONE:
-        return
-
-    # Orthogonal: impulse-high risk cut (SHORT) — before primary exit / BE
+    # Orthogonal: ATH catastrophe SL (SHORT) — even with --exit none
     refreshed = _run_optional_risk_reduce(
         symbol, side_is_long, qty, entry, args, hedge, api, sec, filt,
     )
     if refreshed is None:
         return
     side_is_long, qty, entry = refreshed
+
+    if mode == EXIT_NONE:
+        _run_optional_partial_tp(
+            symbol, side_is_long, qty, entry, args, hedge, api, sec, filt,
+        )
+        return
 
     if mode == EXIT_STAGED:
         from exits.staged import run_once

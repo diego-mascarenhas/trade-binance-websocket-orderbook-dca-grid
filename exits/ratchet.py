@@ -335,18 +335,6 @@ def run_once(
     if entry <= 0 or qty <= 0:
         return
 
-    try:
-        from exits.partial_tp import sl_paused_after_partial
-
-        if sl_paused_after_partial(symbol):
-            print(
-                f"{grid.DIM}Ratchet skip · SL paused after partial TP "
-                f"({symbol.upper()}){grid.RESET}"
-            )
-            return
-    except Exception:
-        pass
-
     recv = int(getattr(args, "recv_window", 15000) or 15000)
     side = "LONG" if side_is_long else "SHORT"
     pierce = break_pct(args)
