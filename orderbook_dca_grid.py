@@ -953,8 +953,16 @@ def get_margin_ratio_pct(api: str, sec: str, recv: int) -> float | None:
 
 def account_margin_ratio_blocks(
     args: argparse.Namespace, api: str, sec: str, verbose: bool = True,
+    *,
+    dca_only: bool = False,
 ) -> bool:
-    """True if Binance margin ratio ≥ --margin-ratio-soft (block new grids / ★)."""
+    """True if Binance margin ratio ≥ --margin-ratio-soft (block new grids / ★).
+
+    DCA-only re-arm on an open position is not an "open" — skip the soft
+    gate (hard strip / freeze still applies in the supervisor).
+    """
+    if dca_only:
+        return False
     soft = float(getattr(args, "margin_ratio_soft", 0) or 0)
     if soft <= 0:
         return False
@@ -1096,12 +1104,13 @@ def account_risk_blocks(
     *,
     leverage: float | None = None,
     verbose: bool = True,
+    dca_only: bool = False,
 ) -> bool:
     """True if any account risk guard blocks opening `add_notional` on this side."""
     lev = leverage if leverage and leverage > 0 else getattr(args, "leverage", 10.0)
     if account_imbalance_blocks(args, is_long, add_notional, api, sec, verbose):
         return True
-    if account_margin_ratio_blocks(args, api, sec, verbose):
+    if account_margin_ratio_blocks(args, api, sec, verbose, dca_only=dca_only):
         return True
     if account_liq_distance_blocks(args, api, sec, verbose):
         return True
@@ -1517,7 +1526,10 @@ def build_and_place_grid(args: argparse.Namespace, api: str, sec: str,
             except Exception:
                 pass
         add_notional = grid_add_notional(orders, args, dca_only=dca_only)
-        if account_risk_blocks(args, is_long, add_notional, api, sec, leverage=lev, verbose=verbose):
+        if account_risk_blocks(
+            args, is_long, add_notional, api, sec,
+            leverage=lev, verbose=verbose, dca_only=dca_only,
+        ):
             return False
     finally:
         args.force = prev_force
@@ -1715,7 +1727,7 @@ def supervise_loop(args: argparse.Namespace) -> None:
     once_max_arm_fails = max(0, int(_env_float("ONCE_MAX_ARM_FAILS", 5.0)))
     once_arm_fails = 0
     margin_dca_frozen = False  # True after hard strip until ratio < hard
-    dca_size_frozen = False  # True after 12× (or custom) size cap
+    dca_size_frozen = False  # True after optional per-symbol size cap
     last_mr_log: str | None = None
     sym = args.symbol.upper()
     try:
@@ -2357,9 +2369,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Skip new grid if projected initial margin / balance exceeds this %% "
                         "(0=off). Env: MAX_MARGIN_PCT")
     p.add_argument("--margin-ratio-soft", type=float,
-                   default=_env_float("MARGIN_RATIO_SOFT", 3.0),
+                   default=_env_float("MARGIN_RATIO_SOFT", 5.0),
                    help="Binance Margin Ratio %% (maint/equity). ≥ this → no new grids / ★ "
-                        "(default 3; 0=off). Env: MARGIN_RATIO_SOFT")
+                        "(default 5; 0=off). Env: MARGIN_RATIO_SOFT")
     p.add_argument("--margin-ratio-hard", type=float,
                    default=_env_float("MARGIN_RATIO_HARD", 5.0),
                    help="Binance Margin Ratio %%. ≥ this → cancel open DCA limits (keep TP/BE/trail); "
@@ -2469,8 +2481,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="Cancel leftover DCA and skip auto re-arm when filled notional ≥ this %% of "
-             "entry base (default 1200 = 12×). A new ★ may place one more grid. "
-             "0 = unlimited. Env: DCA_MAX_ENTRY_PCT",
+             "entry base (default 0 = off; account Margin Ratio 5% is the brake). "
+             "A new ★ may place one more grid past a custom cap. Env: DCA_MAX_ENTRY_PCT",
     )
     p.add_argument(
         "--partial-tp-min-notional",

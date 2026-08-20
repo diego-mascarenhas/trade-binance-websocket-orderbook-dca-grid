@@ -7,9 +7,11 @@ When position notional (qty × avg entry) reaches 5× the entry base
   • trigger = entry ± (``--tp1-profit-pct`` + ``--tp-fee-buffer``)
     (default **0.3% net + 0.12% fees**). Binance reduces as soon as mark
     touches that price.
-  • freeze auto-DCA at ``--dca-max-entry-pct`` (default **12×**):
+    • freeze auto-DCA at ``--dca-max-entry-pct`` when set (default **0** = off):
     cancel leftover safety orders and do not re-arm more adds.
-    A new ★ (scanner rising edge) may place one more grid past that cap.
+    Account Margin Ratio (``MARGIN_RATIO_SOFT`` / ``HARD``, default **5%**)
+    is the live size brake. A new ★ may still place one more grid past a
+    custom per-symbol cap.
 
 A favorable burst (``--partial-tp-burst-pct``, default 2%) can skip the 5×
 TP gate so a 1× fill that explodes still gets the partial. The DCA cap
@@ -151,8 +153,9 @@ def partial_tp_threshold(
 def dca_max_entry_pct(args: argparse.Namespace) -> float:
     """Max filled notional as %% of entry base. 0 = unlimited.
 
-    Default **1200 = 12×** (independent of the 5× partial-TP gate).
-    Override with ``--dca-max-entry-pct`` / ``DCA_MAX_ENTRY_PCT``.
+    Default **0** — account Margin Ratio (5%) is the size brake, not a
+    multiple of the tiny entry ticket. Set ``--dca-max-entry-pct`` /
+    ``DCA_MAX_ENTRY_PCT`` if you still want a per-symbol multiple.
     """
     v = getattr(args, "dca_max_entry_pct", None)
     if v is not None:
@@ -160,7 +163,7 @@ def dca_max_entry_pct(args: argparse.Namespace) -> float:
     env = _env_float_optional("DCA_MAX_ENTRY_PCT")
     if env is not None:
         return float(env)
-    return 1200.0
+    return 0.0
 
 
 def dca_cap_threshold(
@@ -186,7 +189,7 @@ def position_notional(qty: float, entry: float) -> float:
 
 
 def position_over_dca_cap(qty: float, entry: float, cap: float) -> bool:
-    """True when qty×avg entry already meets/exceeds the 12× (or custom) cap."""
+    """True when qty×avg entry already meets/exceeds the optional size cap."""
     if cap <= 0 or cap == float("inf"):
         return False
     return position_notional(qty, entry) >= cap - 1e-9
@@ -244,7 +247,7 @@ def dca_adds_blocked(
     """Whether to freeze DCA (cancel leftovers + skip re-arm).
 
     After partial TP leftover LIMITs are cancelled so the supervisor can
-    place a fresh grid — only the 12× cap (and the ★ one-grid bypass) freeze adds.
+    place a fresh grid — only a custom size cap (and the ★ one-grid bypass) freeze adds.
     """
     try:
         import star_rearm as sr

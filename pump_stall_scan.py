@@ -16,7 +16,7 @@ via `--protect-be` / `--no-protect-be` (orthogonal).
 Early profile: `--trade-exit ratchet` (BE floor + wall SL + 5× partial TP; --exit stays after TP1).
 Other open pairs on the account do not consume these slots.
 Account Margin Ratio (Binance UI): ≥ soft (default 5%) → no new ★;
-≥ hard (default 8%) → cancel DCA limits (keep exits); below hard → re-arm DCA.
+≥ hard (default 5%) → cancel DCA limits (keep exits); below hard → re-arm DCA.
 
   python3 pump_stall_scan.py
   ./pump-stall --top 15 --min-near-regime 80 --min-sharp 35
@@ -66,6 +66,24 @@ WHITE = "\033[37m"
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_SNAPSHOT = ROOT / ".state" / "pump_stall_snapshot.json"
+
+
+def _dca_max_entry_pct() -> float:
+    """Per-symbol DCA cap %% of entry. 0 = off (account margin ratio is the brake)."""
+    raw = os.getenv("DCA_MAX_ENTRY_PCT")
+    if raw is None or str(raw).strip() == "":
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fmt_dca_cap(pct: float | None = None) -> str:
+    v = _dca_max_entry_pct() if pct is None else float(pct)
+    if v <= 0:
+        return "DCA until margin 5%"
+    return f"DCA≤{v / 100.0:g}×"
 
 # First failing filter → color + short label
 BLOCK_COLORS = {
@@ -589,10 +607,10 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "tp_partial_pct": tp_partial,
         "tp1_profit_pct": tp1_profit,
         "partial_tp_min_entry_pct": partial_entry_pct,
-        "dca_max_entry_pct": 1200.0,
+        "dca_max_entry_pct": _dca_max_entry_pct(),
         "imb_long": imb_long,
         "loss_cooldown_min": float(g("loss_cooldown_min", 1440.0) or 1440.0),
-        "margin_ratio_soft": float(g("margin_ratio_soft", 3.0) or 3.0),
+        "margin_ratio_soft": float(g("margin_ratio_soft", 5.0) or 5.0),
         "margin_ratio_hard": float(g("margin_ratio_hard", 5.0) or 5.0),
         "wallet_pct": wallet_pct,
         "slot_wallet_scale": (
@@ -652,11 +670,10 @@ def format_dca_hint(args: argparse.Namespace | None = None) -> str:
     be = " --protect-be" if s.get("protect_be", True) else " --no-protect-be"
     if exit_mode == "none":
         times = float(s.get("partial_tp_min_entry_pct") or 500) / 100.0
-        dca_x = float(s.get("dca_max_entry_pct") or 1200) / 100.0
         return (
             f"Hint: dca SYMBOL short --exit none · ATH SL "
             f"+ TP{s['tp_partial_pct']:g}%@+{s['tp1_profit_pct']:g}%"
-            f"(≥{times:g}×) · DCA≤{dca_x:g}× {gap} --once"
+            f"(≥{times:g}×) · {_fmt_dca_cap(s.get('dca_max_entry_pct'))} {gap} --once"
         )
     if exit_mode == "ob":
         return (
@@ -670,12 +687,12 @@ def format_dca_hint(args: argparse.Namespace | None = None) -> str:
     if exit_mode == "ratchet":
         overlay = " + also-structure" if int(s.get("also_structure") or 0) else ""
         times = float(s.get("partial_tp_min_entry_pct") or 500) / 100.0
-        dca_x = float(s.get("dca_max_entry_pct") or 1200) / 100.0
         return (
             f"Hint: dca SYMBOL short --exit ratchet · "
             f"BE floor@+{s['ratchet_min_profit_pct']:g}%→{s['be_profit_pct']:g}% "
             f"+ TP{s['tp_partial_pct']:g}%@+{s['tp1_profit_pct']:g}%"
-            f"(≥{times:g}×) · DCA≤{dca_x:g}× · +grid if ★{overlay} {gap} --once"
+            f"(≥{times:g}×) · {_fmt_dca_cap(s.get('dca_max_entry_pct'))} "
+            f"· +grid if ★{overlay} {gap} --once"
         )
     return (
         f"Hint: dca SYMBOL short --exit structure{be} "
@@ -1248,8 +1265,9 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         "--protect-be" if use_be else "--no-protect-be",
         "--once",
         "--loss-cooldown-min", str(getattr(args, "loss_cooldown_min", 1440)),
-        "--margin-ratio-soft", str(getattr(args, "margin_ratio_soft", 3.0)),
+        "--margin-ratio-soft", str(getattr(args, "margin_ratio_soft", 5.0)),
         "--margin-ratio-hard", str(getattr(args, "margin_ratio_hard", 5.0)),
+        "--dca-max-entry-pct", str(_dca_max_entry_pct()),
         # Short-only book: default imbalance gate (20–30%) blocks every new ★
         # once a large SHORT (e.g. PUMP) is open. Env PUMPSTALL_MAX_IMBALANCE
         # (default 0 = disable) overrides MAX_IMBALANCE for auto-trade children.
@@ -1270,7 +1288,6 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
             "--tp-partial-pct", "70",
             "--tp1-profit-pct", "0.3",
             "--partial-tp-min-entry-pct", "500",
-            "--dca-max-entry-pct", "1200",
         ])
         # post-BE trail only when BE is on and caller asked for it
         if use_be and float(getattr(args, "post_be_arm_pct", 0) or 0) > 0:
@@ -1290,7 +1307,7 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
             cmd.extend(["--structure-interval", str(args.structure_interval)])
         launch_note = (
             f"dca short --exit structure{be_note}{trail_note} "
-            f"+ TP70%@+0.3%(≥500% entry) · DCA≤12× --once"
+            f"+ TP70%@+0.3%(≥500% entry) · {_fmt_dca_cap()} --once"
         )
     elif exit_mode == "trailing":
         launch_note = f"dca short --exit trailing{be_note} --once"
@@ -1313,7 +1330,6 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
             "--tp-partial-pct", "70",
             "--tp1-profit-pct", "0.3",
             "--partial-tp-min-entry-pct", "500",
-            "--dca-max-entry-pct", "1200",
         ])
         overlay = ""
         if bool(getattr(args, "also_structure", False)):
@@ -1323,7 +1339,7 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
                 cmd.extend(["--structure-interval", str(args.structure_interval)])
         launch_note = (
             f"dca short --exit ratchet · BE floor@+1%→0.3% "
-            f"+ TP70%@+0.3%(≥5×) · DCA≤12×{overlay} --once"
+            f"+ TP70%@+0.3%(≥5×) · {_fmt_dca_cap()}{overlay} --once"
         )
     elif exit_mode == "none":
         if "--protect-be" in cmd:
@@ -1339,11 +1355,10 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
             "--tp-partial-pct", "70",
             "--tp1-profit-pct", "0.3",
             "--partial-tp-min-entry-pct", "500",
-            "--dca-max-entry-pct", "1200",
         ])
         launch_note = (
-            "dca short --exit none · ATH SL "
-            "+ TP70%@+0.3%(≥5×) · DCA≤12× --once"
+            f"dca short --exit none · ATH SL "
+            f"+ TP70%@+0.3%(≥5×) · {_fmt_dca_cap()} --once"
         )
     elif exit_mode == "ob":
         imb = getattr(args, "imb_long", None)
@@ -1392,7 +1407,7 @@ def _print_auto_account_status(
     max_trades: int,
 ) -> None:
     """Always-on strip under the table so soft/hard gates are not invisible."""
-    soft_mr = float(getattr(args, "margin_ratio_soft", 3.0) or 0)
+    soft_mr = float(getattr(args, "margin_ratio_soft", 5.0) or 0)
     hard_mr = float(getattr(args, "margin_ratio_hard", 5.0) or 5.0)
     bits: list[str] = []
 
@@ -1487,7 +1502,7 @@ def _maybe_auto_trade(
         )
         return active
 
-    soft_mr = float(getattr(args, "margin_ratio_soft", 3.0) or 0)
+    soft_mr = float(getattr(args, "margin_ratio_soft", 5.0) or 0)
     if soft_mr > 0:
         if not api or not sec:
             print(
@@ -1844,8 +1859,8 @@ Production (VPS):
     p.add_argument(
         "--margin-ratio-soft",
         type=float,
-        default=float(os.getenv("MARGIN_RATIO_SOFT", "3") or 3),
-        help="Binance Margin Ratio %% ≥ this → no new ★ (default 3; 0=off). "
+        default=float(os.getenv("MARGIN_RATIO_SOFT", "5") or 5),
+        help="Binance Margin Ratio %% ≥ this → no new ★ (default 5; 0=off). "
              "Env: MARGIN_RATIO_SOFT",
     )
     p.add_argument(

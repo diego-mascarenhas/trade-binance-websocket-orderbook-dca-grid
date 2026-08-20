@@ -564,8 +564,17 @@ def cancel_dca_grid_orders(symbol: str, api: str, sec: str, recv: int) -> int:
     return _cancel_grid(symbol, api, sec, recv)
 
 
-def _algo_client_tag(tag: str, symbol: str) -> str:
-    return f"{ALGO_PREFIX}{tag}{symbol.upper()}"
+def _algo_client_tag(tag: str, symbol: str, *, unique: bool = False) -> str:
+    """Stable id ``obstageTP1BOMEUSDT``; optional suffix after cancel/replace.
+
+    Binance -4116 keeps a cancelled clientAlgoId reserved for a few seconds
+    (sometimes longer). A short numeric suffix stays ≤36 chars and still
+    matches ``cancel_our_algos`` / ``find_our_algo`` via prefix.
+    """
+    base = f"{ALGO_PREFIX}{tag}{symbol.upper()}"
+    if not unique:
+        return base
+    return f"{base}{int(time.time() * 1000) % 100000:05d}"[:36]
 
 
 def place_algo_order(
@@ -602,13 +611,28 @@ def place_algo_order(
         params["positionSide"] = "LONG" if is_long else "SHORT"
     else:
         params["reduceOnly"] = "true"
-    return _signed_request("POST", "/fapi/v1/algoOrder", params, api, sec, recv)
+    try:
+        return _signed_request("POST", "/fapi/v1/algoOrder", params, api, sec, recv)
+    except RuntimeError as exc:
+        if not _is_duplicate_client_id(exc):
+            raise
+        existing = find_our_algo(symbol, client_tag, api, sec, recv)
+        if existing:
+            print(
+                f"{DIM}Algo {params['clientAlgoId']} already on book "
+                f"(algoId={existing.get('algoId')}) — adopting.{RESET}"
+            )
+            return existing
+        time.sleep(0.5)
+        params["clientAlgoId"] = _algo_client_tag(client_tag, symbol, unique=True)
+        return _signed_request("POST", "/fapi/v1/algoOrder", params, api, sec, recv)
 
 
 def find_our_algo(symbol: str, tag: str, api: str, sec: str, recv: int) -> dict | None:
     want = _algo_client_tag(tag, symbol)
     for o in list_open_algo_orders(symbol, api, sec, recv):
-        if _algo_client_id(o) == want:
+        cid = _algo_client_id(o)
+        if cid == want or cid.startswith(want):
             return o
     return None
 
@@ -651,6 +675,11 @@ def _qty_strings(tp1: Decimal, remain: Decimal, qty_dp: int) -> tuple[str, str]:
 def _is_immediate_trigger_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     return "-2021" in text or "immediately trigger" in text
+
+
+def _is_duplicate_client_id(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "-4116" in text or "duplicated" in text
 
 
 def _stop_would_immediately_trigger(is_long: bool, trigger: float, mark: float, tick: Decimal) -> bool:

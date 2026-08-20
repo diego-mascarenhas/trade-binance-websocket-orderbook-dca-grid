@@ -162,6 +162,7 @@ python3 orderbook_dca_grid.py OPUSDT --rearm --rearm-flat  # close position, the
 - **Account risk guards** (futures, before arming a grid):
   - `MAX_IMBALANCE=20` (default): skip new grids on the heavier LONG/SHORT side when imbalance exceeds 20%.
   - `MAX_MARGIN_PCT=50`: skip if projected initial margin usage exceeds 50% of balance.
+  - `MARGIN_RATIO_SOFT=5` / `MARGIN_RATIO_HARD=5`: Binance UI Margin Ratio (maint/equity). ≥ soft → no new grids / ★; ≥ hard → cancel leftover DCA (keep TP/BE/trail).
   - `MIN_LIQ_DISTANCE_PCT=20`: skip if any open position is within 20% of liquidation.
   - `MAX_ACCOUNT_NOTIONAL_PCT=80`: skip if total |notional| + new grid exceeds 80% of `wallet × leverage`.
   - `RISK_USE_FULL_GRID=true` (default): checks use full-grid notional, not entry only.
@@ -233,7 +234,7 @@ dca ZAMAUSDT short --exit structure --be-arm-pct 1 --be-profit-pct 0.3 \
   --partial-tp --tp-partial-pct 70 \
   --post-be trail --post-be-arm-pct 1.5 --post-be-callback 0.6 --once
 # 70% TAKE_PROFIT @ +0.3% gross (only if notional ≥ 500% of entry ≈ 5× / mid-grid)
-# · auto-DCA freezes at 12×; a new ★ may place one more grid
+# · auto-DCA until account Margin Ratio 5% (DCA_MAX_ENTRY_PCT=0); a new ★ may still add one grid
 # · BE @ +1% → entry+0.3% · trail from +1.5% (cb 0.6%) · TP resto = EQL
 ```
 
@@ -453,6 +454,9 @@ RECV_WINDOW=15000         # raise if you see -1021 timestamp errors
 WALLET_PCT=10
 MAX_IMBALANCE=20          # 0 = off
 # MAX_MARGIN_PCT=50
+# MARGIN_RATIO_SOFT=5
+# MARGIN_RATIO_HARD=5
+# DCA_MAX_ENTRY_PCT=0
 # MIN_LIQ_DISTANCE_PCT=20
 # MAX_ACCOUNT_NOTIONAL_PCT=80
 # RISK_USE_FULL_GRID=true
@@ -480,6 +484,9 @@ REARM_BACKOFF=60
 | `BASE_SIZE` | `0` | both | Fixed entry USDT (`0` = use `WALLET_PCT`) |
 | `MAX_IMBALANCE` | `20` | futures | Account LONG/SHORT balance guard (`0` = off) |
 | `MAX_MARGIN_PCT` | `50` | futures | Max projected initial margin / balance (`0` = off) |
+| `MARGIN_RATIO_SOFT` | `5` | futures | Binance UI Margin Ratio ≥ this → no new grids / ★ (`0` = off) |
+| `MARGIN_RATIO_HARD` | `5` | futures | ≥ this → cancel leftover DCA; below → re-arm (`0` = off) |
+| `DCA_MAX_ENTRY_PCT` | `0` | futures | Optional per-symbol freeze as % of entry ticket (`0` = off; 5% margin ratio is the brake) |
 | `MIN_LIQ_DISTANCE_PCT` | `20` | futures | Min distance to liq on any position (`0` = off) |
 | `MAX_ACCOUNT_NOTIONAL_PCT` | `80` | futures | Cap on total \|notional\| + grid vs wallet×lev |
 | `RISK_USE_FULL_GRID` | `true` | futures | Risk checks use full grid notional |
