@@ -378,6 +378,7 @@ def scan(args: argparse.Namespace) -> tuple[list[PumpStallHit], list[AnalyzeRow]
     base = args.base.rstrip("/")
     allowed = trading_usdt_perps(base)
     tickers = fetch_tickers(base, allowed)
+    _note_tickers_for_vol(tickers)
     liquid = [t for t in tickers if t.quote_volume >= args.min_quote_vol]
     # Seed pool: top gainers + high absolute movers (captures multi-day pumps still hot)
     by_chg = sorted(liquid, key=lambda t: t.change_pct, reverse=True)
@@ -612,6 +613,8 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "loss_cooldown_min": float(g("loss_cooldown_min", 1440.0) or 1440.0),
         "margin_ratio_soft": float(g("margin_ratio_soft", 5.0) or 5.0),
         "margin_ratio_hard": float(g("margin_ratio_hard", 5.0) or 5.0),
+        "vol_regime_block": 1 if _vol_regime_enabled() else 0,
+        "vol_regime_btc_range_pct": _vol_regime_btc_range_pct(),
         "wallet_pct": wallet_pct,
         "slot_wallet_scale": (
             0
@@ -1196,6 +1199,80 @@ def _maybe_notify_weekend_block(*, telegram: bool) -> None:
         print(f"{DIM}Weekend block Telegram skipped: {exc}{RESET}")
 
 
+# BTC 24h range from the last scan (fail-open if unread).
+_VOL_CACHE: dict[str, float] = {"btc_range": 0.0, "at": 0.0}
+
+
+def _vol_regime_enabled() -> bool:
+    flag = (os.getenv("VOL_REGIME_BLOCK", "1") or "1").strip().lower()
+    return flag not in ("0", "false", "off", "no")
+
+
+def _vol_regime_btc_range_pct() -> float:
+    raw = os.getenv("VOL_REGIME_BTC_RANGE_PCT", "8") or "8"
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 8.0
+
+
+def _note_tickers_for_vol(tickers: list) -> None:
+    for t in tickers:
+        if str(getattr(t, "symbol", "")).upper() == "BTCUSDT":
+            try:
+                _VOL_CACHE["btc_range"] = float(t.range_pct)
+                _VOL_CACHE["at"] = time.time()
+            except (TypeError, ValueError):
+                pass
+            return
+
+
+def _fetch_btc_range_pct(base: str) -> float | None:
+    try:
+        from futures_scan import _get
+
+        raw = _get(f"{base.rstrip('/')}/fapi/v1/ticker/24hr?symbol=BTCUSDT")
+        if not isinstance(raw, dict):
+            return None
+        last = float(raw.get("lastPrice") or 0)
+        high = float(raw.get("highPrice") or 0)
+        low = float(raw.get("lowPrice") or 0)
+        if last <= 0:
+            return None
+        return (high - low) / last * 100.0
+    except Exception:
+        return None
+
+
+def _btc_range_pct() -> float | None:
+    age = time.time() - float(_VOL_CACHE.get("at") or 0)
+    if age < 120 and _VOL_CACHE.get("at"):
+        return float(_VOL_CACHE.get("btc_range") or 0)
+    rng = _fetch_btc_range_pct(os.getenv("FAPI_BASE", FAPI_BASE))
+    if rng is None:
+        if _VOL_CACHE.get("at"):
+            return float(_VOL_CACHE.get("btc_range") or 0)
+        return None
+    _VOL_CACHE["btc_range"] = rng
+    _VOL_CACHE["at"] = time.time()
+    return rng
+
+
+def _vol_regime_active() -> tuple[bool, str]:
+    """(block_new_stars, why). Fail-open if BTC range cannot be read."""
+    if not _vol_regime_enabled():
+        return False, "off"
+    thr = _vol_regime_btc_range_pct()
+    if thr <= 0:
+        return False, "off"
+    rng = _btc_range_pct()
+    if rng is None:
+        return False, "BTC range unread"
+    if rng >= thr:
+        return True, f"BTC range {rng:.1f}% ≥ {thr:g}%"
+    return False, f"BTC range {rng:.1f}% < {thr:g}%"
+
+
 def _trade_exit_mode(args: argparse.Namespace) -> str:
     """Primary exit for auto-trade children.
 
@@ -1416,6 +1493,14 @@ def _print_auto_account_status(
     elif not _weekend_block_enabled():
         bits.append(f"{DIM}weekend off{RESET}")
 
+    vol_on, vol_why = _vol_regime_active()
+    if not _vol_regime_enabled():
+        bits.append(f"{DIM}vol regime off{RESET}")
+    elif vol_on:
+        bits.append(f"{YELLOW}vol regime · {vol_why} — no new ★{RESET}")
+    else:
+        bits.append(f"{DIM}vol regime · {vol_why}{RESET}")
+
     if soft_mr <= 0:
         bits.append(f"{DIM}margin soft off{RESET}")
     elif not api or not sec:
@@ -1500,6 +1585,11 @@ def _maybe_auto_trade(
             f"{YELLOW}AUTO: weekend block Fri 21:00→Sun 23:00 UTC "
             f"— no new ★{RESET}"
         )
+        return active
+
+    vol_on, vol_why = _vol_regime_active()
+    if vol_on:
+        print(f"{YELLOW}AUTO: vol regime · {vol_why} — no new ★{RESET}")
         return active
 
     soft_mr = float(getattr(args, "margin_ratio_soft", 5.0) or 0)

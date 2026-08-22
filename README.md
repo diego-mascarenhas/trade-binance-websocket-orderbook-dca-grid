@@ -277,6 +277,7 @@ python3 pump_stall_scan.py --help
 6. When a slot frees, rescans and may take the next best ★  
 7. Losing close → **`--loss-cooldown-min`** (default **1440 = 24h**) on that symbol (`.state/loss_cooldown.json`)
 8. Weekend block (default **on**): no new ★ from **Fri 21:00 UTC → Sun 23:00 UTC** (`PUMPSTALL_WEEKEND_BLOCK=0` to disable). Open positions are left alone.
+9. Vol regime (default **on**): no new ★ when BTC 24h range ≥ `VOL_REGIME_BTC_RANGE_PCT` (default **8**). `VOL_REGIME_BLOCK=0` disables. Open positions are left alone.
 
 **Exit composition:** `--trade-exit ratchet` (early default) is BE floor + SL to the previous wall. A 5× partial TP (70% @ 0.3%+fees) can take profit first; the chosen `--exit` stays on the runner. `--also-structure` lets EQL/EQH close earlier so `/stats` Reason shows which condition won. CLI `--trade-exit` wins over `TRADE_EXIT` / `EXIT_MODE`.
 
@@ -295,6 +296,8 @@ python3 pump_stall_scan.py --help
 | `--post-be-callback` | `0.6` | Trailing `callbackRate` % |
 | `--why [N]` | off | Show top N blocked seeds by failing filter |
 | `PUMPSTALL_WEEKEND_BLOCK` | `1` | Env: block new ★ Fri 21:00→Sun 23:00 UTC |
+| `VOL_REGIME_BLOCK` | `1` | Env: block new ★ when BTC 24h range is hot |
+| `VOL_REGIME_BTC_RANGE_PCT` | `8` | Env: BTC 24h (high−low)/last %% that counts as hot (`0` = off) |
 
 Trade logs: `logs/pump-stall-SYMBOL.log`. Stop one child: `dca SYMBOL stop`.
 
