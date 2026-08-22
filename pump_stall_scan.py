@@ -615,6 +615,7 @@ def stack_params(args: argparse.Namespace | None = None) -> dict:
         "margin_ratio_hard": float(g("margin_ratio_hard", 5.0) or 5.0),
         "vol_regime_block": 1 if _vol_regime_enabled() else 0,
         "vol_regime_btc_range_pct": _vol_regime_btc_range_pct(),
+        "vol_regime_early_pct": _vol_regime_early_pct(),
         "wallet_pct": wallet_pct,
         "slot_wallet_scale": (
             0
@@ -1204,6 +1205,12 @@ def _maybe_notify_weekend_block(*, telegram: bool) -> None:
 _VOL_CACHE: dict[str, float] = {"btc_range": 0.0, "at": 0.0}
 
 
+# Scan gates matching ./pump-stall-watch-early vs argparse / ./pump-stall-watch.
+_VOL_EARLY_GATES = {"min_stall": 25.0, "min_near_high": 82.0, "ideal_near": 90.0}
+_VOL_STRICT_GATES = {"min_stall": 35.0, "min_near_high": 85.0, "ideal_near": 92.0}
+_VOL_HYSTERESIS = 0.4
+
+
 def _vol_regime_enabled() -> bool:
     flag = (os.getenv("VOL_REGIME_BLOCK", "1") or "1").strip().lower()
     return flag not in ("0", "false", "off", "no")
@@ -1215,6 +1222,19 @@ def _vol_regime_btc_range_pct() -> float:
         return float(raw)
     except (TypeError, ValueError):
         return 8.0
+
+
+def _vol_regime_early_pct() -> float:
+    """Below this BTC 24h range → early profile. Between this and hot → strict."""
+    raw = os.getenv("VOL_REGIME_EARLY_PCT", "4") or "4"
+    try:
+        early = float(raw)
+    except (TypeError, ValueError):
+        early = 4.0
+    hot = _vol_regime_btc_range_pct()
+    if early <= 0 or hot <= 0:
+        return 0.0
+    return min(early, hot)
 
 
 def _note_tickers_for_vol(tickers: list) -> None:
@@ -1259,30 +1279,137 @@ def _btc_range_pct() -> float | None:
     return rng
 
 
-def _vol_regime_active() -> tuple[bool, str]:
-    """(block_new_stars, why). Fail-open if BTC range cannot be read."""
+def _vol_regime_state_path() -> str:
+    return os.path.join(_repo_root(), ".state", "vol_regime.json")
+
+
+def _vol_last_profile() -> str | None:
+    try:
+        with open(_vol_regime_state_path(), encoding="utf-8") as fh:
+            raw = json.load(fh)
+        prof = str((raw or {}).get("profile") or "").strip().lower()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if prof in ("early", "strict", "standdown"):
+        return prof
+    return None
+
+
+def _vol_profile_raw(rng: float, early_max: float, hot_max: float) -> str:
+    if hot_max > 0 and rng >= hot_max:
+        return "standdown"
+    if early_max > 0 and rng < early_max:
+        return "early"
+    return "strict"
+
+
+def _vol_profile_stable(rng: float, last: str | None) -> str:
+    """Band with a 0.4% deadband so a hover does not flip every cycle."""
+    early_max = _vol_regime_early_pct()
+    hot_max = _vol_regime_btc_range_pct()
+    raw = _vol_profile_raw(rng, early_max, hot_max)
+    band = _VOL_HYSTERESIS
+    if last == "early" and raw == "strict" and early_max > 0 and rng < early_max + band:
+        return "early"
+    if last == "strict" and raw == "early" and early_max > 0 and rng > early_max - band:
+        return "strict"
+    # Enter standdown immediately; leave only after cooling under the line.
+    if last == "standdown" and raw != "standdown" and hot_max > 0 and rng > hot_max - band:
+        return "standdown"
+    return raw
+
+
+def _vol_regime_decide() -> tuple[str, str, float | None]:
+    """(profile, why, btc_range). Fail-open to unread/off — never invent a range."""
     if not _vol_regime_enabled():
-        return False, "off"
-    thr = _vol_regime_btc_range_pct()
-    if thr <= 0:
-        return False, "off"
+        return "off", "off", _btc_range_pct()
+    hot = _vol_regime_btc_range_pct()
+    if hot <= 0:
+        return "off", "off", _btc_range_pct()
     rng = _btc_range_pct()
     if rng is None:
-        return False, "BTC range unread"
-    if rng >= thr:
-        return True, f"BTC range {rng:.1f}% ≥ {thr:g}%"
-    return False, f"BTC range {rng:.1f}% < {thr:g}%"
+        return "unread", "BTC range unread", None
+    early = _vol_regime_early_pct()
+    profile = _vol_profile_stable(rng, _vol_last_profile())
+    if profile == "standdown":
+        why = f"BTC range {rng:.1f}% ≥ {hot:g}% — stand down"
+    elif profile == "early":
+        why = f"BTC range {rng:.1f}% < {early:g}% — early"
+    else:
+        why = f"BTC range {rng:.1f}% · {early:g}–{hot:g}% — strict"
+    return profile, why, rng
+
+
+def _vol_regime_active() -> tuple[bool, str]:
+    """(block_new_stars, why). Fail-open if BTC range cannot be read."""
+    profile, why, _rng = _vol_regime_decide()
+    return profile == "standdown", why
+
+
+def _apply_vol_profile(args: argparse.Namespace, *, quiet: bool = False) -> str:
+    """Overlay early/strict scan gates from BTC heat. Does not switch systemd."""
+    profile, why, _rng = _vol_regime_decide()
+    gates = _VOL_EARLY_GATES if profile == "early" else (
+        _VOL_STRICT_GATES if profile in ("strict", "standdown") else None
+    )
+    if gates:
+        args.min_stall = gates["min_stall"]
+        args.min_near_high = gates["min_near_high"]
+        args.ideal_near = gates["ideal_near"]
+    if not quiet and profile in ("early", "strict", "standdown"):
+        print(f"{DIM}VOL · {why} · stall≥{args.min_stall:g} near≥{args.min_near_high:g} ★≥{args.ideal_near:g}{RESET}")
+    return profile
+
+
+def _maybe_notify_vol_profile(*, telegram: bool) -> None:
+    """On early ↔ strict ↔ standdown, announce once (same idea as weekend)."""
+    if not _vol_regime_enabled() or _vol_regime_btc_range_pct() <= 0:
+        return
+    profile, why, rng = _vol_regime_decide()
+    if profile in ("off", "unread"):
+        return
+    path = _vol_regime_state_path()
+    prev = _vol_last_profile()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "profile": profile,
+                    "btc_range_pct": None if rng is None else round(float(rng), 2),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                fh,
+            )
+    except OSError:
+        pass
+    if prev is None:
+        print(f"{DIM}Vol regime state seeded · {profile}{RESET}")
+        return
+    if prev == profile:
+        return
+    tone = YELLOW if profile == "standdown" else (CYAN if profile == "early" else DIM)
+    print(f"{tone}AUTO: vol regime → {profile} · {why}{RESET}")
+    if not telegram:
+        return
+    try:
+        import telegram_notify as tg
+
+        tg.notify_vol_profile(profile=profile, why=why, btc_range_pct=rng)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{DIM}Vol regime Telegram skipped: {exc}{RESET}")
 
 
 def vol_regime_snapshot() -> dict:
     """Live gate for Pumpstall web (meter + AUTO line)."""
-    active, why = _vol_regime_active()
-    rng = _btc_range_pct()
+    profile, why, rng = _vol_regime_decide()
     return {
         "enabled": _vol_regime_enabled(),
-        "active": bool(active),
+        "active": profile == "standdown",
+        "profile": profile,
         "btc_range_pct": None if rng is None else round(float(rng), 2),
         "threshold_pct": _vol_regime_btc_range_pct(),
+        "early_pct": _vol_regime_early_pct(),
         "why": why,
     }
 
@@ -1508,10 +1635,15 @@ def _print_auto_account_status(
         bits.append(f"{DIM}weekend off{RESET}")
 
     vol_on, vol_why = _vol_regime_active()
+    vol_prof, _vw, _vr = _vol_regime_decide()
     if not _vol_regime_enabled():
         bits.append(f"{DIM}vol regime off{RESET}")
     elif vol_on:
-        bits.append(f"{YELLOW}vol regime · {vol_why} — no new ★{RESET}")
+        bits.append(f"{YELLOW}vol · stand down · {vol_why} — no new ★{RESET}")
+    elif vol_prof == "early":
+        bits.append(f"{DIM}vol · early · {vol_why}{RESET}")
+    elif vol_prof == "strict":
+        bits.append(f"{DIM}vol · strict · {vol_why}{RESET}")
     else:
         bits.append(f"{DIM}vol regime · {vol_why}{RESET}")
 
@@ -1603,7 +1735,7 @@ def _maybe_auto_trade(
 
     vol_on, vol_why = _vol_regime_active()
     if vol_on:
-        print(f"{YELLOW}AUTO: vol regime · {vol_why} — no new ★{RESET}")
+        print(f"{YELLOW}AUTO: vol stand down · {vol_why} — no new ★{RESET}")
         return active
 
     soft_mr = float(getattr(args, "margin_ratio_soft", 5.0) or 0)
@@ -1747,6 +1879,7 @@ def watch_loop(args: argparse.Namespace) -> int:
             round_n += 1
             t0 = time.time()
             try:
+                _apply_vol_profile(args, quiet=True)
                 hits, blocked = scan(args)
                 auto_notes = annotate_ath_gates(hits, args)
             except Exception as exc:  # noqa: BLE001
@@ -1763,6 +1896,12 @@ def watch_loop(args: argparse.Namespace) -> int:
                 f"{DIM}#{round_n} · {now} · scan {elapsed:.1f}s · "
                 f"next in {interval:g}s · {mode} · Ctrl+C{RESET}"
             )
+            _vp, _vw, _vr = _vol_regime_decide()
+            if _vp in ("early", "strict", "standdown"):
+                print(
+                    f"{DIM}VOL · {_vw} · stall≥{args.min_stall:g} "
+                    f"near≥{args.min_near_high:g} ★≥{args.ideal_near:g}{RESET}"
+                )
             print()
             why_n = int(getattr(args, "why", 15) or 0)
             prev_before = prev
@@ -1783,6 +1922,7 @@ def watch_loop(args: argparse.Namespace) -> int:
             )
             _maybe_daily_summary(tg_on)
             _maybe_notify_weekend_block(telegram=tg_on)
+            _maybe_notify_vol_profile(telegram=tg_on)
             maybe_write_snapshot(
                 args,
                 hits=hits,
@@ -2017,6 +2157,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{BOLD}{CYAN}Pump→stall short-grid scan{RESET}  "
         f"{DIM}(1D blow-off filter · display only){RESET}"
     )
+    _apply_vol_profile(args)
     hits, blocked = scan(args)
     annotate_ath_gates(hits, args)
     print_hits(

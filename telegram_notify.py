@@ -354,6 +354,57 @@ def notify_us_session_weekend(*, blocked: bool) -> None:
         _send_async(ops)
 
 
+def notify_vol_profile(
+    *,
+    profile: str,
+    why: str,
+    btc_range_pct: float | None,
+) -> None:
+    """Announce early / strict / stand-down (English, public + ops)."""
+    rng = "—" if btc_range_pct is None else f"{btc_range_pct:.1f}%"
+    if profile == "standdown":
+        body = (
+            "🌪 <b>#MARKET vol · stand down</b>\n"
+            f"BTC 24h range <b>{rng}</b>.\n"
+            "Pumpstall will not open new ★ positions.\n"
+            "Open trades continue to be managed."
+        )
+        ops = (
+            f"🌪 #MARKET vol · stand down\n"
+            f"BTC 24h range {rng}. {why}\n"
+            "No new ★. Open trades continue."
+        )
+    elif profile == "early":
+        body = (
+            "🌤 <b>#MARKET vol · early</b>\n"
+            f"BTC 24h range <b>{rng}</b>.\n"
+            "Scanner uses the early profile (looser ★). New ★ allowed."
+        )
+        ops = (
+            f"🌤 #MARKET vol · early\n"
+            f"BTC 24h range {rng}. {why}\n"
+            "Early gates. New ★ allowed."
+        )
+    else:
+        body = (
+            "⛅ <b>#MARKET vol · strict</b>\n"
+            f"BTC 24h range <b>{rng}</b>.\n"
+            "Scanner uses the strict profile. New ★ allowed."
+        )
+        ops = (
+            f"⛅ #MARKET vol · strict\n"
+            f"BTC 24h range {rng}. {why}\n"
+            "Strict gates. New ★ allowed."
+        )
+    try:
+        if _public_chat_id():
+            _send_public_html(body)
+    except Exception:
+        pass
+    if is_configured() and not _ops_is_public_channel():
+        _send_async(ops)
+
+
 def notify_dca_filled(
     symbol: str,
     direction: str,
