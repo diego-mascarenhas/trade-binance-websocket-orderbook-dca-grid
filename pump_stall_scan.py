@@ -744,6 +744,7 @@ def build_snapshot(
         "hint": hint or format_dca_hint(),
         "stack": stack or stack_params(),
         "auto_notes": list(auto_notes or []),
+        "vol_regime": vol_regime_snapshot(),
     }
 
 
@@ -1271,6 +1272,19 @@ def _vol_regime_active() -> tuple[bool, str]:
     if rng >= thr:
         return True, f"BTC range {rng:.1f}% ≥ {thr:g}%"
     return False, f"BTC range {rng:.1f}% < {thr:g}%"
+
+
+def vol_regime_snapshot() -> dict:
+    """Live gate for Pumpstall web (meter + AUTO line)."""
+    active, why = _vol_regime_active()
+    rng = _btc_range_pct()
+    return {
+        "enabled": _vol_regime_enabled(),
+        "active": bool(active),
+        "btc_range_pct": None if rng is None else round(float(rng), 2),
+        "threshold_pct": _vol_regime_btc_range_pct(),
+        "why": why,
+    }
 
 
 def _trade_exit_mode(args: argparse.Namespace) -> str:

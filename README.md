@@ -705,7 +705,7 @@ Common causes:
 
 | Cause | What happened | Fix |
 |-------|----------------|-----|
-| **sudo without TTY** | `dca-telegram-ctl` runs as `forge`; `sudo systemctl` fails silently in the daemon | Updated `botctl.py` tries systemctl **without sudo** for reads. Redeploy + `sudo systemctl restart dca-telegram-ctl`. For `/start`/`/stop`, add passwordless sudo for forge: `forge ALL=(ALL) NOPASSWD: /bin/systemctl *` |
+| **sudo without TTY** | `dca-telegram-ctl` runs as `forge`; `sudo systemctl` fails silently in the daemon | Reads do not need sudo. `/pump` uses NOPASSWD on `pump-stall-watch` / `pump-stall-watch-early` only — see [docs/sudoers.md](docs/sudoers.md). Do **not** add `systemctl *`. |
 | **Fleet never synced** | Alerts from a one-off run; units not enabled | `python3 deploy/sync_pairs.py` on the VPS |
 | **Old unit names** | Bots under `dca-super@` not `dca-futures@` | Migrate per section below, or set `FUTURES_UNIT=dca-super` in `.env` |
 | **Supervisor crashed** | Last alert minutes ago; position still open | `sudo journalctl -u 'dca-futures@*' -n 30`; restart with `/start SYMBOL` or `sync_pairs.py --restart` |
