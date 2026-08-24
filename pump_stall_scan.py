@@ -746,6 +746,7 @@ def build_snapshot(
         "stack": stack or stack_params(),
         "auto_notes": list(auto_notes or []),
         "vol_regime": vol_regime_snapshot(),
+        "auto_gates": auto_gates_snapshot(),
     }
 
 
@@ -1204,6 +1205,14 @@ def _maybe_notify_weekend_block(*, telegram: bool) -> None:
 # BTC 24h range from the last scan (fail-open if unread).
 _VOL_CACHE: dict[str, float] = {"btc_range": 0.0, "at": 0.0}
 
+# Last AUTO gate state (slots / margin / cooldown) — mirrored to Pumpstall web.
+_AUTO_GATES: dict = {}
+
+
+def auto_gates_snapshot() -> dict:
+    """Why new ★ are (not) launching. Empty in display-only runs."""
+    return dict(_AUTO_GATES)
+
 
 # Scan gates matching ./pump-stall-watch-early vs argparse / ./pump-stall-watch.
 _VOL_EARLY_GATES = {"min_stall": 25.0, "min_near_high": 82.0, "ideal_near": 90.0}
@@ -1331,7 +1340,13 @@ def _vol_regime_decide() -> tuple[str, str, float | None]:
         return "unread", "BTC range unread", None
     early = _vol_regime_early_pct()
     profile = _vol_profile_stable(rng, _vol_last_profile())
-    if profile == "standdown":
+    if profile != _vol_profile_raw(rng, early, hot):
+        label = "stand down" if profile == "standdown" else profile
+        why = (
+            f"BTC range {rng:.1f}% · holding {label} "
+            f"(±{_VOL_HYSTERESIS:g}% deadband)"
+        )
+    elif profile == "standdown":
         why = f"BTC range {rng:.1f}% ≥ {hot:g}% — stand down"
     elif profile == "early":
         why = f"BTC range {rng:.1f}% < {early:g}% — early"
@@ -1629,7 +1644,8 @@ def _print_auto_account_status(
     hard_mr = float(getattr(args, "margin_ratio_hard", 5.0) or 5.0)
     bits: list[str] = []
 
-    if _weekend_block_active():
+    weekend_on = _weekend_block_active()
+    if weekend_on:
         bits.append(f"{YELLOW}weekend block (Fri 21:00→Sun 23:00 UTC){RESET}")
     elif not _weekend_block_enabled():
         bits.append(f"{DIM}weekend off{RESET}")
@@ -1647,17 +1663,23 @@ def _print_auto_account_status(
     else:
         bits.append(f"{DIM}vol regime · {vol_why}{RESET}")
 
+    ratio: float | None = None
+    margin_state = "ok"
     if soft_mr <= 0:
+        margin_state = "off"
         bits.append(f"{DIM}margin soft off{RESET}")
     elif not api or not sec:
+        margin_state = "unread"
         bits.append(f"{YELLOW}margin unread (no API keys){RESET}")
     else:
         from orderbook_dca_grid import get_margin_ratio_pct
 
         ratio = get_margin_ratio_pct(api, sec, 15000)
         if ratio is None:
+            margin_state = "unread"
             bits.append(f"{YELLOW}margin unread (API error){RESET}")
         elif ratio >= soft_mr:
+            margin_state = "soft"
             bits.append(
                 f"{YELLOW}margin {ratio:.2f}% ≥ soft {soft_mr:g}% "
                 f"(hard {hard_mr:g}%) — no new ★{RESET}"
@@ -1673,6 +1695,20 @@ def _print_auto_account_status(
         f"{DIM}slots {len(occupied)}/{max_trades} · occupied {occ}{RESET}"
     )
     print("AUTO · " + " · ".join(bits))
+
+    _AUTO_GATES.clear()
+    _AUTO_GATES.update({
+        "weekend_block": bool(weekend_on),
+        "slots_used": len(occupied),
+        "slots_max": int(max_trades),
+        "occupied": sorted(occupied),
+        "margin_state": margin_state,
+        "margin_ratio_pct": None if ratio is None else round(float(ratio), 2),
+        "margin_soft_pct": soft_mr,
+        "margin_hard_pct": hard_mr,
+        "cooldown": [],
+        "blocked_by": "",
+    })
 
 
 def _maybe_auto_trade(
@@ -1731,11 +1767,13 @@ def _maybe_auto_trade(
             f"{YELLOW}AUTO: weekend block Fri 21:00→Sun 23:00 UTC "
             f"— no new ★{RESET}"
         )
+        _AUTO_GATES["blocked_by"] = "weekend"
         return active
 
     vol_on, vol_why = _vol_regime_active()
     if vol_on:
         print(f"{YELLOW}AUTO: vol stand down · {vol_why} — no new ★{RESET}")
+        _AUTO_GATES["blocked_by"] = "vol"
         return active
 
     soft_mr = float(getattr(args, "margin_ratio_soft", 5.0) or 0)
@@ -1759,12 +1797,16 @@ def _maybe_auto_trade(
                     f"(DCA strip at hard "
                     f"{getattr(args, 'margin_ratio_hard', 5):g}%){RESET}"
                 )
+                _AUTO_GATES["blocked_by"] = "margin"
                 return active
 
     cooling = lcd.cooling_map()
     if cooling:
         bits = [f"{s} {lcd.fmt_remaining(t)}" for s, t in sorted(cooling.items())]
         print(f"{DIM}AUTO: loss cooldown · {', '.join(bits)}{RESET}")
+        _AUTO_GATES["cooldown"] = [
+            f"{s} {lcd.fmt_remaining(t)}" for s, t in sorted(cooling.items())
+        ]
 
     slots_left = max(0, max_trades - len(occupied))
     if slots_left <= 0:
@@ -1772,6 +1814,7 @@ def _maybe_auto_trade(
             f"{DIM}AUTO: at --max-trades={max_trades} · occupied "
             f"{', '.join(sorted(occupied)) or '—'} — no new ★{RESET}"
         )
+        _AUTO_GATES["blocked_by"] = "slots"
         return active
 
     # Target set: first N free ★ by score (N = remaining slots)
@@ -1787,6 +1830,7 @@ def _maybe_auto_trade(
             print(f"{DIM}AUTO: no ★ ideal outside cooldown/slots — skip{RESET}")
         else:
             print(f"{DIM}AUTO: no ★ ideal this round — skip{RESET}")
+        _AUTO_GATES["blocked_by"] = "no-star"
         return active
 
     ours = {s.upper() for s in active}
@@ -1923,6 +1967,10 @@ def watch_loop(args: argparse.Namespace) -> int:
             _maybe_daily_summary(tg_on)
             _maybe_notify_weekend_block(telegram=tg_on)
             _maybe_notify_vol_profile(telegram=tg_on)
+            if auto:
+                print()
+                active = _maybe_auto_trade(hits, args, active=active)
+            # After auto-trade so the web snapshot carries this cycle's gates.
             maybe_write_snapshot(
                 args,
                 hits=hits,
@@ -1933,9 +1981,6 @@ def watch_loop(args: argparse.Namespace) -> int:
                 mode=mode,
                 auto_notes=auto_notes,
             )
-            if auto:
-                print()
-                active = _maybe_auto_trade(hits, args, active=active)
             left = interval
             while left > 0:
                 step = min(1.0, left)
