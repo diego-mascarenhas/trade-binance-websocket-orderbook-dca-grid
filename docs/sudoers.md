@@ -24,6 +24,8 @@ Trading only cares about **`pump-stall-ctl`**. The rest is the shared VPS (nginx
 
 Exact commands `forge` may run as root **without a password**. Used by `telegram_botctl.py` (`sudo -n /bin/systemctl …`) for `/pump status|start|stop|early|strict`.
 
+`/pump auto` needs no sudo: it only writes `.state/vol_override.json`, which the scanner re-reads each cycle.
+
 ```sudoers
 forge ALL=NOPASSWD: \
   /bin/systemctl start pump-stall-watch, \

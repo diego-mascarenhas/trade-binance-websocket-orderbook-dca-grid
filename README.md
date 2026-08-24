@@ -277,7 +277,7 @@ python3 pump_stall_scan.py --help
 6. When a slot frees, rescans and may take the next best ★  
 7. Losing close → **`--loss-cooldown-min`** (default **1440 = 24h**) on that symbol (`.state/loss_cooldown.json`)
 8. Weekend block (default **on**): no new ★ from **Fri 21:00 UTC → Sun 23:00 UTC** (`PUMPSTALL_WEEKEND_BLOCK=0` to disable). Open positions are left alone.
-9. Vol regime (default **on**): BTC 24h range picks the scan profile — **early** below `VOL_REGIME_EARLY_PCT` (default **4**), **strict** until `VOL_REGIME_BTC_RANGE_PCT` (default **8**), then **stand down** (no new ★). Does not switch systemd units (`/pump` stays manual). `VOL_REGIME_BLOCK=0` disables. Open positions are left alone.
+9. Vol regime (default **on**): BTC 24h range picks the scan profile — **early** below `VOL_REGIME_EARLY_PCT` (default **4**), **strict** until `VOL_REGIME_BTC_RANGE_PCT` (default **8**), then **stand down** (no new ★). Does not switch systemd units. Pin it by hand with Telegram `/pump early|strict`, release with `/pump auto` (state in `.state/vol_override.json`, read every cycle — no restart). Stand-down still wins over a pin. `VOL_REGIME_BLOCK=0` disables. Open positions are left alone.
 
 **Exit composition:** `--trade-exit ratchet` (early default) is BE floor + SL to the previous wall. A 5× partial TP (70% @ 0.3%+fees) can take profit first; the chosen `--exit` stays on the runner. `--also-structure` lets EQL/EQH close earlier so `/stats` Reason shows which condition won. CLI `--trade-exit` wins over `TRADE_EXIT` / `EXIT_MODE`.
 

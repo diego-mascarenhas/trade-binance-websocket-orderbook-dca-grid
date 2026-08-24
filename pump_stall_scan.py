@@ -1328,6 +1328,16 @@ def _vol_profile_stable(rng: float, last: str | None) -> str:
     return raw
 
 
+def _vol_override() -> str | None:
+    """Profile pinned from Telegram /pump, or None when automatic."""
+    try:
+        import vol_override
+
+        return vol_override.get()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _vol_regime_decide() -> tuple[str, str, float | None]:
     """(profile, why, btc_range). Fail-open to unread/off — never invent a range."""
     if not _vol_regime_enabled():
@@ -1336,9 +1346,22 @@ def _vol_regime_decide() -> tuple[str, str, float | None]:
     if hot <= 0:
         return "off", "off", _btc_range_pct()
     rng = _btc_range_pct()
+    pinned = _vol_override()
     if rng is None:
+        if pinned:
+            return pinned, f"pinned {pinned} · /pump (BTC range unread)", None
         return "unread", "BTC range unread", None
     early = _vol_regime_early_pct()
+    if pinned:
+        # Stand-down is the one thing /pump cannot switch off.
+        if _vol_profile_raw(rng, early, hot) == "standdown":
+            return "standdown", (
+                f"BTC range {rng:.1f}% ≥ {hot:g}% — stand down "
+                f"(overrides pinned {pinned})"
+            ), rng
+        return pinned, (
+            f"BTC range {rng:.1f}% · pinned {pinned} · /pump auto to release"
+        ), rng
     profile = _vol_profile_stable(rng, _vol_last_profile())
     if profile != _vol_profile_raw(rng, early, hot):
         label = "stand down" if profile == "standdown" else profile
@@ -1422,6 +1445,7 @@ def vol_regime_snapshot() -> dict:
         "enabled": _vol_regime_enabled(),
         "active": profile == "standdown",
         "profile": profile,
+        "pinned": _vol_override(),
         "btc_range_pct": None if rng is None else round(float(rng), 2),
         "threshold_pct": _vol_regime_btc_range_pct(),
         "early_pct": _vol_regime_early_pct(),

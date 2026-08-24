@@ -103,6 +103,16 @@ def _unit_state(unit: str) -> str:
     return f"{active} · {enabled}"
 
 
+def _vol_label() -> str:
+    """Scan-gate profile: pinned by /pump, or picked from BTC 24h range."""
+    try:
+        import vol_override
+
+        return vol_override.label()
+    except Exception as exc:  # noqa: BLE001
+        return f"unknown ({exc})"
+
+
 def _pump_status() -> str:
     early = _unit_state(PUMP_EARLY)
     strict = _unit_state(PUMP_STRICT)
@@ -115,7 +125,8 @@ def _pump_status() -> str:
     return (
         f"Pump-stall · {mode}\n"
         f"early:  {early}\n"
-        f"strict: {strict}"
+        f"strict: {strict}\n"
+        f"gates:  {_vol_label()}"
     )
 
 
@@ -150,13 +161,35 @@ def _pump_start(profile: str | None = None) -> str:
     return f"✅ started {target}\n{_pump_status()}"
 
 
+def _pump_gates(profile: str | None) -> str:
+    """Pin / release the scan gates without restarting the scanner."""
+    try:
+        import vol_override
+
+        pinned = vol_override.set_profile(profile)
+    except ValueError as exc:
+        return f"❌ {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"❌ Could not set gates: {exc}"
+    if pinned is None:
+        return (
+            "✅ Gates → AUTO (BTC 24h range picks early / strict)\n"
+            "Takes effect on the next scan cycle (≤60s)."
+        )
+    return (
+        f"✅ Gates → {pinned.upper()} (pinned; /pump auto to release)\n"
+        "Takes effect on the next scan cycle (≤60s).\n"
+        "Stand-down on hot BTC still applies."
+    )
+
+
 def _pump_switch(profile: str) -> str:
     if profile == "early":
         on, off = PUMP_EARLY, PUMP_STRICT
     elif profile == "strict":
         on, off = PUMP_STRICT, PUMP_EARLY
     else:
-        return "Usage: /pump early | /pump strict"
+        return "Usage: /pump early | /pump strict | /pump auto"
     steps = [
         ("stop", off),
         ("disable", off),
@@ -171,7 +204,9 @@ def _pump_switch(profile: str) -> str:
     if errors:
         return "❌ Switch failed:\n" + "\n".join(errors) + f"\n{_pump_status()}"
     label = "EARLY" if profile == "early" else "STRICT"
-    return f"✅ Pump-stall → {label}\n{_pump_status()}"
+    # Pin the scan gates too, else the vol regime would re-pick them next cycle.
+    gates = _pump_gates(profile)
+    return f"✅ Pump-stall → {label}\n{gates}\n{_pump_status()}"
 
 
 def _report_private() -> str:
@@ -279,7 +314,8 @@ def handle_command(cmd: str, args: list[str]) -> str:
             "/review SYMBOL — DeepSeek situational review\n"
             "/list — all running bots\n"
             "/report — Pumpstall #REPORT in this chat (private)\n"
-            "/pump status|start|stop|early|strict|sweep — pump-stall service\n"
+            "/pump status|start|stop|early|strict|auto|sweep — pump-stall service\n"
+            "  early|strict pin the scan gates · auto = BTC volatility picks\n"
             "gate: SHORT only if mid>gate · LONG only if mid<gate\n"
             f"Backend: {backend}"
         )
@@ -357,10 +393,12 @@ def handle_command(cmd: str, args: list[str]) -> str:
             return _pump_switch("early")
         if action in ("strict", "normal"):
             return _pump_switch("strict")
+        if action == "auto":
+            return f"{_pump_gates(None)}\n{_pump_status()}"
         if action == "sweep":
             return botctl.sweep(None)
         return (
-            "Usage: /pump status|start|stop|early|strict|sweep\n"
+            "Usage: /pump status|start|stop|early|strict|auto|sweep\n"
             f"{_pump_status()}"
         )
 
