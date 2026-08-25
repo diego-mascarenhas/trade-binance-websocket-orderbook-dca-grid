@@ -161,7 +161,7 @@ python3 orderbook_dca_grid.py OPUSDT --rearm --rearm-flat  # close position, the
 - **Direction**: `--direction auto` (default) from bid/ask imbalance; or `long` / `short`.
 - **Account risk guards** (futures, before arming a grid):
   - `MAX_IMBALANCE=20` (default): skip new grids on the heavier LONG/SHORT side when imbalance exceeds 20%.
-  - `MAX_MARGIN_PCT=50`: skip if projected initial margin usage exceeds 50% of balance.
+  - `MAX_MARGIN_PCT=50`: skip if projected initial margin usage exceeds 50% of balance. Auto-trade ★ use `PUMPSTALL_MAX_MARGIN_PCT` (default 65) and the scanner pre-checks it, so a ★ is never launched into an arm-retry loop it cannot win.
   - `MARGIN_RATIO_SOFT=5` / `MARGIN_RATIO_HARD=5`: Binance UI Margin Ratio (maint/equity). ≥ soft → no new grids / ★; ≥ hard → cancel leftover DCA (keep TP/BE/trail).
   - `MIN_LIQ_DISTANCE_PCT=20`: skip if any open position is within 20% of liquidation.
   - `MAX_ACCOUNT_NOTIONAL_PCT=80`: skip if total |notional| + new grid exceeds 80% of `wallet × leverage`.

@@ -85,6 +85,37 @@ def _fmt_dca_cap(pct: float | None = None) -> str:
         return "DCA until margin 5%"
     return f"DCA≤{v / 100.0:g}×"
 
+
+def _max_margin_pct() -> float:
+    """Initial-margin usage cap for auto-trade children (0 = off).
+
+    An open position reserves margin for its whole armed DCA ladder, so one
+    large ★ can park the account above the manual `dca` default (50%) and every
+    new grid then dies in the arm loop. PUMPSTALL_MAX_MARGIN_PCT keeps the
+    auto-trade path on its own budget; MAX_MARGIN_PCT is the shared fallback.
+    """
+    raw = os.getenv("PUMPSTALL_MAX_MARGIN_PCT", os.getenv("MAX_MARGIN_PCT", "65"))
+    try:
+        return max(0.0, float(str(raw).strip() or 65))
+    except (TypeError, ValueError):
+        return 65.0
+
+
+def _margin_usage_pct(api: str | None, sec: str | None) -> float | None:
+    """Initial margin / margin balance %%, mirroring the child's arm gate."""
+    if not api or not sec:
+        return None
+    try:
+        from orderbook_dca_grid import account_margin_snapshot
+
+        snap = account_margin_snapshot(api, sec, 15000)
+    except Exception:  # noqa: BLE001
+        return None
+    bal = float(snap.get("margin_balance") or 0)
+    if bal <= 0:
+        return None
+    return float(snap.get("initial_margin") or 0) / bal * 100.0
+
 # First failing filter → color + short label
 BLOCK_COLORS = {
     "klines": DIM,
@@ -1525,6 +1556,9 @@ def _launch_dca_once(hit: PumpStallHit, args: argparse.Namespace) -> subprocess.
         "--margin-ratio-soft", str(getattr(args, "margin_ratio_soft", 5.0)),
         "--margin-ratio-hard", str(getattr(args, "margin_ratio_hard", 5.0)),
         "--dca-max-entry-pct", str(_dca_max_entry_pct()),
+        # Keep the child's arm gate on the same budget the scanner pre-checks,
+        # so a ★ is never launched into a doomed arm-retry loop.
+        "--max-margin-pct", str(_max_margin_pct()),
         # Short-only book: default imbalance gate (20–30%) blocks every new ★
         # once a large SHORT (e.g. PUMP) is open. Env PUMPSTALL_MAX_IMBALANCE
         # (default 0 = disable) overrides MAX_IMBALANCE for auto-trade children.
@@ -1714,6 +1748,24 @@ def _print_auto_account_status(
                 f"(hard {hard_mr:g}%){RESET}"
             )
 
+    usage_max = _max_margin_pct()
+    usage = _margin_usage_pct(api, sec) if usage_max > 0 else None
+    usage_state = "off" if usage_max <= 0 else "ok"
+    if usage_max > 0:
+        if usage is None:
+            usage_state = "unread"
+            bits.append(f"{YELLOW}margin usage unread{RESET}")
+        elif usage >= usage_max:
+            usage_state = "blocked"
+            bits.append(
+                f"{YELLOW}margin usage {usage:.1f}% ≥ max {usage_max:g}% "
+                f"— grids cannot arm{RESET}"
+            )
+        else:
+            bits.append(
+                f"{DIM}margin usage {usage:.1f}% / max {usage_max:g}%{RESET}"
+            )
+
     occ = ", ".join(sorted(occupied)) or "—"
     bits.append(
         f"{DIM}slots {len(occupied)}/{max_trades} · occupied {occ}{RESET}"
@@ -1730,6 +1782,9 @@ def _print_auto_account_status(
         "margin_ratio_pct": None if ratio is None else round(float(ratio), 2),
         "margin_soft_pct": soft_mr,
         "margin_hard_pct": hard_mr,
+        "margin_usage_state": usage_state,
+        "margin_usage_pct": None if usage is None else round(float(usage), 1),
+        "margin_usage_max_pct": usage_max,
         "cooldown": [],
         "blocked_by": "",
     })
@@ -1823,6 +1878,19 @@ def _maybe_auto_trade(
                 )
                 _AUTO_GATES["blocked_by"] = "margin"
                 return active
+
+    # Same budget the child checks before arming: launching under it only burns
+    # a slot for ONCE_MAX_ARM_FAILS × 60s and then relaunches next cycle.
+    usage_max = _max_margin_pct()
+    if usage_max > 0:
+        usage = _margin_usage_pct(api, sec)
+        if usage is not None and usage >= usage_max:
+            print(
+                f"{YELLOW}AUTO: margin usage {usage:.1f}% ≥ max {usage_max:g}% "
+                f"— new grids cannot arm, no new ★{RESET}"
+            )
+            _AUTO_GATES["blocked_by"] = "margin-usage"
+            return active
 
     cooling = lcd.cooling_map()
     if cooling:
